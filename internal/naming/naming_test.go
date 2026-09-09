@@ -247,6 +247,26 @@ func TestOneLine(t *testing.T) {
 	}
 }
 
+// TestOneLineDoesNotCutInsideDottedTokens: a description over the 120-rune cap
+// whose only period under the cap sits INSIDE a token (Class.Method, a version,
+// a filename) must not be cut there.
+func TestOneLineDoesNotCutInsideDottedTokens(t *testing.T) {
+	input := "REFUSED on purpose: ProjectManager.ArchiveProject crashed Resolve 21-1 from a script (measured 2026-09-09); archive from the GUI instead, the bridge never calls it. Use restore-project for the reverse."
+	got := OneLine(input)
+	if strings.HasSuffix(got, "ProjectManager.") || strings.Contains(got, "ProjectManager. ") {
+		t.Fatalf("OneLine cut inside a dotted token: %q", got)
+	}
+	if len([]rune(got)) > 120 {
+		t.Fatalf("OneLine length = %d, want <= 120: %q", len([]rune(got)), got)
+	}
+	if !strings.HasPrefix(got, "REFUSED on purpose: ProjectManager.ArchiveProject") {
+		t.Fatalf("OneLine lost the leading clause: %q", got)
+	}
+	if got := OneLine("Runs on Resolve 21.1 and keeps going with a very long tail that clearly exceeds the one hundred and twenty rune limit. Second sentence."); !strings.HasSuffix(got, "limit.") {
+		t.Fatalf("OneLine should cut at the real sentence end, got %q", got)
+	}
+}
+
 func TestCompactDescriptionPreservesHumanText(t *testing.T) {
 	input := "# Introduction\nAn \"agent-native\" CLI with C:\\tmp paths."
 	want := `An "agent-native" CLI with C:\tmp paths.`

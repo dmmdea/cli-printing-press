@@ -185,6 +185,13 @@ func TestReadOnlyNoAuthSkillSuppressesInapplicableBoilerplate(t *testing.T) {
 	assert.Contains(t, content, "| 7 | Rate limited")
 	assert.NotContains(t, content, "| 6 | Partial failure")
 	assert.NotContains(t, content, "GET responses cached for 5 minutes")
+	// Paths section: a no-auth CLI never writes credential files, so the
+	// SKILL must not describe them (mirrors the README paths-section test).
+	assert.Contains(t, content, "## Paths and state")
+	for _, mention := range []string{"credentials.toml", "cookies", "auth sidecars", "first auth write", "credential-location warnings", "find credentials left"} {
+		assert.NotContains(t, content, mention,
+			"no-auth SKILL paths docs must not describe files the CLI never writes")
+	}
 }
 
 func TestSkillAndReadmeDocumentPartialFailureExitCode(t *testing.T) {

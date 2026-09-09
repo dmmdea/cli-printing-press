@@ -353,6 +353,9 @@ func lastSentenceBoundaryUnder(s string, limit int) string {
 		if r != '.' && r != '!' && r != '?' {
 			continue
 		}
+		if r == '.' && sentencePeriodIsInternal(s, idx) {
+			continue
+		}
 		candidate := strings.TrimSpace(s[:idx+len(string(r))])
 		if candidate == "" || utf8.RuneCountInString(candidate) > limit {
 			continue
@@ -360,6 +363,25 @@ func lastSentenceBoundaryUnder(s string, limit int) string {
 		best = candidate
 	}
 	return best
+}
+
+// sentencePeriodIsInternal reports whether the period at idx sits inside a
+// token rather than ending a sentence: "ProjectManager.ArchiveProject",
+// "21.1", "Info.fcpxml", "e.g." Cutting a Short line there yields
+// "REFUSED on purpose: ProjectManager." instead of a sentence.
+func sentencePeriodIsInternal(s string, idx int) bool {
+	if idx <= 0 || idx >= len(s)-1 {
+		return false
+	}
+	prev, next := s[idx-1], s[idx+1]
+	isAlnum := func(b byte) bool {
+		return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9')
+	}
+	if isAlnum(prev) && isAlnum(next) {
+		return true
+	}
+	tokenStart := strings.LastIndex(s[:idx], " ") + 1
+	return strings.Contains(s[tokenStart:idx], ".")
 }
 
 func hardTruncateOneLine(s string, limit int) string {

@@ -17,7 +17,6 @@ func newLeaguesPromotedCmd(flags *rootFlags) *cobra.Command {
 		Use:         "leagues <game_key>",
 		Short:       "List leagues for a game",
 		Long:        "List leagues for a game",
-		Example:     "  sync-walker-golden-pp-cli leagues your-token-here",
 		Annotations: map[string]string{"pp:endpoint": "leagues.list", "pp:method": "GET", "pp:path": "/games/{game_key}/leagues", "mcp:read-only": "true"},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			c, err := flags.newClient()
@@ -65,9 +64,11 @@ func newLeaguesPromotedCmd(flags *rootFlags) *cobra.Command {
 			// opt out of the auto-JSON path so piped consumers that asked for a
 			// non-JSON format reach the standard pipeline below.
 			if flags.asJSON || (!isTerminal(cmd.OutOrStdout()) && !flags.csv && !flags.quiet && !flags.plain) {
+				var selectErr error
 				filtered := data
 				if flags.selectFields != "" {
-					filtered = filterFields(filtered, flags.selectFields)
+					filtered, selectErr = filterFieldsChecked(filtered, flags.selectFields)
+					selectErr = selectErrorForDryRun(selectErr, flags, data)
 				} else if flags.compact {
 					filtered = compactFields(filtered, nil)
 				}
@@ -79,7 +80,10 @@ func newLeaguesPromotedCmd(flags *rootFlags) *cobra.Command {
 				if wrapErr != nil {
 					return wrapErr
 				}
-				return printOutput(cmd.OutOrStdout(), wrapped, true)
+				if err := printOutput(cmd.OutOrStdout(), wrapped, true); err != nil {
+					return err
+				}
+				return selectErr
 			}
 			if wantsHumanTable(cmd.OutOrStdout(), flags) {
 				var items []map[string]any

@@ -24,6 +24,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	_ "modernc.org/sqlite"
 )
@@ -51,25 +52,32 @@ func IsUUID(s string) bool {
 
 // StoreSchemaVersion is the on-disk schema version this binary understands.
 // It is stamped into SQLite's PRAGMA user_version on fresh databases and
-// checked on every open. Learn-enabled CLIs advance to v9 for the
-// learn_candidates and learn_events tables (CLI-side capture and
-// measurement), on top of the v8 learning_playbooks table for
-// hand-authored choreography keyed by query family and the v6 canonical
-// learn-loop tables ported from prediction-goat (including the v3
-// resources_fts rowid rehash and v4 resources_fts content extraction).
-const StoreSchemaVersion = 9
+// checked on every open. Learn-enabled CLIs advance to v12 for the
+// parent-key storage-id migration, on top of v11's trigram resources_fts
+// rebuild (CJK substring search), v10's learn_candidates and learn_events
+// tables plus the latest-sync-attempt completion marker, the v8
+// learning_playbooks table, and the v6 canonical learn-loop tables
+// (including the v3 resources_fts rowid rehash and v4 resources_fts content
+// extraction).
+const StoreSchemaVersion = 12
 
 // resourcesFTSContentSchemaVersion pins the schema bump that rewrote
 // resources_fts content from raw JSON to searchable leaf values. Keep this
 // separate from StoreSchemaVersion — and pinned at 4 regardless of the
 // learn shape — so schema bumps that only add tables (the learn
-// migrations) never trigger an expensive full FTS content rewrite. A
-// store stamped at v4 or later already carries the extracted-leaf FTS
-// content; opening it with a newer binary must stay additive-only.
+// migrations) never trigger an expensive full FTS content rewrite.
 const resourcesFTSContentSchemaVersion = 4
 
+// resourcesFTSTokenizerSchemaVersion pins the trigram resources_fts rebuild.
+// It stays at the bump that introduced the tokenizer (v11 learn-enabled, v6
+// otherwise) so later additive migrations do not rebuild FTS. The pin cannot
+// sit at the v4 content-extraction version: learn-enabled stores were already
+// past v4 when the tokenizer landed, and a v4 pin would skip the rebuild and
+// leave porter tokens in place.
+const resourcesFTSTokenizerSchemaVersion = 11
+
 const resourcesFTSCreateSQL = `CREATE VIRTUAL TABLE IF NOT EXISTS resources_fts USING fts5(
-	id, resource_type, content, tokenize='porter unicode61'
+	id, resource_type, content, tokenize='trigram'
 )`
 
 type Store struct {
@@ -222,23 +230,19 @@ func rejectNewerSchemaBeforeJournalMode(ctx context.Context, dbPath string) erro
 
 // hardenSQLiteFiles is best-effort so stores on filesystems without Unix modes
 // remain usable. The deferred call catches files the SQLite driver creates.
+// Chmod by path only: opening these files to fchmod, then closing that
+// descriptor, drops every POSIX fcntl lock this process holds on them,
+// including SQLite's own connection locks.
 func hardenSQLiteFiles(dbPath string) {
 	for _, path := range []string{dbPath, dbPath + "-journal", dbPath + "-wal", dbPath + "-shm"} {
 		info, err := os.Lstat(path)
 		if err != nil || !info.Mode().IsRegular() {
 			continue
 		}
-
-		file, err := os.Open(path)
-		if err != nil {
+		if info.Mode().Perm() == 0o600 {
 			continue
 		}
-		openInfo, statErr := file.Stat()
-		pathInfo, lstatErr := os.Lstat(path)
-		if statErr == nil && lstatErr == nil && pathInfo.Mode().IsRegular() && os.SameFile(openInfo, pathInfo) {
-			_ = file.Chmod(0o600)
-		}
-		_ = file.Close()
+		_ = os.Chmod(path, 0o600)
 	}
 }
 
@@ -407,6 +411,9 @@ func (s *Store) ensureColumn(ctx context.Context, conn *sql.Conn, table, column,
 // word.
 func (s *Store) backfillColumns(ctx context.Context, conn *sql.Conn) error {
 	for _, c := range []struct{ table, column, decl string }{
+		// Legacy checkpoints cannot prove lossless completion: even an empty
+		// cursor may have come from a capped or partially stored page.
+		{table: "sync_state", column: "last_attempt_complete", decl: "INTEGER NOT NULL DEFAULT 0"},
 		{table: "gadgets", column: "name", decl: "TEXT"},
 		{table: "widgets", column: "name", decl: "TEXT"},
 		{table: "sync_state", column: "last_cursor", decl: "TEXT"},
@@ -471,7 +478,8 @@ func (s *Store) migrate(ctx context.Context) error {
 			resource_type TEXT PRIMARY KEY,
 			last_cursor TEXT,
 			last_synced_at DATETIME,
-			total_count INTEGER DEFAULT 0
+			total_count INTEGER DEFAULT 0,
+			last_attempt_complete INTEGER NOT NULL DEFAULT 0
 		)`,
 		resourcesFTSCreateSQL,
 		// CLI Printing Press: learn migrations
@@ -689,6 +697,22 @@ func (s *Store) migrate(ctx context.Context) error {
 			if err := s.migrateResourcesFTSContent(ctx, conn); err != nil {
 				return fmt.Errorf("migrating resources FTS content: %w", err)
 			}
+		} else if current < resourcesFTSTokenizerSchemaVersion {
+			if err := s.migrateResourcesFTSContent(ctx, conn); err != nil {
+				return fmt.Errorf("migrating resources FTS tokenizer: %w", err)
+			}
+		}
+		// After any FTS rebuild. Those rebuilds index whatever ids are on
+		// disk, including legacy bare keys; this pass then replaces the
+		// rowids that were derived from those keys.
+		//
+		// Not gated on user_version. A reprint can add a type to
+		// resourceParentKeyColumns after this store is already at
+		// StoreSchemaVersion; the next open still has to re-key that
+		// type. An empty map, or a store with no bare ids for the mapped
+		// types, returns without rewriting.
+		if err := s.migrateParentKeyStorageIDs(ctx, conn); err != nil {
+			return fmt.Errorf("migrating parent-key storage ids: %w", err)
 		}
 		// Stamp the schema version. On a fresh DB this writes the current
 		// StoreSchemaVersion; on an already-stamped DB this is a no-op
@@ -863,6 +887,306 @@ func rebuildResourcesFTS(ctx context.Context, conn *sql.Conn) error {
 		); err != nil {
 			return fmt.Errorf("indexing resource %s/%s: %w", r.resourceType, r.id, err)
 		}
+	}
+	return nil
+}
+
+// parentKeyLegacyBatchSize bounds how many bare resource payloads are held
+// while their storage ids are rewritten. The sweep runs on every open, so
+// the batch also keeps that work from retaining an entire partition.
+const parentKeyLegacyBatchSize = 64
+
+// Fixed name so a reprint can find the previous predicate and replace it.
+// CREATE INDEX IF NOT EXISTS would keep the old type list and hide bare
+// rows of a type added after the schema stamp.
+const parentKeyLegacyIndexName = "idx_resources_legacy_parent_key"
+
+// A reprint can add a parent-keyed type without bumping the schema stamp,
+// so bare ids are re-checked on every open. instr(id, char(0)) cannot use
+// the resources primary key; the partial index makes the empty check a
+// seek instead of a table scan under the migration write lock, and its
+// predicate is rebuilt when the type list drifts so the new type is not
+// skipped. Composite wins on a shared storage id because current upserts
+// maintain that row; a different parent is a separate association. FTS
+// rowids follow the stored id, so the bare entry has to be replaced.
+func (s *Store) migrateParentKeyStorageIDs(ctx context.Context, conn *sql.Conn) error {
+	if len(resourceParentKeyColumns) == 0 {
+		return nil
+	}
+	exists, err := tableExists(ctx, conn, "resources")
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return nil
+	}
+
+	resourceTypes := make([]string, 0, len(resourceParentKeyColumns))
+	for resourceType := range resourceParentKeyColumns {
+		resourceTypes = append(resourceTypes, resourceType)
+	}
+	// Map iteration order is random. The index predicate is compared as
+	// text, so an unsorted list would miss and rebuild on every open.
+	sort.Strings(resourceTypes)
+	bareWhere := parentKeyLegacyBareWhere(resourceTypes)
+	if err := ensureParentKeyLegacyIndex(ctx, conn, bareWhere); err != nil {
+		return err
+	}
+	bare, err := parentKeyBareIDsExist(ctx, conn, bareWhere)
+	if err != nil {
+		return err
+	}
+	if !bare {
+		return nil
+	}
+
+	var (
+		afterType string
+		afterID   string
+		hasCursor bool
+		ftsKnown  bool
+		ftsExists bool
+	)
+	for {
+		batch, err := loadParentKeyLegacyBatch(ctx, conn, bareWhere, afterType, afterID, hasCursor)
+		if err != nil {
+			return err
+		}
+		if len(batch) == 0 {
+			return nil
+		}
+		for _, row := range batch {
+			if row.storageID == "" {
+				continue
+			}
+			if !ftsKnown {
+				ftsExists, err = tableExists(ctx, conn, "resources_fts")
+				if err != nil {
+					return err
+				}
+				ftsKnown = true
+			}
+			if err := applyParentKeyLegacyRow(ctx, conn, row, ftsExists); err != nil {
+				return err
+			}
+		}
+		last := batch[len(batch)-1]
+		afterType, afterID = last.resourceType, last.id
+		hasCursor = true
+		if len(batch) < parentKeyLegacyBatchSize {
+			return nil
+		}
+	}
+}
+
+type parentKeyLegacyRow struct {
+	id           string
+	resourceType string
+	data         string
+	storageID    string
+}
+
+// Literals, not placeholders: a bound IN list does not prove the
+// partial-index predicate, and the empty check would scan.
+func parentKeyLegacyBareWhere(resourceTypes []string) string {
+	quoted := make([]string, len(resourceTypes))
+	for i, resourceType := range resourceTypes {
+		quoted[i] = "'" + strings.ReplaceAll(resourceType, "'", "''") + "'"
+	}
+	return `instr(id, char(0)) = 0 AND resource_type IN (` + strings.Join(quoted, ", ") + `)`
+}
+
+func parentKeyLegacyIndexSQL(bareWhere string) string {
+	return `CREATE INDEX ` + parentKeyLegacyIndexName + ` ON resources(resource_type, id) WHERE ` + bareWhere
+}
+
+func ensureParentKeyLegacyIndex(ctx context.Context, conn *sql.Conn, bareWhere string) error {
+	indexSQL := parentKeyLegacyIndexSQL(bareWhere)
+	var got sql.NullString
+	err := conn.QueryRowContext(ctx, `SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?`, parentKeyLegacyIndexName).Scan(&got)
+	if err != nil && err != sql.ErrNoRows {
+		return fmt.Errorf("reading parent-key legacy index: %w", err)
+	}
+	if err == nil && got.Valid && got.String == indexSQL {
+		return nil
+	}
+	if _, err := conn.ExecContext(ctx, `DROP INDEX IF EXISTS `+parentKeyLegacyIndexName); err != nil {
+		return fmt.Errorf("dropping parent-key legacy index: %w", err)
+	}
+	if _, err := conn.ExecContext(ctx, indexSQL); err != nil {
+		return fmt.Errorf("creating parent-key legacy index: %w", err)
+	}
+	return nil
+}
+
+func parentKeyBareIDsExist(ctx context.Context, conn *sql.Conn, bareWhere string) (bool, error) {
+	// INDEXED BY refuses a table-scan fallback while the migration write
+	// lock is held. LIMIT 1 returns before any batch rewrite when no bare
+	// id is left.
+	var one int
+	err := conn.QueryRowContext(ctx,
+		`SELECT 1 FROM resources INDEXED BY `+parentKeyLegacyIndexName+` WHERE `+bareWhere+` LIMIT 1`,
+	).Scan(&one)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("probing bare parent-key ids: %w", err)
+	}
+	return true, nil
+}
+
+func loadParentKeyLegacyBatch(ctx context.Context, conn *sql.Conn, bareWhere, afterType, afterID string, hasCursor bool) ([]parentKeyLegacyRow, error) {
+	args := make([]any, 0, 4)
+	// char(0) is the composite-key separator. Rows that already carry it
+	// are current and must not be rewritten. The cursor walks every bare
+	// row, including ones that cannot be re-keyed, so a later batch does
+	// not read them again in this open.
+	query := `SELECT id, resource_type, data FROM resources WHERE ` + bareWhere
+	if hasCursor {
+		query += ` AND (resource_type > ? OR (resource_type = ? AND id > ?))`
+		args = append(args, afterType, afterType, afterID)
+	}
+	query += ` ORDER BY resource_type, id LIMIT ?`
+	args = append(args, parentKeyLegacyBatchSize)
+	rows, err := conn.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("querying parent-key resources: %w", err)
+	}
+
+	batch := make([]parentKeyLegacyRow, 0, parentKeyLegacyBatchSize)
+	for rows.Next() {
+		var row parentKeyLegacyRow
+		if err := rows.Scan(&row.id, &row.resourceType, &row.data); err != nil {
+			_ = rows.Close()
+			return nil, fmt.Errorf("scanning parent-key resource: %w", err)
+		}
+		if strings.IndexByte(row.id, 0) < 0 && len(resourceParentKeyColumns[row.resourceType]) > 0 {
+			obj, err := DecodeJSONObject(json.RawMessage(row.data))
+			if err == nil {
+				if storageID := resourceStorageID(row.resourceType, row.id, obj); storageID != row.id {
+					row.storageID = storageID
+				}
+			}
+		}
+		batch = append(batch, row)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, fmt.Errorf("reading parent-key resources: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("closing parent-key resources: %w", err)
+	}
+	return batch, nil
+}
+
+func applyParentKeyLegacyRow(ctx context.Context, conn *sql.Conn, row parentKeyLegacyRow, ftsExists bool) error {
+	canonicalData := row.data
+	err := conn.QueryRowContext(ctx,
+		`SELECT data FROM resources WHERE resource_type = ? AND id = ?`,
+		row.resourceType, row.storageID,
+	).Scan(&canonicalData)
+	keepComposite := false
+	switch {
+	case err == nil:
+		keepComposite = true
+	case err == sql.ErrNoRows:
+		res, err := conn.ExecContext(ctx,
+			`UPDATE resources SET id = ? WHERE resource_type = ? AND id = ?`,
+			row.storageID, row.resourceType, row.id,
+		)
+		if err != nil {
+			return fmt.Errorf("re-keying resource %s/%s: %w", row.resourceType, row.id, err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("re-keying resource %s/%s: %w", row.resourceType, row.id, err)
+		}
+		if n != 1 {
+			return fmt.Errorf("re-keying resource %s/%s changed %d rows", row.resourceType, row.id, n)
+		}
+	default:
+		return fmt.Errorf("checking composite resource %s/%s: %w", row.resourceType, row.id, err)
+	}
+
+	if err := migrateParentKeyTypedID(ctx, conn, row.resourceType, row.id, row.storageID); err != nil {
+		return err
+	}
+	if keepComposite {
+		res, err := conn.ExecContext(ctx,
+			`DELETE FROM resources WHERE resource_type = ? AND id = ?`,
+			row.resourceType, row.id,
+		)
+		if err != nil {
+			return fmt.Errorf("deleting bare resource %s/%s: %w", row.resourceType, row.id, err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("deleting bare resource %s/%s: %w", row.resourceType, row.id, err)
+		}
+		if n != 1 {
+			return fmt.Errorf("deleting bare resource %s/%s removed %d rows", row.resourceType, row.id, n)
+		}
+	}
+	if !ftsExists {
+		return nil
+	}
+	return replaceParentKeyResourceFTS(ctx, conn, row.resourceType, row.id, row.storageID, canonicalData)
+}
+
+func replaceParentKeyResourceFTS(ctx context.Context, conn *sql.Conn, resourceType, bareID, storageID, data string) error {
+	if _, err := conn.ExecContext(ctx, `DELETE FROM resources_fts WHERE rowid = ?`, ftsRowID(resourceType, bareID)); err != nil {
+		return fmt.Errorf("deleting bare resource FTS row %s/%s: %w", resourceType, bareID, err)
+	}
+	if _, err := conn.ExecContext(ctx, `DELETE FROM resources_fts WHERE rowid = ?`, ftsRowID(resourceType, storageID)); err != nil {
+		return fmt.Errorf("replacing composite resource FTS row %s/%s: %w", resourceType, storageID, err)
+	}
+	if _, err := conn.ExecContext(ctx,
+		`INSERT INTO resources_fts (rowid, id, resource_type, content) VALUES (?, ?, ?, ?)`,
+		ftsRowID(resourceType, storageID), storageID, resourceType,
+		searchableResourceContent(json.RawMessage(data)),
+	); err != nil {
+		return fmt.Errorf("indexing composite resource %s/%s: %w", resourceType, storageID, err)
+	}
+	return nil
+}
+
+// Content-synced FTS follows the typed table's rowid, not ftsRowID, and
+// its triggers run only when that content row is updated or deleted. An
+// existing composite id wins, so the bare row is removed instead of
+// renamed onto it.
+func migrateParentKeyTypedID(ctx context.Context, conn *sql.Conn, resourceType, bareID, storageID string) error {
+	table, ok := typedListTableByResource[resourceType]
+	if !ok {
+		return nil
+	}
+	if !validIdentifierRE.MatchString(table) {
+		return fmt.Errorf("refusing parent-key migration for unsafe table name %q", table)
+	}
+	return migrateParentKeyTypedTableID(ctx, conn, table, bareID, storageID)
+}
+
+func migrateParentKeyTypedTableID(ctx context.Context, conn *sql.Conn, table, bareID, storageID string) error {
+	quoted := `"` + table + `"`
+	var compositeCount int
+	if err := conn.QueryRowContext(ctx,
+		fmt.Sprintf(`SELECT COUNT(*) FROM %s WHERE id = ?`, quoted), storageID,
+	).Scan(&compositeCount); err != nil {
+		return fmt.Errorf("checking typed composite row %s/%s: %w", table, storageID, err)
+	}
+	if compositeCount > 0 {
+		if _, err := conn.ExecContext(ctx,
+			fmt.Sprintf(`DELETE FROM %s WHERE id = ?`, quoted), bareID,
+		); err != nil {
+			return fmt.Errorf("deleting typed bare row %s/%s: %w", table, bareID, err)
+		}
+		return nil
+	}
+	if _, err := conn.ExecContext(ctx,
+		fmt.Sprintf(`UPDATE %s SET id = ? WHERE id = ?`, quoted), storageID, bareID,
+	); err != nil {
+		return fmt.Errorf("re-keying typed row %s/%s: %w", table, bareID, err)
 	}
 	return nil
 }
@@ -1262,52 +1586,65 @@ func (s *Store) Search(query string, limit int, resourceTypes ...string) ([]json
 	if limit <= 0 {
 		limit = 50
 	}
-	matchQuery := FTSMatchQuery(query)
-	if matchQuery == "" {
+	tokens := ftsQueryTokenRE.FindAllString(query, -1)
+	if len(tokens) == 0 {
 		return nil, nil
 	}
 	resourceType := ""
 	if len(resourceTypes) > 0 {
 		resourceType = strings.TrimSpace(resourceTypes[0])
 	}
-	if resourceType != "" {
-		rows, err := s.db.Query(
-			`SELECT r.data FROM resources r
+
+	var (
+		q    string
+		args []any
+	)
+	if ftsNeedsLikeFallback(tokens) {
+		clause, likeArgs := ftsLikeClause("f", tokens)
+		if clause == "" {
+			return nil, nil
+		}
+		q = `SELECT r.data FROM resources r
+			 JOIN resources_fts f ON r.id = f.id AND r.resource_type = f.resource_type
+			 WHERE ` + clause
+		args = likeArgs
+		if resourceType != "" {
+			q += ` AND r.resource_type = ?`
+			args = append(args, resourceType)
+		}
+		q += ` LIMIT ?`
+		args = append(args, limit)
+	} else {
+		matchQuery := FTSMatchQuery(query)
+		if matchQuery == "" {
+			return nil, nil
+		}
+		if resourceType != "" {
+			q = `SELECT r.data FROM resources r
 			 JOIN resources_fts f ON r.id = f.id AND r.resource_type = f.resource_type
 			 WHERE resources_fts MATCH ?
 			 AND r.resource_type = ?
 			 ORDER BY f.rank
-			 LIMIT ?`,
-			matchQuery, resourceType, limit,
-		)
-		if err != nil {
-			return nil, err
+			 LIMIT ?`
+			args = []any{matchQuery, resourceType, limit}
+		} else {
+			q = `SELECT r.data FROM resources r
+			 JOIN resources_fts f ON r.id = f.id AND r.resource_type = f.resource_type
+			 WHERE resources_fts MATCH ?
+			 ORDER BY f.rank
+			 LIMIT ?`
+			args = []any{matchQuery, limit}
 		}
-		defer rows.Close()
-
-		var results []json.RawMessage
-		for rows.Next() {
-			var data string
-			if err := rows.Scan(&data); err != nil {
-				return nil, err
-			}
-			results = append(results, json.RawMessage(data))
-		}
-		return results, rows.Err()
 	}
-	rows, err := s.db.Query(
-		`SELECT r.data FROM resources r
-		 JOIN resources_fts f ON r.id = f.id AND r.resource_type = f.resource_type
-		 WHERE resources_fts MATCH ?
-		 ORDER BY f.rank
-		 LIMIT ?`,
-		matchQuery, limit,
-	)
+	rows, err := s.db.Query(q, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
+	return scanSearchData(rows)
+}
 
+func scanSearchData(rows *sql.Rows) ([]json.RawMessage, error) {
 	var results []json.RawMessage
 	for rows.Next() {
 		var data string
@@ -1393,6 +1730,42 @@ func FTSMatchQuery(query string) string {
 		quoted = append(quoted, `"`+token+`"`)
 	}
 	return strings.Join(quoted, " ")
+}
+
+const ftsTrigramMinRunes = 3
+
+func ftsNeedsLikeFallback(tokens []string) bool {
+	for _, token := range tokens {
+		if utf8.RuneCountInString(token) < ftsTrigramMinRunes {
+			return true
+		}
+	}
+	return false
+}
+
+func escapeLikePattern(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, `%`, `\%`)
+	s = strings.ReplaceAll(s, `_`, `\_`)
+	return s
+}
+
+// ftsLikeClause AND-s LIKE predicates for the already-parsed FTS tokens.
+// Trigram MATCH cannot hit queries shorter than 3 runes (營造, phase-2).
+func ftsLikeClause(alias string, tokens []string) (string, []any) {
+	if len(tokens) == 0 {
+		return "", nil
+	}
+	parts := make([]string, 0, len(tokens))
+	args := make([]any, 0, len(tokens)*2)
+	contentCol := alias + ".content"
+	idCol := alias + ".id"
+	for _, token := range tokens {
+		pattern := "%" + escapeLikePattern(token) + "%"
+		parts = append(parts, "("+contentCol+" LIKE ? ESCAPE '\\' OR "+idCol+" LIKE ? ESCAPE '\\')")
+		args = append(args, pattern, pattern)
+	}
+	return strings.Join(parts, " AND "), args
 }
 
 // A record filed under its own identifier often carries no id field inside the
@@ -2927,10 +3300,9 @@ func (s *Store) UpsertBatchDetailed(resourceType string, items []json.RawMessage
 		}
 
 		if err := s.upsertGenericResourceTx(tx, resourceType, storageID, item); err != nil {
-			// Return the running stored count rather than zero so callers
-			// inspecting partial progress on failure see what already
-			// landed in earlier loop iterations.
-			return stored, extractFailures, typedFailures, fmt.Errorf("upserting %s/%s: %w", resourceType, storageID, err)
+			// A non-nil error aborts this transaction through the deferred
+			// rollback, so no earlier in-memory progress was committed.
+			return 0, extractFailures, typedFailures, fmt.Errorf("upserting %s/%s: %w", resourceType, storageID, err)
 		}
 		stored++
 
@@ -2941,7 +3313,7 @@ func (s *Store) UpsertBatchDetailed(resourceType string, items []json.RawMessage
 
 		savepoint := fmt.Sprintf("pp_typed_%d", i)
 		if _, err := tx.Exec("SAVEPOINT " + savepoint); err != nil {
-			return stored, extractFailures, typedFailures, fmt.Errorf("savepoint begin for %s/%s: %w", resourceType, storageID, err)
+			return 0, extractFailures, typedFailures, fmt.Errorf("savepoint begin for %s/%s: %w", resourceType, storageID, err)
 		}
 
 		var typedErr error
@@ -2954,16 +3326,16 @@ func (s *Store) UpsertBatchDetailed(resourceType string, items []json.RawMessage
 
 		if typedErr != nil {
 			if _, rbErr := tx.Exec("ROLLBACK TO SAVEPOINT " + savepoint); rbErr != nil {
-				return stored, extractFailures, typedFailures, fmt.Errorf("rollback to savepoint for %s/%s (typed err: %v): %w", resourceType, storageID, typedErr, rbErr)
+				return 0, extractFailures, typedFailures, fmt.Errorf("rollback to savepoint for %s/%s (typed err: %v): %w", resourceType, storageID, typedErr, rbErr)
 			}
 			if _, relErr := tx.Exec("RELEASE SAVEPOINT " + savepoint); relErr != nil {
-				return stored, extractFailures, typedFailures, fmt.Errorf("release savepoint after rollback for %s/%s: %w", resourceType, storageID, relErr)
+				return 0, extractFailures, typedFailures, fmt.Errorf("release savepoint after rollback for %s/%s: %w", resourceType, storageID, relErr)
 			}
 			typedFailures++
 			continue
 		}
 		if _, err := tx.Exec("RELEASE SAVEPOINT " + savepoint); err != nil {
-			return stored, extractFailures, typedFailures, fmt.Errorf("release savepoint for %s/%s: %w", resourceType, storageID, err)
+			return 0, extractFailures, typedFailures, fmt.Errorf("release savepoint for %s/%s: %w", resourceType, storageID, err)
 		}
 	}
 
@@ -2975,14 +3347,12 @@ func (s *Store) UpsertBatchDetailed(resourceType string, items []json.RawMessage
 	if extractFailures > 0 && stored == 0 && len(items) > 0 {
 		fmt.Fprintf(os.Stderr, "warning: %d/%d %s items returned but not cached locally (no extractable ID field; offline lookup against these rows will be incomplete; live queries unaffected)\n", skippedCount, len(items), resourceType)
 	}
-	// Surface typed-table failures without aborting the batch. Generic rows
-	// already committed; only the typed projection failed.
-	if typedFailures > 0 {
-		fmt.Fprintf(os.Stderr, "warning: %d/%d %s items: typed-table upsert failed; generic resources rows preserved\n", typedFailures, len(items), resourceType)
-	}
-
 	if err := tx.Commit(); err != nil {
 		return 0, extractFailures, typedFailures, err
+	}
+	// Surface typed-table failures only after the outer transaction commits.
+	if typedFailures > 0 {
+		fmt.Fprintf(os.Stderr, "warning: %d/%d %s items: typed-table upsert failed; generic resources rows preserved\n", typedFailures, len(items), resourceType)
 	}
 	return stored, extractFailures, typedFailures, nil
 }
@@ -3032,39 +3402,42 @@ func (s *Store) SaveSyncStateAt(resourceType, cursor string, count int, at time.
 	s.lockForWrite()
 	defer s.unlockAfterWrite()
 	_, err := s.db.Exec(
-		`INSERT INTO sync_state (resource_type, last_cursor, last_synced_at, total_count)
-		 VALUES (?, ?, ?, ?)
+		`INSERT INTO sync_state (resource_type, last_cursor, last_synced_at, total_count, last_attempt_complete)
+		 VALUES (?, ?, ?, ?, 1)
 		 ON CONFLICT(resource_type) DO UPDATE SET last_cursor = excluded.last_cursor,
-		 last_synced_at = excluded.last_synced_at, total_count = excluded.total_count`,
+		 last_synced_at = excluded.last_synced_at, total_count = excluded.total_count,
+		 last_attempt_complete = 1`,
 		resourceType, cursor, at.UTC().Format(time.RFC3339), count,
 	)
 	return err
 }
 
-// SaveSyncProgress stores pagination progress without changing the
-// incremental watermark. A new row gets a parseable zero timestamp so
-// GetSyncState can scan it into time.Time without a NULL conversion error.
+// SaveSyncProgress stores pagination progress, marks the latest attempt
+// incomplete, and preserves the last completed incremental watermark.
 func (s *Store) SaveSyncProgress(resourceType, cursor string, count int) error {
 	s.lockForWrite()
 	defer s.unlockAfterWrite()
 	_, err := s.db.Exec(
-		`INSERT INTO sync_state (resource_type, last_cursor, last_synced_at, total_count)
-		 VALUES (?, ?, ?, ?)
+		`INSERT INTO sync_state (resource_type, last_cursor, last_synced_at, total_count, last_attempt_complete)
+		 VALUES (?, ?, NULL, ?, 0)
 		 ON CONFLICT(resource_type) DO UPDATE SET last_cursor = excluded.last_cursor,
-		 total_count = excluded.total_count`,
-		resourceType, cursor, time.Time{}.UTC().Format(time.RFC3339), count,
+		 total_count = excluded.total_count, last_attempt_complete = 0`,
+		resourceType, cursor, count,
 	)
 	return err
 }
 
 func (s *Store) GetSyncState(resourceType string) (cursor string, lastSynced time.Time, count int, err error) {
+	var savedCursor sql.NullString
+	var savedTime sql.NullTime
 	err = s.db.QueryRow(
 		`SELECT last_cursor, last_synced_at, total_count FROM sync_state WHERE resource_type = ?`,
 		resourceType,
-	).Scan(&cursor, &lastSynced, &count)
+	).Scan(&savedCursor, &savedTime, &count)
 	if err == sql.ErrNoRows {
 		return "", time.Time{}, 0, nil
 	}
+	cursor, lastSynced = savedCursor.String, savedTime.Time
 	return
 }
 
@@ -3072,12 +3445,12 @@ func (s *Store) GetSyncState(resourceType string) (cursor string, lastSynced tim
 func (s *Store) SaveSyncCursor(resourceType, cursor string) error {
 	s.lockForWrite()
 	defer s.unlockAfterWrite()
-	now := time.Now().UTC().Format(time.RFC3339)
 	_, err := s.db.Exec(
-		`INSERT INTO sync_state (resource_type, last_cursor, last_synced_at, total_count)
-		 VALUES (?, ?, ?, 0)
-		 ON CONFLICT(resource_type) DO UPDATE SET last_cursor = ?, last_synced_at = ?`,
-		resourceType, cursor, now, cursor, now,
+		`INSERT INTO sync_state (resource_type, last_cursor, last_synced_at, total_count, last_attempt_complete)
+		 VALUES (?, ?, ?, 0, 0)
+		 ON CONFLICT(resource_type) DO UPDATE SET last_cursor = excluded.last_cursor,
+		 last_attempt_complete = 0`,
+		resourceType, cursor, time.Time{}.UTC().Format(time.RFC3339),
 	)
 	return err
 }

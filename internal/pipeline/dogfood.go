@@ -33,6 +33,13 @@ type DogfoodSpecSource string
 const (
 	DogfoodSpecSourceBundled DogfoodSpecSource = "bundled"
 	DogfoodSpecSourceCaller  DogfoodSpecSource = "caller"
+	DogfoodSpecSourceNone    DogfoodSpecSource = "none"
+)
+
+const (
+	DogfoodVerdictPass = "PASS"
+	DogfoodVerdictWarn = "WARN"
+	DogfoodVerdictFail = "FAIL"
 )
 
 type DogfoodReport struct {
@@ -146,6 +153,7 @@ type AuthCheckResult struct {
 	SpecScheme   string `json:"spec_scheme"`
 	GeneratedFmt string `json:"generated_format"`
 	Match        bool   `json:"match"`
+	Skipped      bool   `json:"skipped,omitempty"`
 	Detail       string `json:"detail"`
 }
 
@@ -182,9 +190,11 @@ type DeadCodeResult struct {
 
 type PipelineResult struct {
 	SyncCallsDomain      bool   `json:"sync_calls_domain"`
+	SyncCallsGeneric     bool   `json:"sync_calls_generic,omitempty"`
 	SearchCallsDomain    bool   `json:"search_calls_domain"`
 	DomainTables         int    `json:"domain_tables"`
 	SyncFileEmitted      bool   `json:"sync_file_emitted"`
+	SyncFileReadError    bool   `json:"sync_file_read_error,omitempty"`
 	SyncResourcesPresent bool   `json:"sync_resources_present"`
 	Detail               string `json:"detail"`
 }
@@ -309,7 +319,7 @@ func RunDogfood(dir, specPath string, opts ...DogfoodOption) (*DogfoodReport, er
 		SpecPath:    specPath,
 		SpecSource:  specSource,
 		IsDeviceCLI: isDeviceCLIDir(dir),
-		Verdict:     "PASS",
+		Verdict:     DogfoodVerdictPass,
 	}
 
 	var spec *openAPISpec
@@ -352,9 +362,15 @@ func RunDogfood(dir, specPath string, opts ...DogfoodOption) (*DogfoodReport, er
 		report.BrowserSessionCheck = checkBrowserSessionAuth(dir, spec.Auth)
 		report.OAuthScopeCoverage = checkOAuthScopeCoverage(dir, spec.OAuthScopeRequirements, spec.Auth)
 	} else {
+		report.SpecSource = DogfoodSpecSourceNone
+		report.PathCheck = PathCheckResult{
+			Skipped: true,
+			Detail:  "no resolvable spec; path validity not checked",
+		}
 		report.AuthCheck = AuthCheckResult{
-			Match:  true,
-			Detail: "spec not provided; auth protocol check skipped",
+			Match:   false,
+			Skipped: true,
+			Detail:  "spec not provided; auth protocol check skipped",
 		}
 		report.BrowserSessionCheck = BrowserSessionCheckResult{
 			Pass:   true,
@@ -373,7 +389,11 @@ func RunDogfood(dir, specPath string, opts ...DogfoodOption) (*DogfoodReport, er
 	report.WiringCheck = checkWiring(dir)
 	report.NovelFeaturesCheck = checkNovelFeaturesOpts(dir, cfg.researchDir, cfg.overwriteCommandMirror)
 	report.MCPSurfaceParityCheck = checkMCPSurfaceParity(dir)
-	report.ReimplementationCheck = checkReimplementation(dir, cfg.researchDir)
+	specPaths := []string{}
+	if specPath != "" {
+		specPaths = []string{specPath}
+	}
+	report.ReimplementationCheck = checkReimplementationWithHostGate(dir, cfg.researchDir, specPaths, dnsNovelHostResolver)
 	if drift := checkDescriptionDrift(dir, cfg.researchDir); shouldReportDescriptionDrift(drift) {
 		report.DescriptionDriftCheck = &drift
 	}
@@ -382,6 +402,9 @@ func RunDogfood(dir, specPath string, opts ...DogfoodOption) (*DogfoodReport, er
 	report.TestPresence = checkTestPresence(dir)
 	report.NamingCheck = checkNamingConsistency(dir)
 	report.SyncParamDropCheck = CheckSyncParamDrop(dir, resolveTrafficAnalysisPath(cfg, specPath))
+	if report.SpecSource == DogfoodSpecSourceNone {
+		report.PathCheck.Detail = fmt.Sprintf("no resolvable spec; %d command(s) unvalidated", report.WiringCheck.CommandTree.Defined)
+	}
 	report.Issues = collectDogfoodIssues(report, spec != nil)
 	report.Verdict = deriveDogfoodVerdict(report, spec != nil)
 
@@ -2491,7 +2514,7 @@ func checkPipelineIntegrity(dir string) PipelineResult {
 		Detail: "sync/search/store files not found",
 	}
 
-	syncData, _ := os.ReadFile(filepath.Join(dir, "internal", "cli", "sync.go"))
+	syncData, syncReadErr := os.ReadFile(filepath.Join(dir, "internal", "cli", "sync.go"))
 	searchData, _ := os.ReadFile(filepath.Join(dir, "internal", "cli", "search.go"))
 	storeData, _ := os.ReadFile(filepath.Join(dir, "internal", "store", "store.go"))
 
@@ -2503,19 +2526,25 @@ func checkPipelineIntegrity(dir string) PipelineResult {
 	domainSearchRe := regexp.MustCompile(`\.Search[A-Z]\w*\s*\(`)
 
 	result.SyncCallsDomain = domainUpsertRe.MatchString(syncSource)
+	result.SyncCallsGeneric = !result.SyncCallsDomain && strings.Contains(syncSource, ".Upsert(")
 	result.SearchCallsDomain = domainSearchRe.MatchString(searchSource)
 	result.DomainTables = countDomainTables(storeSource)
-	result.SyncFileEmitted = syncSource != ""
-	result.SyncResourcesPresent = hasPopulatedSyncResources(syncSource)
+	result.SyncFileReadError = syncReadErr != nil && !errors.Is(syncReadErr, os.ErrNotExist)
+	result.SyncFileEmitted = syncReadErr == nil || result.SyncFileReadError
+	result.SyncResourcesPresent = !result.SyncFileReadError && hasPopulatedSyncResources(syncSource)
 
 	var parts []string
-	switch {
-	case result.SyncCallsDomain:
-		parts = append(parts, "sync uses domain-specific Upsert methods")
-	case strings.Contains(syncSource, ".Upsert("):
-		parts = append(parts, "sync uses generic Upsert only")
-	default:
-		parts = append(parts, "sync Upsert calls not found")
+	if result.SyncFileEmitted {
+		switch {
+		case result.SyncFileReadError:
+			parts = append(parts, "sync.go could not be read")
+		case result.SyncCallsDomain:
+			parts = append(parts, "sync uses domain-specific Upsert methods")
+		case result.SyncCallsGeneric:
+			parts = append(parts, "sync uses generic Upsert only")
+		default:
+			parts = append(parts, "sync Upsert calls not found")
+		}
 	}
 
 	switch {
@@ -2535,7 +2564,7 @@ func checkPipelineIntegrity(dir string) PipelineResult {
 	// the sync command is a no-op at runtime. Store-dependent novel commands
 	// (cookbook, pantry, top-rated, …) then ship with no advertised path to
 	// populate the store. Flag so the absence surfaces at shipcheck time.
-	if syncSource != "" && !result.SyncResourcesPresent {
+	if result.SyncFileEmitted && !result.SyncFileReadError && !result.SyncResourcesPresent {
 		parts = append(parts, "defaultSyncResources empty (sync command is a no-op)")
 	}
 
@@ -2669,65 +2698,70 @@ type dogfoodVerdictRule struct {
 }
 
 var dogfoodVerdictRules = []dogfoodVerdictRule{
-	{"FAIL", func(r *DogfoodReport, hasSpec bool) bool {
+	{DogfoodVerdictFail, func(r *DogfoodReport, hasSpec bool) bool {
 		return hasSpec && r.PathCheck.Tested > 0 && r.PathCheck.Pct < 70
 	}},
-	{"FAIL", func(r *DogfoodReport, hasSpec bool) bool { return hasSpec && !r.IsDeviceCLI && !r.AuthCheck.Match }},
-	{"FAIL", func(r *DogfoodReport, hasSpec bool) bool {
+	{DogfoodVerdictFail, func(r *DogfoodReport, hasSpec bool) bool { return hasSpec && !r.IsDeviceCLI && !r.AuthCheck.Match }},
+	{DogfoodVerdictFail, func(r *DogfoodReport, hasSpec bool) bool {
 		return hasSpec && r.BrowserSessionCheck.Required && !r.BrowserSessionCheck.Pass
 	}},
-	{"FAIL", func(r *DogfoodReport, hasSpec bool) bool {
+	{DogfoodVerdictFail, func(r *DogfoodReport, hasSpec bool) bool {
 		return hasSpec && len(r.OAuthScopeCoverage.Violations) > 0
 	}},
-	{"FAIL", func(r *DogfoodReport, _ bool) bool { return r.DeadFlags.Dead >= 3 }},
-	{"FAIL", func(r *DogfoodReport, _ bool) bool {
+	{DogfoodVerdictFail, func(r *DogfoodReport, _ bool) bool { return r.DeadFlags.Dead >= 3 }},
+	{DogfoodVerdictFail, func(r *DogfoodReport, _ bool) bool {
 		return r.ExampleCheck.Tested > 0 && (r.ExampleCheck.WithExamples*100/r.ExampleCheck.Tested) < 50
 	}},
-	{"FAIL", func(r *DogfoodReport, _ bool) bool {
+	{DogfoodVerdictFail, func(r *DogfoodReport, _ bool) bool {
 		return len(r.ReimplementationCheck.MissingDataSourceStrategy) > 0
 	}},
-	{"FAIL", func(r *DogfoodReport, _ bool) bool {
+	{DogfoodVerdictFail, func(r *DogfoodReport, _ bool) bool {
 		return len(r.ReimplementationCheck.AuthGetenv) > 0
 	}},
-	{"WARN", func(r *DogfoodReport, _ bool) bool { return r.DeadFlags.Dead >= 1 && r.DeadFlags.Dead <= 2 }},
-	{"WARN", func(r *DogfoodReport, _ bool) bool { return r.DeadFuncs.Dead >= 1 }},
-	{"WARN", func(r *DogfoodReport, _ bool) bool { return !r.IsDeviceCLI && !r.PipelineCheck.SyncCallsDomain }},
-	{"WARN", func(r *DogfoodReport, _ bool) bool {
+	{DogfoodVerdictFail, func(r *DogfoodReport, _ bool) bool {
+		return len(r.ReimplementationCheck.UnverifiedHosts) > 0
+	}},
+	{DogfoodVerdictWarn, func(r *DogfoodReport, _ bool) bool { return r.DeadFlags.Dead >= 1 && r.DeadFlags.Dead <= 2 }},
+	{DogfoodVerdictWarn, func(r *DogfoodReport, _ bool) bool { return r.DeadFuncs.Dead >= 1 }},
+	{DogfoodVerdictWarn, func(r *DogfoodReport, _ bool) bool {
+		return !r.IsDeviceCLI && r.PipelineCheck.SyncFileEmitted && !r.PipelineCheck.SyncCallsDomain
+	}},
+	{DogfoodVerdictWarn, func(r *DogfoodReport, _ bool) bool {
 		// Issue #1156: when defaultSyncResources is emitted empty, the sync
 		// command is a runtime no-op and store-dependent novel commands have
 		// no advertised path to populate the store. Promote to WARN so the
 		// gap surfaces at shipcheck time rather than after publish.
 		return !r.IsDeviceCLI && r.PipelineCheck.SyncFileEmitted && !r.PipelineCheck.SyncResourcesPresent
 	}},
-	{"WARN", func(r *DogfoodReport, _ bool) bool { return len(r.ExampleCheck.InvalidFlags) > 0 }},
-	{"WARN", func(r *DogfoodReport, _ bool) bool { return !r.IsDeviceCLI && r.ExampleCheck.Skipped }},
-	{"FAIL", func(r *DogfoodReport, _ bool) bool { return len(r.WiringCheck.CommandTree.Unregistered) > 0 }},
-	{"FAIL", func(r *DogfoodReport, _ bool) bool {
+	{DogfoodVerdictWarn, func(r *DogfoodReport, _ bool) bool { return len(r.ExampleCheck.InvalidFlags) > 0 }},
+	{DogfoodVerdictWarn, func(r *DogfoodReport, _ bool) bool { return !r.IsDeviceCLI && r.ExampleCheck.Skipped }},
+	{DogfoodVerdictFail, func(r *DogfoodReport, _ bool) bool { return len(r.WiringCheck.CommandTree.Unregistered) > 0 }},
+	{DogfoodVerdictFail, func(r *DogfoodReport, _ bool) bool {
 		return !r.WiringCheck.ConfigConsist.Consistent && len(r.WiringCheck.ConfigConsist.Mismatched) > 0
 	}},
 	// Pure-logic packages with zero tests fail shipcheck; prompts alone have not kept this invariant reliable.
-	{"FAIL", func(r *DogfoodReport, _ bool) bool { return len(r.TestPresence.MissingTests) > 0 }},
-	{"FAIL", func(r *DogfoodReport, _ bool) bool { return len(r.NamingCheck.Violations) > 0 }},
-	{"FAIL", func(r *DogfoodReport, _ bool) bool {
+	{DogfoodVerdictFail, func(r *DogfoodReport, _ bool) bool { return len(r.TestPresence.MissingTests) > 0 }},
+	{DogfoodVerdictFail, func(r *DogfoodReport, _ bool) bool { return len(r.NamingCheck.Violations) > 0 }},
+	{DogfoodVerdictFail, func(r *DogfoodReport, _ bool) bool {
 		return r.DescriptionDriftCheck != nil && len(r.DescriptionDriftCheck.Findings) > 0
 	}},
-	{"FAIL", func(r *DogfoodReport, _ bool) bool {
+	{DogfoodVerdictFail, func(r *DogfoodReport, _ bool) bool {
 		return mcpSurfaceCheckActive(r.MCPSurfaceParityCheck) && !r.MCPSurfaceParityCheck.HandEdited && !r.MCPSurfaceParityCheck.Pass
 	}},
-	{"WARN", func(r *DogfoodReport, _ bool) bool { return len(r.WiringCheck.WorkflowComplete.UnmappedSteps) > 0 }},
-	{"WARN", func(r *DogfoodReport, _ bool) bool {
+	{DogfoodVerdictWarn, func(r *DogfoodReport, _ bool) bool { return len(r.WiringCheck.WorkflowComplete.UnmappedSteps) > 0 }},
+	{DogfoodVerdictWarn, func(r *DogfoodReport, _ bool) bool {
 		return len(r.NovelFeaturesCheck.Missing) > 0 ||
 			len(r.NovelFeaturesCheck.DepthMismatches) > 0 ||
 			len(r.NovelFeaturesCheck.Stubbed) > 0
 	}},
-	{"WARN", func(r *DogfoodReport, _ bool) bool {
+	{DogfoodVerdictWarn, func(r *DogfoodReport, _ bool) bool {
 		return mcpSurfaceCheckActive(r.MCPSurfaceParityCheck) && r.MCPSurfaceParityCheck.HandEdited
 	}},
 	// Surface hand-rolled responses without hard-blocking early iteration.
-	{"WARN", func(r *DogfoodReport, _ bool) bool { return len(r.ReimplementationCheck.Suspicious) > 0 }},
-	{"WARN", func(r *DogfoodReport, _ bool) bool { return len(r.SyncParamDropCheck.Findings) > 0 }},
-	{"WARN", func(r *DogfoodReport, _ bool) bool { return len(r.SourceClientCheck.Findings) > 0 }},
-	{"WARN", func(r *DogfoodReport, _ bool) bool { return len(r.PrintJSONFilteredCheck.Findings) > 0 }},
+	{DogfoodVerdictWarn, func(r *DogfoodReport, _ bool) bool { return len(r.ReimplementationCheck.Suspicious) > 0 }},
+	{DogfoodVerdictWarn, func(r *DogfoodReport, _ bool) bool { return len(r.SyncParamDropCheck.Findings) > 0 }},
+	{DogfoodVerdictWarn, func(r *DogfoodReport, _ bool) bool { return len(r.SourceClientCheck.Findings) > 0 }},
+	{DogfoodVerdictWarn, func(r *DogfoodReport, _ bool) bool { return len(r.PrintJSONFilteredCheck.Findings) > 0 }},
 }
 
 func deriveDogfoodVerdict(report *DogfoodReport, hasSpec bool) string {
@@ -2736,7 +2770,7 @@ func deriveDogfoodVerdict(report *DogfoodReport, hasSpec bool) string {
 			return rule.verdict
 		}
 	}
-	return "PASS"
+	return DogfoodVerdictPass
 }
 
 func collectDogfoodIssues(report *DogfoodReport, hasSpec bool) []string {
@@ -2761,10 +2795,17 @@ func collectDogfoodIssues(report *DogfoodReport, hasSpec bool) []string {
 	if report.DeadFuncs.Dead > 0 {
 		issues = append(issues, fmt.Sprintf("%d dead helper functions found", report.DeadFuncs.Dead))
 	}
-	if !report.IsDeviceCLI && !report.PipelineCheck.SyncCallsDomain {
-		issues = append(issues, "sync uses generic Upsert only")
+	if !report.IsDeviceCLI && report.PipelineCheck.SyncFileEmitted && !report.PipelineCheck.SyncCallsDomain {
+		switch {
+		case report.PipelineCheck.SyncFileReadError:
+			issues = append(issues, "sync.go could not be read")
+		case report.PipelineCheck.SyncCallsGeneric:
+			issues = append(issues, "sync uses generic Upsert only")
+		default:
+			issues = append(issues, "sync Upsert calls not found")
+		}
 	}
-	if !report.IsDeviceCLI && report.PipelineCheck.SyncFileEmitted && !report.PipelineCheck.SyncResourcesPresent {
+	if !report.IsDeviceCLI && report.PipelineCheck.SyncFileEmitted && !report.PipelineCheck.SyncFileReadError && !report.PipelineCheck.SyncResourcesPresent {
 		issues = append(issues, "defaultSyncResources empty: sync command is a runtime no-op; store-dependent novel commands have no advertised population path")
 	}
 	if report.ExampleCheck.Tested > 0 && (report.ExampleCheck.WithExamples*100/report.ExampleCheck.Tested) < 50 {
@@ -2837,6 +2878,19 @@ func collectDogfoodIssues(report *DogfoodReport, hasSpec bool) []string {
 		issues = append(issues, fmt.Sprintf("%d/%d novel features missing data-source strategy: %s",
 			len(report.ReimplementationCheck.MissingDataSourceStrategy),
 			report.ReimplementationCheck.Checked,
+			strings.Join(parts, "; ")))
+	}
+	if len(report.ReimplementationCheck.UnverifiedHosts) > 0 {
+		parts := make([]string, 0, len(report.ReimplementationCheck.UnverifiedHosts))
+		for _, f := range report.ReimplementationCheck.UnverifiedHosts {
+			where := f.File
+			if f.Line > 0 {
+				where = fmt.Sprintf("%s:%d", f.File, f.Line)
+			}
+			parts = append(parts, fmt.Sprintf("%s (%s) — %s", f.Command, where, f.Reason))
+		}
+		issues = append(issues, fmt.Sprintf("%d novel feature host(s) are not in research artifacts: %s",
+			len(report.ReimplementationCheck.UnverifiedHosts),
 			strings.Join(parts, "; ")))
 	}
 	if len(report.ReimplementationCheck.AuthGetenv) > 0 {

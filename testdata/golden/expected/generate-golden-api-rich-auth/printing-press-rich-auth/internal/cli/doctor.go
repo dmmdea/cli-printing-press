@@ -80,6 +80,19 @@ func looksLikeDoctorInterstitial(body []byte) string {
 	return ""
 }
 
+func doctorBodyLooksLikeHTML(body []byte) bool {
+	s := strings.TrimSpace(string(body))
+	if s == "" {
+		return false
+	}
+	lower := strings.ToLower(s)
+	if len(lower) > 2048 {
+		lower = lower[:2048]
+	}
+	return strings.HasPrefix(lower, "<!doctype html") || strings.HasPrefix(lower, "<html") ||
+		(strings.HasPrefix(lower, "<") && (strings.Contains(lower, "<html") || strings.Contains(lower, "<body") || strings.Contains(lower, "<head") || strings.Contains(lower, "<title")))
+}
+
 // suggestReadCommand walks the Cobra tree to find an endpoint-mirror command
 // an operator can run to confirm credentials work end-to-end. Picks the
 // first leaf that (a) carries the `pp:endpoint` annotation, so it actually
@@ -169,6 +182,9 @@ func newDoctorCmd(flags *rootFlags) *cobra.Command {
   printing-press-rich-pp-cli doctor --fail-on warn
   printing-press-rich-pp-cli doctor --fail-on stale`,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if dryRunOK(flags) {
+				return writeDryRun(cmd.OutOrStdout(), flags, "doctor")
+			}
 			if registeredPlatformSource != nil {
 				if flags.platformSession == nil {
 					return errors.New("verified client profile session is required")
@@ -321,11 +337,12 @@ func newDoctorCmd(flags *rootFlags) *cobra.Command {
 			//
 			// The doctor uses the same client every other command uses --
 			// flags.newClient() returns a *client.Client wrapping whatever
-			// transport the spec declared (Surf for browser-chrome, stdlib
-			// for standard). A separate stdlib http.Client would silently
-			// bypass that choice and report false negatives against
-			// Cloudflare-fronted, Akamai-fronted, or otherwise bot-detected
-			// sites. By going through flags.newClient(), the doctor's
+			// transport the spec declared (the Chrome-compatible transport
+			// for browser-chrome, stdlib for standard). A separate stdlib
+			// http.Client would silently bypass that choice and report
+			// false negatives against Cloudflare-fronted, Akamai-fronted,
+			// or otherwise bot-detected sites. By going through
+			// flags.newClient(), the doctor's
 			// reachability verdict matches what real commands experience.
 			if cfg != nil && cfg.BaseURL != "" {
 				c, clientErr := flags.newClient()
@@ -333,7 +350,10 @@ func newDoctorCmd(flags *rootFlags) *cobra.Command {
 					report["api"] = fmt.Sprintf("client init error: %s", clientErr)
 				} else {
 					// Step 1: Basic reachability via the configured transport.
-					reachBody, reachErr := c.Get(cmd.Context(), "/", nil)
+					// Health paths have no response_format field, so opt this
+					// probe into HTML: a 200 HTML homepage is reachable, and
+					// a Cloudflare challenge page can still be classified.
+					reachBody, reachErr := c.GetWithHeaders(cmd.Context(), "/", nil, map[string]string{client.HTMLResponseHeader: "true"})
 					var reachAPIErr *client.APIError
 					switch {
 					case reachErr == nil:
@@ -342,6 +362,8 @@ func newDoctorCmd(flags *rootFlags) *cobra.Command {
 						// 200 with a JS challenge page.
 						if vendor := looksLikeDoctorInterstitial(reachBody); vendor != "" {
 							report["api"] = fmt.Sprintf("blocked by %s interstitial — the configured transport reached the wall. Try a different network, wait for the IP-level rate limit to clear, or check that the browser-chrome transport is bound correctly.", vendor)
+						} else if doctorBodyLooksLikeHTML(reachBody) {
+							report["api"] = "reachable (HTML body at /)"
 						} else {
 							report["api"] = "reachable"
 						}
@@ -587,7 +609,7 @@ func collectCredentialsLocationReport(report map[string]any, cfg *config.Config)
 	if cfg == nil {
 		return
 	}
-	credentialRemediation := "run auth set-token or auth logout"
+	remediationHint := "run auth set-token or auth logout"
 	if cfg.CredentialSource != "" {
 		report["credentials_location"] = cfg.CredentialSource
 	} else {
@@ -617,9 +639,9 @@ func collectCredentialsLocationReport(report map[string]any, cfg *config.Config)
 	}
 	if credsPresent && len(locations) > 1 {
 		if legacySecretsElsewhere != "" {
-			report["credentials_location_warning"] = "WARN credentials stored in more than one location; legacy secrets remain at " + legacySecretsElsewhere + "; " + credentialRemediation + " to consolidate and remove legacy secrets"
+			report["credentials_location_warning"] = "WARN credentials stored in more than one location; legacy secrets remain at " + legacySecretsElsewhere + "; " + remediationHint + " to consolidate and remove legacy secrets"
 		} else {
-			report["credentials_location_warning"] = "WARN credentials stored in more than one location; current reads use credentials file; " + credentialRemediation + " to consolidate"
+			report["credentials_location_warning"] = "WARN credentials stored in more than one location; current reads use credentials file; " + remediationHint + " to consolidate"
 		}
 	}
 }
@@ -645,33 +667,59 @@ func legacyCredentialProbePaths(cfg *config.Config) []string {
 	return paths
 }
 
+// doctorInfoKeys are report entries rendered as information, not health
+// checks. Their free text (hints, paths, tool names) can contain "missing"
+// or "error" without meaning the CLI is unhealthy.
+var doctorInfoKeys = map[string]bool{
+	"config_path":                  true,
+	"base_url":                     true,
+	"auth_source":                  true,
+	"auth_domain":                  true,
+	"auth_hint":                    true,
+	"auth_refusals":                true,
+	"version":                      true,
+	"cookie_tool":                  true,
+	"browser_session_proof_detail": true,
+	"credentials_location":         true,
+	"credentials_locations":        true,
+	"agentcookie":                  true,
+}
+
+func doctorIsInfoKey(key string) bool { return doctorInfoKeys[key] }
+
 // doctorExitForFailOn returns a non-nil error when the report's worst
 // status meets the --fail-on gate. "error" trips on failing sections, "warn"
 // trips on deliberate WARN sections plus errors, and "stale" trips on cache
 // freshness plus errors. The default empty string means never fail on status.
+// The gate value is matched case-insensitively.
 func doctorExitForFailOn(failOn string, report map[string]any) error {
+	failOn = strings.ToLower(strings.TrimSpace(failOn))
 	if failOn == "" {
 		return nil
 	}
 	worstError := false
 	worstWarn := false
 	worstStale := false
-	for _, v := range report {
+	for k, v := range report {
 		s, ok := v.(string)
-		if ok {
-			if strings.HasPrefix(s, "ERROR") || strings.HasPrefix(s, "refused:") || strings.Contains(s, "error") || strings.Contains(s, "unreachable") || strings.Contains(s, "invalid") || strings.Contains(s, "missing") {
-				worstError = true
-			}
-			if strings.HasPrefix(s, "WARN") {
+		if ok && !doctorIsInfoKey(k) {
+			low := strings.ToLower(s)
+			// A WARN prefix is the verdict. Explanatory text such as
+			// "neither accepted nor rejected" must not promote it to an error.
+			if strings.HasPrefix(low, "warn") {
 				worstWarn = true
+			} else if strings.HasPrefix(low, "error") || strings.HasPrefix(low, "refused:") || strings.HasPrefix(low, "rejected") || strings.Contains(low, "error") || strings.Contains(low, "unreachable") || strings.Contains(low, "invalid") || strings.Contains(low, "missing") {
+				worstError = true
 			}
 		}
 		if m, ok := v.(map[string]any); ok {
-			if st, _ := m["status"].(string); st == "error" {
+			st, _ := m["status"].(string)
+			switch strings.ToLower(st) {
+			case "error":
 				worstError = true
-			} else if st == "warn" {
+			case "warn":
 				worstWarn = true
-			} else if st == "stale" {
+			case "stale":
 				worstStale = true
 			}
 		}

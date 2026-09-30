@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -738,6 +739,62 @@ func writeAPIErrorEnvelope(w io.Writer, flags *rootFlags, err error, code int) {
 	})
 }
 
+// Printed CLIs need an API-specific way to distinguish known console or landing
+// pages from generic authentication failures, so wrong base URLs can produce
+// actionable guidance without changing classification for every HTML body.
+var classifyHTMLPayload func(trimmed []byte) error
+
+func applyHTMLPayloadClassifier(trimmed []byte) error {
+	if classifyHTMLPayload == nil {
+		return nil
+	}
+	return classifyHTMLPayload(bytes.TrimSpace(trimmed))
+}
+
+func htmlLooksLikeAuthFailure(trimmed []byte) bool {
+	if len(trimmed) == 0 {
+		return false
+	}
+	lower := strings.ToLower(string(trimmed))
+	for _, marker := range []string{
+		"unauthorized",
+		"forbidden",
+		"session expired",
+		"not authenticated",
+		"authentication required",
+		"authentication failed",
+		"invalid api key",
+		"invalid token",
+		"invalid credential",
+		"www-authenticate",
+	} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func htmlEvidenceFromTransportError(err error) []byte {
+	msg := err.Error()
+	const marker = "returned HTML instead of JSON"
+	if idx := strings.Index(msg, marker); idx >= 0 {
+		return []byte(msg[idx+len(marker):])
+	}
+	return []byte(msg)
+}
+
+func classifyHTMLTransportError(err error) error {
+	evidence := htmlEvidenceFromTransportError(err)
+	if classified := applyHTMLPayloadClassifier(evidence); classified != nil {
+		return classified
+	}
+	if htmlLooksLikeAuthFailure(evidence) {
+		return authErr(fmt.Errorf("not authenticated or session expired; API returned HTML instead of JSON. " + "Set your API key with: export EMBEDDED_PAGED_API_KEY=\"your-token-here\""))
+	}
+	return apiErr(fmt.Errorf("%w\nhint: the request may have reached a web page or the wrong endpoint", err))
+}
+
 // classifyAPIErrorOnly maps API errors to structured exit codes without writing.
 // Hand-written commands should use this helper when they own output sequencing.
 func classifyAPIErrorOnly(err error) error {
@@ -747,6 +804,10 @@ func classifyAPIErrorOnly(err error) error {
 	var typed *cliError
 	if errors.As(err, &typed) {
 		return err
+	}
+	var rateLimited *platform.RateLimitedError
+	if errors.As(err, &rateLimited) {
+		return rateLimitErr(err)
 	}
 
 	msg := err.Error()
@@ -773,6 +834,8 @@ func classifyAPIErrorOnly(err error) error {
 		return notFoundErr(fmt.Errorf("%w\nhint: resource not found. Run the 'list' command to see available items", err))
 	case strings.Contains(msg, "HTTP 429"):
 		return rateLimitErr(err)
+	case strings.Contains(msg, "returned HTML instead of JSON"):
+		return classifyHTMLTransportError(err)
 	default:
 		return apiErr(err)
 	}
@@ -786,6 +849,12 @@ func classifyAPIError(w io.Writer, err error, flags *rootFlags) error {
 	var typed *cliError
 	if errors.As(err, &typed) {
 		return err
+	}
+	var rateLimited *platform.RateLimitedError
+	if errors.As(err, &rateLimited) {
+		classified := rateLimitErr(err)
+		writeAPIErrorEnvelope(w, flags, classified, ExitCode(classified))
+		return classified
 	}
 	msg := err.Error()
 	if strings.Contains(msg, "HTTP 409") {
@@ -895,6 +964,48 @@ func paginatedGetWithResponsePath(ctx context.Context, c interface {
 	return applyResponsePath(data, responsePath), nil
 }
 
+// Generated commands stringify every flag, so an unset default and an
+// operator-set --flag=false or --n=0 are the same "false"/"0" bytes.
+// Explicit false/0 must stay on the wire; otherwise a boolean that
+// defaults to true is accepted and never reaches the API.
+func retainCLIQueryParams(cmd *cobra.Command, params map[string]string, flagNamesByWire map[string][]string, cursorParam, paginationType string) map[string]string {
+	explicit := map[string]struct{}{}
+	for wire := range params {
+		names, tracked := flagNamesByWire[wire]
+		if !tracked {
+			explicit[wire] = struct{}{}
+			continue
+		}
+		if cmd == nil {
+			continue
+		}
+		for _, name := range names {
+			if cmd.Flags().Changed(name) {
+				explicit[wire] = struct{}{}
+				break
+			}
+		}
+	}
+	return retainExplicitQueryParams(params, explicit, cursorParam, paginationType)
+}
+
+func retainExplicitQueryParams(params map[string]string, explicit map[string]struct{}, cursorParam, paginationType string) map[string]string {
+	clean := map[string]string{}
+	for k, v := range params {
+		if v == "" {
+			continue
+		}
+		if _, ok := explicit[k]; ok {
+			clean[k] = v
+			continue
+		}
+		if (k == cursorParam && paginationType == "offset") || (v != "0" && v != "false") {
+			clean[k] = v
+		}
+	}
+	return clean
+}
+
 // paginatedGet fetches pages and concatenates array results. The headers
 // argument carries per-endpoint required headers (e.g. cal-api-version) that
 // must be sent on every page request, including the first; pass nil when the
@@ -902,16 +1013,21 @@ func paginatedGetWithResponsePath(ctx context.Context, c interface {
 func paginatedGet(ctx context.Context, c interface {
 	GetWithHeaders(ctx context.Context, path string, params map[string]string, headers map[string]string) (json.RawMessage, error)
 }, path string, params map[string]string, headers map[string]string, fetchAll bool, cursorParam, paginationType, limitParam string, defaultPageSize int, nextCursorPath, hasMoreField string) (json.RawMessage, error) {
-	// The cursor param is exempt from the "0"/"false" strip only for offset
-	// pagination, where offset=0 is a legitimate first page. Under id-cursor
-	// pagination 0 is not a real record id: APIs answer it with an empty page,
-	// so an unset cursor flag would silently empty every list command.
+	// Generated commands run retainCLIQueryParams first so unset "0"/"false"
+	// never reach this loop. Values that remain — including operator-set
+	// false/0 — go on the wire. Empty strings are still dropped. The offset
+	// cursor is exempt so offset=0 is a legitimate first page. Under
+	// id-cursor pagination 0 is not a real record id: APIs answer it with
+	// an empty page, so cursor=0 must not survive as an unset flag.
 	clean := map[string]string{}
 	for k, v := range params {
 		if v == "" {
 			continue
 		}
-		if (k == cursorParam && paginationType == "offset") || (v != "0" && v != "false") {
+		if k == cursorParam && paginationType != "offset" && v == "0" {
+			continue
+		}
+		if (k == cursorParam && paginationType == "offset") || v != "" {
 			clean[k] = v
 		}
 	}
@@ -1903,11 +2019,21 @@ func responsePayloadParentAtPath(data json.RawMessage, responsePath string) (map
 // build a typed slice/struct call this so --select, --compact, --csv, and
 // --quiet all behave the same way as on generator-emitted commands.
 func printJSONFiltered(w io.Writer, v any, flags *rootFlags) error {
+	return printJSONFilteredKeep(w, v, flags)
+}
+
+// Caller-supplied row keys that --agent/--compact must retain cannot be
+// passed as documented fields: that switches on schema-aware compaction,
+// which keeps only gravity names and drops the keys the caller asked for.
+func printJSONFilteredKeep(w io.Writer, v any, flags *rootFlags, keep ...string) error {
 	raw, err := json.Marshal(v)
 	if err != nil {
 		return err
 	}
-	return printOutputWithFlags(w, json.RawMessage(raw), flags)
+	if len(keep) == 0 || flags == nil {
+		return printOutputWithFlags(w, json.RawMessage(raw), flags)
+	}
+	return printOutputWithFlagsMetaAndKeep(w, json.RawMessage(raw), flags, map[string]any{"source": resolveAgentOutputSource(flags, json.RawMessage(raw))}, keep)
 }
 
 func platformStructuredOutputSelected(w io.Writer, flags *rootFlags) bool {
@@ -1986,10 +2112,7 @@ func wrapPlatformStructuredOutput(data json.RawMessage, flags *rootFlags, result
 		if err := json.Unmarshal(envelope["meta"], &meta); err != nil {
 			return nil, err
 		}
-		for key, value := range platformMeta {
-			meta[key] = value
-		}
-		mergedMeta, err := json.Marshal(meta)
+		mergedMeta, err := json.Marshal(mergeCommandMeta(meta, platformMeta))
 		if err != nil {
 			return nil, err
 		}
@@ -2008,30 +2131,104 @@ func wrapPlatformStructuredOutput(data json.RawMessage, flags *rootFlags, result
 	return data, nil
 }
 
+// Command-owned metadata must remain authoritative when output wrappers add
+// provenance. A wrapper source on the other axis is kept beside it: transport
+// is live, local, or dry-run, and data-origin is catalogue or computed. Those
+// axes are not collapsed into one source string.
+func mergeCommandMeta(commandMeta, wrapperMeta map[string]any) map[string]any {
+	merged := make(map[string]any, len(commandMeta)+len(wrapperMeta))
+	for key, value := range commandMeta {
+		merged[key] = value
+	}
+	for key, value := range wrapperMeta {
+		if key == "source" {
+			preserveWrapperSource(merged, value)
+			continue
+		}
+		if _, present := merged[key]; present {
+			continue
+		}
+		merged[key] = value
+	}
+	return merged
+}
+
+func preserveWrapperSource(dst map[string]any, wrapperSource any) {
+	_, present := dst["source"]
+	wrapperText, wrapperOK := metaSourceString(wrapperSource)
+	if !present {
+		if wrapperOK {
+			dst["source"] = wrapperText
+		} else if wrapperSource != nil {
+			dst["source"] = wrapperSource
+		}
+		return
+	}
+	if !wrapperOK {
+		return
+	}
+	commandText, commandOK := metaSourceString(dst["source"])
+	if !commandOK || strings.EqualFold(commandText, wrapperText) {
+		return
+	}
+	commandAxis := metaSourceAxis(commandText)
+	wrapperAxis := metaSourceAxis(wrapperText)
+	if commandAxis == "" || wrapperAxis == "" || commandAxis == wrapperAxis {
+		return
+	}
+	if _, exists := dst[wrapperAxis]; exists {
+		return
+	}
+	dst[wrapperAxis] = wrapperText
+}
+
+func metaSourceString(value any) (string, bool) {
+	text, ok := value.(string)
+	if !ok {
+		return "", false
+	}
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return "", false
+	}
+	return text, true
+}
+
+func metaSourceAxis(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "live", "local", "dry-run":
+		return "transport"
+	case "catalogue", "computed":
+		return "data_origin"
+	default:
+		return ""
+	}
+}
+
 // wrapAgentOutput gives --agent callers one parseable top-level envelope for
 // generated command families that build typed Go values instead of endpoint
 // response bytes. The raw value is preserved under results so --json without
 // --agent can stay backward-compatible while shell agents get stable metadata.
-// A payload that is already a {meta, results} envelope is flattened so a
-// second wrap cannot overwrite live provenance with the local default.
+// A payload that is already a {meta, results} envelope is flattened. The
+// command's meta wins; a wrapper source on the other provenance axis is kept.
 func wrapAgentOutput(data json.RawMessage, meta map[string]any) (json.RawMessage, error) {
-	if meta == nil {
-		meta = map[string]any{}
+	merged := map[string]any{}
+	for key, value := range meta {
+		merged[key] = value
 	}
 	if results, existing, ok := splitResultsMetaEnvelope(data); ok {
-		for k, v := range existing {
-			if _, present := meta[k]; !present {
-				meta[k] = v
-			}
-		}
+		merged = mergeCommandMeta(existing, merged)
 		data = results
 	}
-	if _, ok := meta["source"]; !ok {
-		meta["source"] = "local"
+	source, hasSource := metaSourceString(merged["source"])
+	if !hasSource {
+		source = "local"
+		merged["source"] = source
 	}
-	if source, _ := meta["source"].(string); source == "live" {
+	if source == "live" {
 		data = unwrapSingleKeyArray(data)
 	}
+	meta = merged
 	var results any
 	if json.Valid(data) {
 		results = data
@@ -2088,8 +2285,10 @@ func declaredAgentSource(cmd *cobra.Command, flags *rootFlags) string {
 	switch commandDataSourceAnnotation(cmd) {
 	case "live":
 		return "live"
-	case "local", "computed":
+	case "local":
 		return "local"
+	case "computed":
+		return "computed"
 	case "auto":
 		if flags != nil && flags.dataSource == "local" {
 			return "local"
@@ -2161,7 +2360,14 @@ func unwrapSingleKeyArray(data json.RawMessage) json.RawMessage {
 // filterFields keeps only the specified fields (comma-separated) from JSON objects/arrays.
 // Supports dotted paths like "events.shortName" to descend into nested structures.
 // Arrays are traversed element-wise: "events.shortName" keeps shortName on each event.
+// This one-value wrapper stays so preserved novel commands keep compiling.
+// Generated output sites use filterFieldsChecked so a total miss can exit non-zero.
 func filterFields(data json.RawMessage, fields string) json.RawMessage {
+	filtered, _ := filterFieldsChecked(data, fields)
+	return filtered
+}
+
+func filterFieldsChecked(data json.RawMessage, fields string) (json.RawMessage, error) {
 	var paths [][]string
 	var requestedPaths []string
 	for _, f := range strings.Split(fields, ",") {
@@ -2177,13 +2383,14 @@ func filterFields(data json.RawMessage, fields string) json.RawMessage {
 		paths = append(paths, parts)
 	}
 	if len(paths) == 0 {
-		return data
+		return data, nil
 	}
 	filtered, state := filterFieldsRec(data, paths, true)
 	valid := ""
+	var unmatched []string
 	for i, path := range paths {
 		_, pathState := filterFieldsRec(data, [][]string{path}, true)
-		pathIndeterminate := pathState.anchoredIndeterminate || (len(paths) == 1 && pathState.fallbackIndeterminate)
+		pathIndeterminate := pathState.anchoredIndeterminate || pathState.fallbackIndeterminate
 		if pathState.matched || pathIndeterminate {
 			continue
 		}
@@ -2194,11 +2401,26 @@ func filterFields(data json.RawMessage, fields string) json.RawMessage {
 			}
 		}
 		fmt.Fprintf(os.Stderr, "warning: --select %q matched no fields; valid fields: %s\n", requestedPaths[i], valid)
+		unmatched = append(unmatched, requestedPaths[i])
 	}
+	out := filtered
 	if !state.matched && !state.anchoredIndeterminate && !state.fallbackIndeterminate {
-		return data
+		out = data
 	}
-	return filtered
+	if len(unmatched) > 0 && len(unmatched) == len(requestedPaths) && !state.anchoredIndeterminate && !state.fallbackIndeterminate {
+		return out, usageErr(fmt.Errorf("--select matched no fields: %s", strings.Join(unmatched, ", ")))
+	}
+	return out, nil
+}
+
+// The persistent --dry-run flag must not weaken all-miss --select typo
+// detection on local search or on determinate API payloads that merely
+// contain `"dry_run": true`; only the exact client sentinel is a plan.
+func selectErrorForDryRun(err error, flags *rootFlags, data json.RawMessage) error {
+	if err == nil || !isDryRunResponse(flags != nil && flags.dryRun, data) {
+		return err
+	}
+	return nil
 }
 
 func selectFieldKeys(data json.RawMessage) []string {
@@ -2467,6 +2689,10 @@ func handleBinaryResponseDelivery(cmd *cobra.Command, flags *rootFlags, data jso
 }
 
 func printOutputWithFlagsMeta(w io.Writer, data json.RawMessage, flags *rootFlags, agentMeta map[string]any, documentedFields ...map[string]bool) error {
+	return printOutputWithFlagsMetaAndKeep(w, data, flags, agentMeta, nil, documentedFields...)
+}
+
+func printOutputWithFlagsMetaAndKeep(w io.Writer, data json.RawMessage, flags *rootFlags, agentMeta map[string]any, keep []string, documentedFields ...map[string]bool) error {
 	if err := validatePlatformAnalytics(flags); err != nil {
 		return err
 	}
@@ -2475,10 +2701,13 @@ func printOutputWithFlagsMeta(w io.Writer, data json.RawMessage, flags *rootFlag
 	// must not strip those fields out before --select can pick them. When
 	// only --compact is set (e.g., --agent without --select), the allow-list
 	// still runs.
+	var selectErr error
 	if flags.selectFields != "" {
-		data = filterFields(data, flags.selectFields)
+		selectPayload := data
+		data, selectErr = filterFieldsChecked(selectPayload, flags.selectFields)
+		selectErr = selectErrorForDryRun(selectErr, flags, selectPayload)
 	} else if flags.compact {
-		data = compactFields(data, documentedFields...)
+		data = compactFieldsKeep(data, keep, documentedFields...)
 	}
 	if flags.agent && flags.asJSON && !flags.csv && !flags.plain && !flags.quiet {
 		wrapped, err := wrapAgentOutput(data, agentMeta)
@@ -2500,28 +2729,35 @@ func printOutputWithFlagsMeta(w io.Writer, data json.RawMessage, flags *rootFlag
 	}
 	// --quiet: one identity value per row (id, then name/slug/title).
 	if flags.quiet {
-		return printQuiet(w, data)
-	}
-	// --csv: render as CSV
-	if flags.csv {
-		headerFields := documentedFields
-		if flags.selectFields != "" {
-			selected := map[string]bool{}
-			for _, part := range strings.Split(flags.selectFields, ",") {
-				part = strings.TrimSpace(part)
-				if part != "" {
-					selected[part] = true
-				}
-			}
-			headerFields = []map[string]bool{selected}
+		if err := printQuiet(w, data); err != nil {
+			return err
 		}
-		return printCSV(w, data, headerFields...)
+		return selectErr
 	}
-	// --plain: render arrays as tab-separated rows
-	if flags.plain {
-		return printPlain(w, data)
+	headerFields := documentedFields
+	if flags.selectFields != "" {
+		selected := map[string]bool{}
+		for _, part := range strings.Split(flags.selectFields, ",") {
+			part = strings.TrimSpace(part)
+			if part != "" {
+				selected[part] = true
+			}
+		}
+		headerFields = []map[string]bool{selected}
 	}
-	return printOutput(w, data, flags.asJSON)
+	var printErr error
+	switch {
+	case flags.csv:
+		printErr = printCSV(w, data, headerFields...)
+	case flags.plain:
+		printErr = printPlain(w, data, headerFields...)
+	default:
+		printErr = printOutput(w, data, flags.asJSON)
+	}
+	if printErr != nil {
+		return printErr
+	}
+	return selectErr
 }
 
 // compactVerboseListFields are prose-shaped fields stripped from list-item
@@ -2548,16 +2784,23 @@ var compactVerboseObjectFields = map[string]bool{
 // For arrays: allowlist of high-gravity fields (no descriptions).
 // For single objects: blocklist that strips known-verbose fields (descriptions, comments, etc.).
 func compactFields(data json.RawMessage, documentedFields ...map[string]bool) json.RawMessage {
+	return compactFieldsKeep(data, nil, documentedFields...)
+}
+
+// keep stays a floor rather than a documented-field set. Schema-aware
+// compaction keeps only gravity names and would drop the keys the caller
+// asked --agent/--compact to retain.
+func compactFieldsKeep(data json.RawMessage, keep []string, documentedFields ...map[string]bool) json.RawMessage {
 	// Try array first
 	var items []map[string]any
 	if err := json.Unmarshal(data, &items); err == nil {
-		return compactListFields(items, documentedFields...)
+		return compactListFields(items, keep, documentedFields...)
 	}
 
 	// Single object — use blocklist
 	var obj map[string]any
 	if err := json.Unmarshal(data, &obj); err == nil {
-		return compactObjectFields(obj, documentedFields...)
+		return compactObjectFields(obj, keep, documentedFields...)
 	}
 
 	return data
@@ -2613,7 +2856,14 @@ func isCompactGravityField(name string) bool {
 // When an item still carries none of the keep keys, the original is
 // preserved so `--agent` does not silently emit {} for shapes whose key
 // names are entirely off-canonical.
-func compactListFields(items []map[string]any, documentedFields ...map[string]bool) json.RawMessage {
+//
+// keep is a floor of additional row keys. It does not switch on
+// schema-aware compaction. Envelope sidecar names (warnings, errors,
+// fetch_failures) are also a floor, but only in the frequency path:
+// hypothesis — object-level projection already copies those arrays
+// through, and the frequency rule then treats the same names inside
+// payload rows as ordinary keys, so a minority of rows lose them.
+func compactListFields(items []map[string]any, keep []string, documentedFields ...map[string]bool) json.RawMessage {
 	keepFields := map[string]bool{
 		// Identity
 		"id": true, "name": true, "title": true, "identifier": true,
@@ -2643,11 +2893,21 @@ func compactListFields(items []map[string]any, documentedFields ...map[string]bo
 			}
 		}
 	}
+	for _, field := range keep {
+		if field != "" {
+			keepFields[field] = true
+		}
+	}
 	schemaAware := false
 	for _, fields := range documentedFields {
 		if len(fields) > 0 {
 			schemaAware = true
 			break
+		}
+	}
+	if !schemaAware {
+		for field := range envelopeMetadataArrayKeys {
+			keepFields[field] = true
 		}
 	}
 	if !schemaAware && len(items) > 0 {
@@ -2711,8 +2971,8 @@ func isCompactScalar(v any) bool {
 // "markdown" — those fields are payload on `get` commands and stripping them
 // under `--agent`/`--compact` is a silent loss; agents who want to omit them
 // can pass `--select` to specify only the fields they need.
-func compactObjectFields(obj map[string]any, documentedFields ...map[string]bool) json.RawMessage {
-	if compacted, ok := compactListEnvelopeObjectAtDepth(obj, 0, documentedFields...); ok {
+func compactObjectFields(obj map[string]any, keep []string, documentedFields ...map[string]bool) json.RawMessage {
+	if compacted, ok := compactListEnvelopeObjectAtDepth(obj, 0, keep, documentedFields...); ok {
 		result, _ := json.Marshal(compacted)
 		return result
 	}
@@ -2726,7 +2986,7 @@ func compactObjectFields(obj map[string]any, documentedFields ...map[string]bool
 	return result
 }
 
-func compactListEnvelopeObjectAtDepth(obj map[string]any, envelopeDepth int, documentedFields ...map[string]bool) (map[string]any, bool) {
+func compactListEnvelopeObjectAtDepth(obj map[string]any, envelopeDepth int, keep []string, documentedFields ...map[string]bool) (map[string]any, bool) {
 	out := map[string]any{}
 	foundArray := false
 	payloadArrays := map[string]bool{}
@@ -2734,7 +2994,7 @@ func compactListEnvelopeObjectAtDepth(obj map[string]any, envelopeDepth int, doc
 		if envelopeMetadataArrayKeys[k] || envelopeMetadataKeys[k] {
 			continue
 		}
-		if _, ok := compactObjectArrayValue(v, documentedFields...); ok {
+		if _, ok := compactObjectArrayValue(v, keep, documentedFields...); ok {
 			payloadArrays[k] = true
 		}
 	}
@@ -2746,14 +3006,14 @@ func compactListEnvelopeObjectAtDepth(obj map[string]any, envelopeDepth int, doc
 			out[k] = v
 			continue
 		}
-		if compacted, ok := compactObjectArrayValue(v, documentedFields...); ok {
+		if compacted, ok := compactObjectArrayValue(v, keep, documentedFields...); ok {
 			foundArray = true
 			out[k] = compacted
 			continue
 		}
 		if nested, ok := v.(map[string]any); ok {
 			if envelopeDepth < maxListEnvelopeDepth {
-				if compacted, ok := compactListEnvelopeObjectAtDepth(nested, envelopeDepth+1, documentedFields...); ok {
+				if compacted, ok := compactListEnvelopeObjectAtDepth(nested, envelopeDepth+1, keep, documentedFields...); ok {
 					foundArray = true
 					out[k] = compacted
 					continue
@@ -2768,7 +3028,7 @@ func compactListEnvelopeObjectAtDepth(obj map[string]any, envelopeDepth int, doc
 	return out, true
 }
 
-func compactObjectArrayValue(v any, documentedFields ...map[string]bool) (any, bool) {
+func compactObjectArrayValue(v any, keep []string, documentedFields ...map[string]bool) (any, bool) {
 	rawItems, ok := v.([]any)
 	if !ok || len(rawItems) == 0 {
 		return nil, false
@@ -2781,13 +3041,17 @@ func compactObjectArrayValue(v any, documentedFields ...map[string]bool) (any, b
 		}
 		items = append(items, item)
 	}
-	compactedRaw := compactListFields(items, documentedFields...)
+	compactedRaw := compactListFields(items, keep, documentedFields...)
 	var compacted any
 	if err := json.Unmarshal(compactedRaw, &compacted); err != nil {
 		return nil, false
 	}
 	return compacted, true
 }
+
+// Distinguishes an empty array from swallowed stdout when no header
+// columns are known. Exit 0 with zero bytes is indistinguishable from a crash.
+const emptyTabularResultMarker = "(no rows)"
 
 func printCSV(w io.Writer, data json.RawMessage, documentedFields ...map[string]bool) error {
 	items, ok := tabularObjectRows(data)
@@ -2798,6 +3062,7 @@ func printCSV(w io.Writer, data json.RawMessage, documentedFields ...map[string]
 	if len(items) == 0 {
 		keys := csvDeclaredHeader(documentedFields...)
 		if len(keys) == 0 {
+			fmt.Fprintln(w, emptyTabularResultMarker)
 			return nil
 		}
 		writeCSVRow(w, keys)
@@ -2825,14 +3090,7 @@ func writeCSVRows(w io.Writer, items []map[string]any) error {
 	for _, item := range items {
 		var vals []string
 		for _, k := range keys {
-			v := item[k]
-			if v == nil {
-				vals = append(vals, "")
-			} else if f, ok := v.(float64); ok {
-				vals = append(vals, strconv.FormatFloat(f, 'f', -1, 64))
-			} else {
-				vals = append(vals, fmt.Sprintf("%v", v))
-			}
+			vals = append(vals, formatTabularCell(item[k]))
 		}
 		writeCSVRow(w, vals)
 	}
@@ -2868,13 +3126,19 @@ func csvDeclaredHeader(documentedFields ...map[string]bool) []string {
 	return keys
 }
 
-func printPlain(w io.Writer, data json.RawMessage) error {
+func printPlain(w io.Writer, data json.RawMessage, documentedFields ...map[string]bool) error {
 	items, ok := tabularObjectRows(data)
 	if !ok {
 		fmt.Fprintln(w, string(data))
 		return nil
 	}
 	if len(items) == 0 {
+		keys := csvDeclaredHeader(documentedFields...)
+		if len(keys) == 0 {
+			fmt.Fprintln(w, emptyTabularResultMarker)
+			return nil
+		}
+		fmt.Fprintln(w, strings.Join(keys, "\t"))
 		return nil
 	}
 	keySet := map[string]bool{}
@@ -2948,16 +3212,21 @@ func quietRowValue(item map[string]any) string {
 			}
 		}
 	}
-	for k, v := range item {
+	keys := make([]string, 0, len(item))
+	for k := range item {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
 		lower := strings.ToLower(k)
 		if strings.HasSuffix(lower, "_id") || strings.HasSuffix(k, "Id") {
-			if s := quietScalar(v); s != "" {
+			if s := quietScalar(item[k]); s != "" {
 				return s
 			}
 		}
 	}
-	for _, v := range item {
-		if s := quietScalar(v); s != "" {
+	for _, k := range keys {
+		if s := quietScalar(item[k]); s != "" {
 			return s
 		}
 	}
@@ -3027,20 +3296,77 @@ func objectEnvelopeRows(obj map[string]any) ([]map[string]any, bool) {
 }
 
 func plainCellValue(v any) string {
-	if v == nil {
-		return ""
-	}
-	var s string
-	if f, ok := v.(float64); ok {
-		s = strconv.FormatFloat(f, 'f', -1, 64)
-	} else {
-		s = fmt.Sprintf("%v", v)
-	}
+	s := formatTabularCell(v)
 	s = strings.ReplaceAll(s, "\t", " ")
 	s = strings.ReplaceAll(s, "\r\n", " ")
 	s = strings.ReplaceAll(s, "\n", " ")
 	s = strings.ReplaceAll(s, "\r", " ")
 	return s
+}
+
+// --csv/--plain cells must round-trip. fmt's %v of map[string]any and []any
+// is Go syntax, so nested values are compact JSON. Nested numbers stay
+// fixed-point so a magnitude that encoding/json would print with an exponent
+// remains a plain decimal, matching top-level float64 cells.
+func formatTabularCell(v any) string {
+	if v == nil {
+		return ""
+	}
+	if f, ok := v.(float64); ok {
+		return strconv.FormatFloat(f, 'f', -1, 64)
+	}
+	if text, ok := compactJSONCell(v); ok {
+		return text
+	}
+	return fmt.Sprintf("%v", v)
+}
+
+func compactJSONCell(v any) (string, bool) {
+	switch v.(type) {
+	case map[string]any, []any:
+	default:
+		return "", false
+	}
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(jsonFixedNumbers(v)); err != nil {
+		return "", false
+	}
+	return strings.TrimRight(buf.String(), "\n"), true
+}
+
+func jsonFixedNumbers(v any) any {
+	switch t := v.(type) {
+	case float64:
+		return jsonFixedFloat(t)
+	case map[string]any:
+		out := make(map[string]any, len(t))
+		for k, val := range t {
+			out[k] = jsonFixedNumbers(val)
+		}
+		return out
+	case []any:
+		out := make([]any, len(t))
+		for i, val := range t {
+			out[i] = jsonFixedNumbers(val)
+		}
+		return out
+	default:
+		return v
+	}
+}
+
+// jsonFixedFloat forces decimal text. JSON has no NaN or Inf, so those
+// become null and the rest of the cell still encodes.
+type jsonFixedFloat float64
+
+func (f jsonFixedFloat) MarshalJSON() ([]byte, error) {
+	v := float64(f)
+	if math.IsNaN(v) || math.IsInf(v, 0) {
+		return []byte("null"), nil
+	}
+	return []byte(strconv.FormatFloat(v, 'f', -1, 64)), nil
 }
 
 // printOutput auto-detects arrays and renders as tables, or prints raw JSON for objects.
@@ -3593,8 +3919,14 @@ func printProvenance(cmd *cobra.Command, count int, prov DataProvenance) {
 
 func nonJSONPayloadError(data json.RawMessage) error {
 	trimmed := bytes.TrimSpace(data)
+	if err := applyHTMLPayloadClassifier(trimmed); err != nil {
+		return err
+	}
 	if len(trimmed) > 0 && trimmed[0] == '<' {
-		return authErr(fmt.Errorf("not authenticated or session expired; API returned HTML instead of JSON. " + "Set your API key with: export EMBEDDED_PAGED_API_KEY=\"your-token-here\""))
+		if htmlLooksLikeAuthFailure(trimmed) {
+			return authErr(fmt.Errorf("not authenticated or session expired; API returned HTML instead of JSON. " + "Set your API key with: export EMBEDDED_PAGED_API_KEY=\"your-token-here\""))
+		}
+		return apiErr(fmt.Errorf("API returned HTML instead of JSON; the request may have reached a web page or the wrong endpoint"))
 	}
 	if len(trimmed) == 0 {
 		return apiErr(fmt.Errorf("API returned an empty response body; expected JSON"))
@@ -3613,6 +3945,8 @@ func assertLiveJSONBody(data json.RawMessage) error {
 // {"results": ..., "meta": {...}}. Single-key array envelopes from the API
 // (e.g. {"results": [...]}, {"data": [...]}) are unwrapped first so the
 // output shape is the same regardless of the API's wrapper key.
+// A payload that already has both meta and results stays one envelope;
+// the command's meta wins and provenance fills only missing keys.
 func wrapWithProvenance(data json.RawMessage, prov DataProvenance) (json.RawMessage, error) {
 	meta := map[string]any{"source": prov.Source}
 	if prov.SyncedAt != nil {
@@ -3626,6 +3960,16 @@ func wrapWithProvenance(data json.RawMessage, prov DataProvenance) (json.RawMess
 	}
 	if prov.Freshness != nil {
 		meta["freshness"] = prov.Freshness
+	}
+	if results, existing, ok := splitResultsMetaEnvelope(data); ok {
+		if !json.Valid(results) {
+			return nil, nonJSONPayloadError(results)
+		}
+		envelope := map[string]any{
+			"results": json.RawMessage(results),
+			"meta":    mergeCommandMeta(existing, meta),
+		}
+		return json.Marshal(envelope)
 	}
 	var results any
 	if json.Valid(data) {

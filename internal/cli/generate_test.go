@@ -585,6 +585,36 @@ func TestGenerateCmdForceStillPreservesCompilingHandEdits(t *testing.T) {
 	runGoCommandForCLITest(t, outputDir, "build", "./cmd/handedit-pp-cli")
 }
 
+func TestGenerateCmdForcePreservesHandEditedGeneratedFuncBody(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	specPath := filepath.Join(dir, "spec.yaml")
+	outputDir := filepath.Join(dir, "bodyedit")
+	require.NoError(t, os.WriteFile(specPath, forceRegenMatrixSpec("bodyedit"), 0o644))
+
+	runForceRegenMatrixGenerate(t, specPath, outputDir, false, false)
+
+	clientPath := filepath.Join(outputDir, "internal", "client", "client.go")
+	client, err := os.ReadFile(clientPath)
+	require.NoError(t, err)
+	const original = "return c != nil && c.DryRun"
+	require.Contains(t, string(client), original)
+	edited := bytes.Replace(client, []byte(original), []byte("if c == nil {\n\t\treturn false\n\t}\n\treturn c.DryRun"), 1)
+	require.NoError(t, os.WriteFile(clientPath, edited, 0o644))
+
+	runForceRegenMatrixGenerate(t, specPath, outputDir, true, true)
+
+	got, err := os.ReadFile(clientPath)
+	require.NoError(t, err)
+	assert.Contains(t, string(got), "if c == nil",
+		"same-version generate --force must keep a hand-edited generated function body")
+	assert.NotContains(t, string(got), original)
+
+	runGoCommandForCLITest(t, outputDir, "mod", "tidy")
+	runGoCommandForCLITest(t, outputDir, "build", "./cmd/bodyedit-pp-cli")
+}
+
 func TestForceRegenCommandModulePathMatchesVersionMajor(t *testing.T) {
 	t.Parallel()
 
@@ -1898,7 +1928,8 @@ resources:
 
 	gomod, err := os.ReadFile(filepath.Join(outputDir, "go.mod"))
 	require.NoError(t, err)
-	assert.Contains(t, string(gomod), "github.com/enetx/surf")
+	assert.Contains(t, string(gomod), "github.com/refraction-networking/utls")
+	assert.NotContains(t, string(gomod), "github.com/enetx/")
 
 	authGo, err := os.ReadFile(filepath.Join(outputDir, "internal", "cli", "auth.go"))
 	require.NoError(t, err)
@@ -1913,12 +1944,16 @@ resources:
 	clientGo, err := os.ReadFile(filepath.Join(outputDir, "internal", "client", "client.go"))
 	require.NoError(t, err)
 	assert.NotContains(t, string(clientGo), `req.Header.Set("User-Agent"`)
-	assert.Contains(t, string(clientGo), `"github.com/enetx/surf"`)
-	// HAR distribution declares H/2 majority -> ForceHTTP2 is emitted and
-	// ForceHTTP3 is not. With an empty distribution the bare browser-chrome
-	// enum would emit neither; the fixture above pins the HAR-driven path.
-	assert.Contains(t, string(clientGo), "ForceHTTP2()")
-	assert.NotContains(t, string(clientGo), "ForceHTTP3()")
+	assert.Contains(t, string(clientGo), "return chromeClient(timeout, jar, skipTLSVerify)")
+	assert.NotContains(t, string(clientGo), "github.com/enetx/")
+	// HAR distribution declares H/2 majority -> the ClientHello offers only
+	// h2 and no HTTP/3 transport is emitted. With an empty distribution the
+	// bare browser-chrome enum would also offer http/1.1; the fixture above
+	// pins the HAR-driven path.
+	chromeGo, err := os.ReadFile(filepath.Join(outputDir, "internal", "client", "chrome.go"))
+	require.NoError(t, err)
+	assert.Contains(t, string(chromeGo), `chromeALPN = []string{"h2"}`)
+	assert.NoFileExists(t, filepath.Join(outputDir, "internal", "client", "chrome_h3.go"))
 	assert.NotContains(t, string(clientGo), "runBrowserUseFetch")
 	assert.NotContains(t, string(clientGo), "runAgentBrowserFetch")
 	assert.NotContains(t, string(clientGo), "browser runtime required")
@@ -1995,10 +2030,13 @@ resources:
 
 	clientGo, err := os.ReadFile(filepath.Join(outputDir, "internal", "client", "client.go"))
 	require.NoError(t, err)
-	assert.Contains(t, string(clientGo), `"github.com/enetx/surf"`)
-	// HAR distribution declares H/2 majority -> ForceHTTP2 emits.
-	assert.Contains(t, string(clientGo), "ForceHTTP2()")
-	assert.NotContains(t, string(clientGo), "ForceHTTP3()")
+	assert.Contains(t, string(clientGo), "return chromeClient(timeout, jar, skipTLSVerify)")
+	assert.NotContains(t, string(clientGo), "github.com/enetx/")
+	// HAR distribution declares H/2 majority -> the ClientHello offers only h2.
+	chromeGo, err := os.ReadFile(filepath.Join(outputDir, "internal", "client", "chrome.go"))
+	require.NoError(t, err)
+	assert.Contains(t, string(chromeGo), `chromeALPN = []string{"h2"}`)
+	assert.NoFileExists(t, filepath.Join(outputDir, "internal", "client", "chrome_h3.go"))
 	assert.NotContains(t, string(clientGo), "runBrowserUseFetch")
 	assert.NotContains(t, string(clientGo), "runAgentBrowserFetch")
 
@@ -2491,6 +2529,112 @@ func TestMergeSpecsPreservesRequiredHeadersAndLearnFromLaterSpecs(t *testing.T) 
 			"team": {{Canonical: "Acme", Aliases: []string{"acme corp"}}},
 		},
 	}, merged.Learn)
+}
+
+func tenantTemplateSpec(name, override string) *spec.APISpec {
+	s := &spec.APISpec{
+		Name:                 name,
+		Version:              "0.1.0",
+		BaseURL:              "https://api.example.com",
+		EndpointTemplateVars: []string{"tenant"},
+		Resources: map[string]spec.Resource{
+			name: {Endpoints: map[string]spec.Endpoint{
+				"list": {Method: "GET", Path: "/tenant/{tenant}/" + name},
+			}},
+		},
+		Types: map[string]spec.TypeDef{},
+	}
+	if override != "" {
+		s.EndpointTemplateEnvOverrides = map[string]string{"tenant": override}
+		s.GlobalPathTemplateVars = []string{"tenant"}
+	}
+	return s
+}
+
+func TestMergeSpecsUnionsEndpointTemplateVarsAndEnvOverrides(t *testing.T) {
+	t.Parallel()
+
+	primary := tenantTemplateSpec("jobs", "ST_TENANT_ID")
+	primary.EndpointPathParamDefaults = map[string]string{"userId": "me"}
+	primary.EndpointTemplateVarDefaults = map[string]string{"version": "v1"}
+	secondary := tenantTemplateSpec("crm", "ST_TENANT_ID")
+	secondary.EndpointTemplateVars = []string{"tenant", "version"}
+	secondary.EndpointTemplateEnvOverrides["version"] = "ST_API_VERSION"
+	secondary.EndpointPathParamDefaults = map[string]string{"userId": "self", "orgId": "default"}
+	secondary.EndpointTemplateVarDefaults = map[string]string{"version": "v2", "region": "us"}
+
+	merged := mergeSpecs([]*spec.APISpec{primary, secondary}, "combo")
+
+	assert.Equal(t, []string{"tenant", "version"}, merged.EndpointTemplateVars)
+	assert.Equal(t, map[string]string{"tenant": "ST_TENANT_ID", "version": "ST_API_VERSION"}, merged.EndpointTemplateEnvOverrides)
+	assert.Equal(t, map[string]string{"userId": "me", "orgId": "default"}, merged.EndpointPathParamDefaults, "first spec's path-param default wins; new keys still merge")
+	assert.Equal(t, map[string]string{"version": "v1", "region": "us"}, merged.EndpointTemplateVarDefaults, "first spec's template-var default wins; new keys still merge")
+	assert.Empty(t, merged.GlobalPathTemplateVars)
+	assert.Equal(t, "ST_TENANT_ID", merged.EndpointTemplateEnvName("tenant"))
+}
+
+func TestMergeSpecsWarnsAndKeepsFirstConflictingTemplateEnvOverride(t *testing.T) {
+	// Captures os.Stderr for the collision warning; not parallel with other
+	// tests that write the process stderr.
+
+	primary := tenantTemplateSpec("jobs", "ST_TENANT_ID")
+	secondary := tenantTemplateSpec("crm", "OTHER_TENANT_ID")
+
+	var merged *spec.APISpec
+	stderr, err := runWithCapturedStderr(t, func() error {
+		merged = mergeSpecs([]*spec.APISpec{primary, secondary}, "combo")
+		return nil
+	})
+	require.NoError(t, err)
+
+	assert.Equal(t, map[string]string{"tenant": "ST_TENANT_ID"}, merged.EndpointTemplateEnvOverrides)
+	assert.Contains(t, stderr, "tenant")
+	assert.Contains(t, stderr, "jobs")
+	assert.Contains(t, stderr, "crm")
+	assert.Contains(t, stderr, "ST_TENANT_ID")
+	assert.Contains(t, stderr, "OTHER_TENANT_ID")
+}
+
+func TestMergeSpecsKeepsTemplateBindingWhenLaterSpecOmitsIt(t *testing.T) {
+	t.Parallel()
+
+	primary := tenantTemplateSpec("jobs", "ST_TENANT_ID")
+	secondary := tenantTemplateSpec("crm", "")
+
+	merged := mergeSpecs([]*spec.APISpec{primary, secondary}, "combo")
+
+	assert.Equal(t, []string{"tenant"}, merged.EndpointTemplateVars)
+	assert.Equal(t, map[string]string{"tenant": "ST_TENANT_ID"}, merged.EndpointTemplateEnvOverrides)
+	assert.Empty(t, merged.GlobalPathTemplateVars)
+}
+
+func TestMergeSpecsRederivesGlobalPathTemplateVarsFromMergedEndpoints(t *testing.T) {
+	t.Parallel()
+
+	tenantScoped := tenantTemplateSpec("jobs", "ST_TENANT_ID")
+	untemplated := &spec.APISpec{
+		Name:    "settings",
+		Version: "0.1.0",
+		BaseURL: "https://api.example.com",
+		Resources: map[string]spec.Resource{
+			"settings": {Endpoints: map[string]spec.Endpoint{
+				"a": {Method: "GET", Path: "/settings/a"},
+				"b": {Method: "GET", Path: "/settings/b"},
+				"c": {Method: "GET", Path: "/settings/c"},
+				"d": {Method: "GET", Path: "/settings/d"},
+			}},
+		},
+		Types: map[string]spec.TypeDef{},
+	}
+
+	merged := mergeSpecs([]*spec.APISpec{tenantScoped, untemplated}, "combo")
+	require.Empty(t, merged.GlobalPathTemplateVars)
+	merged.PromoteGlobalPathTemplateVars()
+	assert.Empty(t, merged.GlobalPathTemplateVars, "{tenant} covers 1 of 5 merged endpoints and must not become a root flag")
+
+	covered := mergeSpecs([]*spec.APISpec{tenantScoped, tenantTemplateSpec("crm", "ST_TENANT_ID")}, "combo")
+	covered.PromoteGlobalPathTemplateVars()
+	assert.Equal(t, []string{"tenant"}, covered.GlobalPathTemplateVars)
 }
 
 func TestMergeSpecsScopesConflictingRequiredHeadersToTheirSourceEndpoints(t *testing.T) {
@@ -3291,6 +3435,109 @@ func TestMergeSpecsPreservesSingleSpecAuthScopeOrder(t *testing.T) {
 	assert.Equal(t, []string{"scope.z", "scope.a"}, merged.Auth.Scopes)
 }
 
+func TestMergeSpecsUnionsScopesForGrantsWithoutAuthorizationURL(t *testing.T) {
+	t.Parallel()
+
+	newSpec := func(name string, auth spec.AuthConfig) *spec.APISpec {
+		return &spec.APISpec{
+			Name:    name,
+			Version: "0.1.0",
+			BaseURL: "https://api.example.com",
+			Auth:    auth,
+			Resources: map[string]spec.Resource{
+				name: {Endpoints: map[string]spec.Endpoint{"list": {Method: "GET", Path: "/" + name}}},
+			},
+			Types: map[string]spec.TypeDef{},
+		}
+	}
+
+	tests := []struct {
+		name       string
+		primary    spec.AuthConfig
+		secondary  spec.AuthConfig
+		wantScopes []string
+	}{
+		{
+			name: "client credentials specs sharing a token URL union scopes",
+			primary: spec.AuthConfig{
+				Type:        "oauth2",
+				OAuth2Grant: spec.OAuth2GrantClientCredentials,
+				TokenURL:    "https://accounts.example.com/token",
+				Scopes:      []string{"a:r"},
+			},
+			secondary: spec.AuthConfig{
+				Type:        "oauth2",
+				OAuth2Grant: spec.OAuth2GrantClientCredentials,
+				TokenURL:    "https://accounts.example.com/token",
+				Scopes:      []string{"b:r"},
+			},
+			wantScopes: []string{"a:r", "b:r"},
+		},
+		{
+			name: "client credentials specs with different token URLs keep primary scopes",
+			primary: spec.AuthConfig{
+				Type:        "oauth2",
+				OAuth2Grant: spec.OAuth2GrantClientCredentials,
+				TokenURL:    "https://accounts.example.com/token",
+				Scopes:      []string{"a:r"},
+			},
+			secondary: spec.AuthConfig{
+				Type:        "oauth2",
+				OAuth2Grant: spec.OAuth2GrantClientCredentials,
+				TokenURL:    "https://other.example.net/token",
+				Scopes:      []string{"b:r"},
+			},
+			wantScopes: []string{"a:r"},
+		},
+		{
+			name: "client credentials specs with mismatched refresh mechanisms keep primary scopes",
+			primary: spec.AuthConfig{
+				Type:        "oauth2",
+				OAuth2Grant: spec.OAuth2GrantClientCredentials,
+				TokenURL:    "https://accounts.example.com/token",
+				Scopes:      []string{"a:r"},
+			},
+			secondary: spec.AuthConfig{
+				Type:                  "oauth2",
+				OAuth2Grant:           spec.OAuth2GrantClientCredentials,
+				TokenURL:              "https://accounts.example.com/token",
+				RefreshTokenMechanism: "rotating",
+				Scopes:                []string{"b:r"},
+			},
+			wantScopes: []string{"a:r"},
+		},
+		{
+			name: "authorization code specs without an authorization URL keep primary scopes",
+			primary: spec.AuthConfig{
+				Type:        "oauth2",
+				OAuth2Grant: spec.OAuth2GrantAuthorizationCode,
+				TokenURL:    "https://accounts.example.com/token",
+				Scopes:      []string{"a:r"},
+			},
+			secondary: spec.AuthConfig{
+				Type:        "oauth2",
+				OAuth2Grant: spec.OAuth2GrantAuthorizationCode,
+				TokenURL:    "https://accounts.example.com/token",
+				Scopes:      []string{"b:r"},
+			},
+			wantScopes: []string{"a:r"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			merged := mergeSpecs([]*spec.APISpec{
+				newSpec("primary", tt.primary),
+				newSpec("secondary", tt.secondary),
+			}, "combo")
+
+			assert.Equal(t, tt.wantScopes, merged.Auth.Scopes)
+		})
+	}
+}
+
 func assertAdditionalAuthHeader(t *testing.T, headers []spec.AdditionalAuthHeader, wantHeader, wantEnvVar string) {
 	t.Helper()
 	for _, header := range headers {
@@ -3404,6 +3651,85 @@ paths:
 	singleAuthFile, err := os.ReadFile(filepath.Join(singleOutputDir, "internal", "cli", "auth.go"))
 	require.NoError(t, err)
 	assert.NotContains(t, string(singleAuthFile), "yt-analytics.readonly")
+}
+
+func TestGenerateMultiSpecUnionsClientCredentialsScopes(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	primarySpecPath := filepath.Join(dir, "billing.yaml")
+	reportingSpecPath := filepath.Join(dir, "reporting.yaml")
+	outputDir := filepath.Join(dir, "ledger")
+	require.NoError(t, os.WriteFile(primarySpecPath, []byte(`openapi: 3.0.3
+info:
+  title: Ledger Billing
+  version: 1.0.0
+servers:
+  - url: https://billing.example.com/v1
+components:
+  securitySchemes:
+    OAuth2:
+      type: oauth2
+      flows:
+        clientCredentials:
+          tokenUrl: https://auth.example.com/oauth/token
+          scopes:
+            billing:read: Read billing records
+security:
+  - OAuth2: []
+paths:
+  /invoices:
+    get:
+      operationId: listInvoices
+      responses:
+        "200":
+          description: OK
+`), 0o644))
+	require.NoError(t, os.WriteFile(reportingSpecPath, []byte(`openapi: 3.0.3
+info:
+  title: Ledger Reporting
+  version: 1.0.0
+servers:
+  - url: https://reporting.example.com/v1
+components:
+  securitySchemes:
+    OAuth2:
+      type: oauth2
+      flows:
+        clientCredentials:
+          tokenUrl: https://auth.example.com/oauth/token
+          scopes:
+            reporting:read: Read reports
+security:
+  - OAuth2: []
+paths:
+  /reports:
+    get:
+      operationId: listReports
+      responses:
+        "200":
+          description: OK
+`), 0o644))
+
+	cmd := newGenerateCmd()
+	cmd.SetArgs([]string{
+		"--spec", primarySpecPath,
+		"--spec", reportingSpecPath,
+		"--name", "ledger",
+		"--output", outputDir,
+		"--validate=false",
+		"--force",
+	})
+	require.NoError(t, cmd.Execute())
+
+	authFile, err := os.ReadFile(filepath.Join(outputDir, "internal", "cli", "auth.go"))
+	require.NoError(t, err)
+	authSource := string(authFile)
+	require.Contains(t, authSource, "func resolveClientCredentialsScope(")
+	assert.Contains(t, authSource, `return "billing:read reporting:read"`)
+
+	runGoCommandForCLITest(t, outputDir, "mod", "tidy")
+	runGoCommandForCLITest(t, outputDir, "build", "./...")
 }
 
 func TestGenerateMultiSpecEmitsNestedResourceBaseURLPrefix(t *testing.T) {
@@ -4434,7 +4760,8 @@ resources:
 
 	gomod, err := os.ReadFile(filepath.Join(outputDir, "go.mod"))
 	require.NoError(t, err)
-	assert.Contains(t, string(gomod), "github.com/enetx/surf")
+	assert.Contains(t, string(gomod), "github.com/refraction-networking/utls")
+	assert.NotContains(t, string(gomod), "github.com/enetx/")
 }
 
 func TestGenerateCmdAllowsSniffedSpecWithoutTrafficAnalysis(t *testing.T) {
@@ -4516,7 +4843,8 @@ resources:
 
 	gomod, err := os.ReadFile(filepath.Join(outputDir, "go.mod"))
 	require.NoError(t, err)
-	assert.NotContains(t, string(gomod), "github.com/enetx/surf")
+	assert.NotContains(t, string(gomod), "github.com/enetx/")
+	assert.NotContains(t, string(gomod), "github.com/refraction-networking/utls")
 }
 
 func TestGenerateCmdRejectsPageContextTrafficAnalysisEvenWithTransportOverride(t *testing.T) {
@@ -4614,7 +4942,8 @@ resources:
 	assert.FileExists(t, filepath.Join(outputDir, "README.md"))
 	clientGo, err := os.ReadFile(filepath.Join(outputDir, "internal", "client", "client.go"))
 	require.NoError(t, err)
-	assert.Contains(t, string(clientGo), `"github.com/enetx/surf"`)
+	assert.Contains(t, string(clientGo), "return chromeClient(timeout, jar, skipTLSVerify)")
+	assert.NotContains(t, string(clientGo), "github.com/enetx/")
 }
 
 func TestGenerateCmdRejectsConflictingReachabilityOverrideTransport(t *testing.T) {
@@ -5214,4 +5543,86 @@ paths:
 	assert.Contains(t, err.Error(), specPath, "error must name the offending spec file")
 	assert.Contains(t, err.Error(), "no `servers:`", "error must explain that the spec declares no servers")
 	assert.NoDirExists(t, outputDir, "refusal must fire before any output is written")
+}
+
+// TestGenerateMultiSpecKeepsTenantTemplateBinding proves the merged spec
+// carries each source's tenant binding all the way into emitted code: a root
+// --tenant flag plus the declared env-var override, instead of a positional
+// path argument on every command.
+func TestGenerateMultiSpecKeepsTenantTemplateBinding(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	outputDir := filepath.Join(dir, "tenantcombo")
+	specAPath := filepath.Join(dir, "jobs.yaml")
+	specBPath := filepath.Join(dir, "crm.yaml")
+
+	tenantSpec := func(title, resource string) string {
+		return `openapi: 3.0.0
+info:
+  title: ` + title + `
+  version: 1.0.0
+  x-tenant-env-var: ST_TENANT_ID
+servers:
+  - url: https://api.example.com
+paths:
+  /tenant/{tenant}/` + resource + `:
+    get:
+      operationId: list` + resource + `
+      summary: List ` + resource + `
+      parameters:
+        - name: tenant
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: OK
+  /tenant/{tenant}/` + resource + `/{id}:
+    get:
+      operationId: get` + resource + `
+      summary: Get one ` + resource + `
+      parameters:
+        - name: tenant
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: OK
+`
+	}
+	require.NoError(t, os.WriteFile(specAPath, []byte(tenantSpec("Jobs API", "jobs")), 0o644))
+	require.NoError(t, os.WriteFile(specBPath, []byte(tenantSpec("CRM API", "customers")), 0o644))
+
+	cmd := newGenerateCmd()
+	cmd.SetArgs([]string{
+		"--spec", specAPath,
+		"--spec", specBPath,
+		"--name", "tenantcombo",
+		"--name-prefix",
+		"--output", outputDir,
+		"--validate=false",
+		"--force",
+	})
+	require.NoError(t, cmd.Execute())
+
+	root, err := os.ReadFile(filepath.Join(outputDir, "internal", "cli", "root.go"))
+	require.NoError(t, err)
+	assert.Contains(t, string(root), `"tenant", "", "Set {tenant} path template value (env: ST_TENANT_ID)"`)
+	assert.Contains(t, string(root), `cfg.TemplateVars["tenant"] = f.templateVarTenant`)
+
+	config, err := os.ReadFile(filepath.Join(outputDir, "internal", "config", "config.go"))
+	require.NoError(t, err)
+	assert.Contains(t, string(config), "ST_TENANT_ID")
+
+	runGoCommandForCLITest(t, outputDir, "mod", "tidy")
+	runGoCommandForCLITest(t, outputDir, "build", "./...")
 }

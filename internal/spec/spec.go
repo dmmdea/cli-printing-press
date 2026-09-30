@@ -1809,14 +1809,66 @@ func validateHTTPSURL(label, raw string) error {
 	}
 }
 
-func validateAuthURL(label, raw string) error {
-	if strings.ContainsAny(raw, "{}<>") {
+func validateAuthURL(label, raw string, registered []string) error {
+	concrete := substituteRegisteredAuthPlaceholders(raw, registered)
+	if strings.ContainsAny(concrete, "{}<>") {
 		return fmt.Errorf("%s contains an unresolved placeholder; supply a concrete URL before generation", label)
 	}
-	if err := validateHTTPSURL(label, raw); err != nil {
+	if err := validateHTTPSURL(label, concrete); err != nil {
 		return err
 	}
 	return nil
+}
+
+// Token, device, and authorization URLs may keep a {name} that is a
+// registered runtime template var. Unregistered braces still fail
+// validation. Substitution happens at request time on the same path as
+// server URLs, so the placeholder is not dialed as a literal host.
+func (s *APISpec) AuthURLUsesEndpointTemplateVar(raw string) bool {
+	if s == nil {
+		return false
+	}
+	return authURLUsesRegisteredPlaceholder(raw, s.EndpointTemplateVars)
+}
+
+func authURLUsesRegisteredPlaceholder(raw string, registered []string) bool {
+	if !strings.Contains(raw, "{") || len(registered) == 0 {
+		return false
+	}
+	allowed := registeredAuthPlaceholderSet(registered)
+	for _, match := range pathParamRe.FindAllStringSubmatch(raw, -1) {
+		if len(match) < 2 {
+			continue
+		}
+		if _, ok := allowed[match[1]]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func substituteRegisteredAuthPlaceholders(raw string, registered []string) string {
+	if !strings.Contains(raw, "{") || len(registered) == 0 {
+		return raw
+	}
+	allowed := registeredAuthPlaceholderSet(registered)
+	return pathParamRe.ReplaceAllStringFunc(raw, func(match string) string {
+		name := match[1 : len(match)-1]
+		if _, ok := allowed[name]; ok {
+			return "x"
+		}
+		return match
+	})
+}
+
+func registeredAuthPlaceholderSet(registered []string) map[string]struct{} {
+	allowed := make(map[string]struct{}, len(registered))
+	for _, name := range registered {
+		if name != "" {
+			allowed[name] = struct{}{}
+		}
+	}
+	return allowed
 }
 
 // validateOAuth2Grant ensures OAuth2Grant is empty or one of the supported
@@ -2026,16 +2078,16 @@ func authFormatPlaceholderSet(auth AuthConfig) map[string]struct{} {
 
 // AuthConfig.Type is intentionally skipped: the field is ignored for
 // non-oauth2 types, matching how SessionTTLHours and similar fields behave.
-func validateOAuth2Grant(c AuthConfig) error {
+func validateOAuth2Grant(c AuthConfig, registered []string) error {
 	switch c.OAuth2Grant {
 	case "", OAuth2GrantAuthorizationCode, OAuth2GrantClientCredentials, OAuth2GrantDeviceCode:
 		if (c.OAuth2Grant == "" || c.OAuth2Grant == OAuth2GrantAuthorizationCode) && strings.TrimSpace(c.TokenURL) != "" {
-			if err := validateAuthURL("auth.token_url", c.TokenURL); err != nil {
+			if err := validateAuthURL("auth.token_url", c.TokenURL, registered); err != nil {
 				return err
 			}
 		}
 		if c.OAuth2Grant == OAuth2GrantClientCredentials && strings.TrimSpace(c.TokenURL) != "" {
-			if err := validateAuthURL("auth.token_url", c.TokenURL); err != nil {
+			if err := validateAuthURL("auth.token_url", c.TokenURL, registered); err != nil {
 				return err
 			}
 		}
@@ -2046,10 +2098,10 @@ func validateOAuth2Grant(c AuthConfig) error {
 			if strings.TrimSpace(c.TokenURL) == "" {
 				return fmt.Errorf("auth.token_url is required when auth.oauth2_grant is %q", OAuth2GrantDeviceCode)
 			}
-			if err := validateAuthURL("auth.device_authorization_url", c.DeviceAuthorizationURL); err != nil {
+			if err := validateAuthURL("auth.device_authorization_url", c.DeviceAuthorizationURL, registered); err != nil {
 				return err
 			}
-			if err := validateAuthURL("auth.token_url", c.TokenURL); err != nil {
+			if err := validateAuthURL("auth.token_url", c.TokenURL, registered); err != nil {
 				return err
 			}
 		}
@@ -2060,14 +2112,14 @@ func validateOAuth2Grant(c AuthConfig) error {
 	}
 }
 
-func validateOAuth2Refresh(c AuthConfig) error {
+func validateOAuth2Refresh(c AuthConfig, registered []string) error {
 	if c.Type != AuthTypeOAuth2Refresh {
 		return nil
 	}
 	if strings.TrimSpace(c.TokenURL) == "" {
 		return fmt.Errorf("auth.token_url is required when auth.type is %q", AuthTypeOAuth2Refresh)
 	}
-	if err := validateAuthURL("auth.token_url", c.TokenURL); err != nil {
+	if err := validateAuthURL("auth.token_url", c.TokenURL, registered); err != nil {
 		return err
 	}
 	return nil
@@ -2150,7 +2202,10 @@ type ShareConfig struct {
 // recognize resource identifiers in free-text queries (e.g., Kalshi
 // `KXTICKER-...` codes). Each pattern is validated at spec load via
 // regexp.Compile so authoring typos surface at parse time rather than at
-// end-user runtime.
+// end-user runtime. Patterns are also checked against the generator's
+// seeded playbook query_family_examples: a pattern that classifies every
+// remaining content token as a ticker makes QueryFamily empty and skips
+// every seeded playbook as unreachable, so validation fails closed.
 //
 // Stopwords are domain-specific tokens stripped from queries before the
 // recall path matches against learned templates. The generated CLI merges
@@ -2165,7 +2220,7 @@ type LearnConfig struct {
 	Enabled           bool                    `yaml:"enabled" json:"enabled,omitempty"`                                   // master switch; when false, the loop's commands and pre-seeding hook are not emitted
 	Disabled          bool                    `yaml:"disabled,omitempty" json:"disabled,omitempty"`                       // generation-time opt-out. A plain Enabled bool cannot distinguish "explicitly off" from "absent" once the generator defaults the loop on, so this is the authoritative off switch. Contradicts an explicit enabled: true and is rejected at parse time.
 	EnabledSet        bool                    `yaml:"-" json:"-"`                                                         // internal presence bit: legacy specs with learn.enabled: false remain opted out when the default-on pass runs.
-	TickerPatterns    []string                `yaml:"ticker_patterns,omitempty" json:"ticker_patterns,omitempty"`         // Go regexp patterns the recall path uses to recognize resource identifiers in free-text. Each value must compile via regexp.Compile.
+	TickerPatterns    []string                `yaml:"ticker_patterns,omitempty" json:"ticker_patterns,omitempty"`         // Go regexp patterns the recall path uses to recognize resource identifiers in free-text. Each value must compile via regexp.Compile and must not empty QueryFamily for seeded playbook examples.
 	Stopwords         []string                `yaml:"stopwords,omitempty" json:"stopwords,omitempty"`                     // domain-specific stopwords stripped from queries before recall match; merged with a built-in default set. Whitespace-only entries are dropped at parse time.
 	Synonyms          map[string]string       `yaml:"synonyms,omitempty" json:"synonyms,omitempty"`                       // per-CLI variant -> canonical query-phrasing folds (e.g., "last night" -> "yesterday") applied symmetrically at write and read so same-referent phrasings share one query family. Keys and values must be lowercase; chains are rejected so folding is a single hop.
 	EntityLookupSeeds map[string][]LookupSeed `yaml:"entity_lookup_seeds,omitempty" json:"entity_lookup_seeds,omitempty"` // canonical-name + aliases table keyed by seed kind (e.g., "country"). Used by the recall path to substitute one entity for another and generalize learned templates.
@@ -2321,10 +2376,40 @@ type Resource struct {
 	// endpoints. Fixed at generation time. Incompatible with the
 	// proxy-envelope client pattern, which POSTs every request to a
 	// single URL.
-	BaseURL      string              `yaml:"base_url,omitempty" json:"base_url,omitempty"`
-	Tier         string              `yaml:"tier,omitempty" json:"tier,omitempty"`
+	BaseURL string `yaml:"base_url,omitempty" json:"base_url,omitempty"`
+	Tier    string `yaml:"tier,omitempty" json:"tier,omitempty"`
+	// List endpoints on one resource share a primary key authors declare once.
+	// Endpoint-only id_field left that key unknown, so the store never learned it.
+	IDField string `yaml:"id_field,omitempty" json:"id_field,omitempty"`
+	// Authors drop a whole resource from default sync and auto-refresh while
+	// leaving it callable by name. False must stay distinct from an omitted key.
+	Syncable     *bool               `yaml:"syncable,omitempty" json:"syncable,omitempty"`
 	Endpoints    map[string]Endpoint `yaml:"endpoints" json:"endpoints"`
 	SubResources map[string]Resource `yaml:"sub_resources,omitempty" json:"sub_resources,omitempty"`
+}
+
+// Profiler and store classification must agree on one identity; inlined
+// precedence let the store treat a declared key as parameter-keyed.
+func EffectiveIDField(resource Resource, endpoint Endpoint) string {
+	if id := strings.TrimSpace(endpoint.IDField); id != "" {
+		return id
+	}
+	return strings.TrimSpace(resource.IDField)
+}
+
+// Default-sync membership and auto-refresh opt-out must stay one decision.
+// Endpoint syncable only opts in; opt-out is an inherited resource-level false.
+func EffectiveSyncMembership(resource Resource, endpoint Endpoint) (optIn, optOut bool) {
+	if endpoint.SyncableSet || endpoint.Syncable {
+		return endpoint.Syncable, false
+	}
+	if resource.Syncable == nil {
+		return false, false
+	}
+	if *resource.Syncable {
+		return true, false
+	}
+	return false, true
 }
 
 // DefaultResourceDescription returns the parser fallback description for a
@@ -2392,10 +2477,17 @@ type Endpoint struct {
 	Mutation    *bool  `yaml:"mutation,omitempty" json:"mutation,omitempty"`
 	BaseURL     string `yaml:"base_url,omitempty" json:"base_url,omitempty"`
 	Description string `yaml:"description" json:"description"`
+	// Deprecated is OpenAPI `deprecated: true`. Keep the command visible;
+	// cobra.Command.Deprecated would hide it from help.
+	Deprecated bool `yaml:"deprecated,omitempty" json:"deprecated,omitempty"`
 	// Example is an optional Cobra Example string for this endpoint command.
-	// When empty, the generator synthesizes an example from command path and
-	// required inputs.
+	// When empty, the generator synthesizes one from the command path,
+	// parameter examples, or request-body examples.
 	Example string `yaml:"example,omitempty" json:"example,omitempty"`
+	// RequestBodyExample is the requestBody media-type example, or the first
+	// named examples value. Example synthesis reads it when the operation has
+	// no parameter examples. It is not serialized and does not feed pp:happy-args.
+	RequestBodyExample any `yaml:"-" json:"-"`
 	// DescriptionSynthesized marks descriptions generated by parser fallback
 	// when both summary and description are absent in the source operation.
 	// Internal-only provenance: never serialized.
@@ -2508,7 +2600,10 @@ type Endpoint struct {
 	// the profiler's safety heuristic would otherwise exclude it for required
 	// path/query params. Use only when the spec supplies those inputs through
 	// defaults, template vars, or another generated runtime mechanism.
-	Syncable bool `yaml:"syncable,omitempty" json:"syncable,omitempty"`
+	// When set, it overrides Resource.Syncable. SyncableSet distinguishes an
+	// explicit false from an omitted key; the bool alone cannot.
+	Syncable    bool `yaml:"syncable,omitempty" json:"syncable,omitempty"`
+	SyncableSet bool `yaml:"-" json:"-"`
 	// Walker, when present, declares this endpoint as a hierarchical child
 	// resource fetched by iterating a named parent. Used when the generator's
 	// path-param dependent-resource auto-detection would miss the link — for
@@ -2573,7 +2668,23 @@ func (e *Endpoint) UnmarshalYAML(value *yaml.Node) error {
 	}
 	*e = Endpoint(out)
 	e.BodySet = bodyNode != nil
+	e.SyncableSet = yamlMappingValue(value, "syncable") != nil
 	return nil
+}
+
+// MarshalYAML keeps an explicit syncable: false. The bool field is omitempty,
+// and SyncableSet is not serialized, so a plain struct marshal would drop the
+// key and let a resource-level syncable win after the spec is parsed again.
+func (e Endpoint) MarshalYAML() (any, error) {
+	type endpointAlias Endpoint
+	var node yaml.Node
+	if err := node.Encode(endpointAlias(e)); err != nil {
+		return nil, err
+	}
+	if e.SyncableSet && !e.Syncable {
+		appendYAMLBool(&node, "syncable", false)
+	}
+	return &node, nil
 }
 
 func (e *Endpoint) UnmarshalJSON(data []byte) error {
@@ -2609,7 +2720,26 @@ func (e *Endpoint) UnmarshalJSON(data []byte) error {
 	}
 	*e = Endpoint(out)
 	e.BodySet = bodySet
+	_, e.SyncableSet = raw["syncable"]
 	return nil
+}
+
+// MarshalJSON keeps an explicit syncable: false. See MarshalYAML.
+func (e Endpoint) MarshalJSON() ([]byte, error) {
+	type endpointAlias Endpoint
+	data, err := json.Marshal(endpointAlias(e))
+	if err != nil {
+		return nil, err
+	}
+	if !e.SyncableSet || e.Syncable {
+		return data, nil
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil, err
+	}
+	raw["syncable"] = []byte("false")
+	return json.Marshal(raw)
 }
 
 // MutationOverride reports the explicit mutation flag. set is false when
@@ -2695,7 +2825,7 @@ func (e Endpoint) UsesXMLResponse() bool {
 type HTMLExtract struct {
 	Mode         string   `yaml:"mode,omitempty" json:"mode,omitempty"`                   // page (default), links, or embedded-json
 	LinkPrefixes []string `yaml:"link_prefixes,omitempty" json:"link_prefixes,omitempty"` // path-segment prefixes to keep when extracting links (mode: links)
-	Limit        int      `yaml:"limit,omitempty" json:"limit,omitempty"`                 // max links to return; defaults at runtime (mode: links)
+	Limit        int      `yaml:"limit,omitempty" json:"limit,omitempty"`                 // max links or table rows to return; 0 disables the table-row cap and uses the runtime default for links
 	// ScriptSelector identifies the <script> tag containing serialized
 	// page state when mode is embedded-json. Defaults to
 	// DefaultEmbeddedJSONScriptSelector ("script#__NEXT_DATA__") when
@@ -3424,6 +3554,18 @@ func validateRawSpecStructure(data []byte) error {
 		}
 	}
 
+	if resources := mappingValue(root, "resources"); resources != nil {
+		var problems []string
+		unknownResourceMappingFields(resources, "", &problems)
+		if len(problems) == 1 {
+			return fmt.Errorf("spec structural error: %s", problems[0])
+		}
+		if len(problems) > 1 {
+			slices.Sort(problems)
+			return fmt.Errorf("spec structural error: %s", strings.Join(problems, "; "))
+		}
+	}
+
 	types := mappingValue(root, "types")
 	if types == nil || types.Kind != yaml.MappingNode {
 		return nil
@@ -3441,6 +3583,35 @@ func validateRawSpecStructure(data []byte) error {
 		return fmt.Errorf("spec structural error: found resource-shaped entr%s under 'types:' (%s) - resources were likely appended at the wrong indentation level; move them under top-level 'resources:'", pluralSuffix(len(misplaced), "y", "ies"), strings.Join(misplaced, ", "))
 	}
 	return nil
+}
+
+func unknownResourceMappingFields(node *yaml.Node, prefix string, problems *[]string) {
+	if node == nil || node.Kind != yaml.MappingNode {
+		return
+	}
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		name := node.Content[i].Value
+		if name == "<<" {
+			continue
+		}
+		value := node.Content[i+1]
+		if value.Kind == yaml.AliasNode {
+			value = value.Alias
+		}
+		if value == nil || value.Kind != yaml.MappingNode {
+			continue
+		}
+		path := name
+		if prefix != "" {
+			path = prefix + "." + name
+		}
+		for _, field := range unknownYAMLFields(value, reflect.TypeFor[Resource]()) {
+			*problems = append(*problems, fmt.Sprintf("resource %q contains unknown field %q", path, field))
+		}
+		if subs := mappingValue(value, "sub_resources"); subs != nil {
+			unknownResourceMappingFields(subs, path, problems)
+		}
+	}
 }
 
 func unknownYAMLFields(node *yaml.Node, structType reflect.Type) []string {
@@ -3495,15 +3666,77 @@ func yamlDocumentRoot(doc *yaml.Node) *yaml.Node {
 }
 
 func mappingValue(node *yaml.Node, key string) *yaml.Node {
-	if node == nil || node.Kind != yaml.MappingNode {
+	return mappingValueVisited(node, key, map[*yaml.Node]bool{})
+}
+
+// mappingValueVisited returns key from a mapping, following YAML merge keys
+// (<<) and aliases. An explicit key wins. For a merge sequence, earlier
+// mappings win over later ones, matching YAML 1.1 merge precedence.
+func mappingValueVisited(node *yaml.Node, key string, seen map[*yaml.Node]bool) *yaml.Node {
+	node = resolveYAMLAlias(node)
+	if node == nil || node.Kind != yaml.MappingNode || seen[node] {
 		return nil
 	}
+	seen[node] = true
+	var merges []*yaml.Node
 	for i := 0; i+1 < len(node.Content); i += 2 {
-		if node.Content[i].Value == key {
-			return node.Content[i+1]
+		name := node.Content[i].Value
+		child := node.Content[i+1]
+		if name == "<<" {
+			merges = append(merges, child)
+			continue
+		}
+		if name == key {
+			return resolveYAMLAlias(child)
+		}
+	}
+	for _, merge := range merges {
+		if found := mappingValueFromMerge(merge, key, seen); found != nil {
+			return found
 		}
 	}
 	return nil
+}
+
+func mappingValueFromMerge(node *yaml.Node, key string, seen map[*yaml.Node]bool) *yaml.Node {
+	node = resolveYAMLAlias(node)
+	if node == nil {
+		return nil
+	}
+	if node.Kind == yaml.SequenceNode {
+		for _, item := range node.Content {
+			if found := mappingValueVisited(item, key, seen); found != nil {
+				return found
+			}
+		}
+		return nil
+	}
+	return mappingValueVisited(node, key, seen)
+}
+
+func resolveYAMLAlias(node *yaml.Node) *yaml.Node {
+	for node != nil && node.Kind == yaml.AliasNode {
+		node = node.Alias
+	}
+	return node
+}
+
+func appendYAMLBool(node *yaml.Node, key string, value bool) {
+	mapping := node
+	if node != nil && node.Kind == yaml.DocumentNode && len(node.Content) > 0 {
+		mapping = node.Content[0]
+	}
+	if mapping == nil || mapping.Kind != yaml.MappingNode {
+		return
+	}
+	text := "false"
+	if value {
+		text = "true"
+	}
+	mapping.Content = append(mapping.Content,
+		&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: key},
+		&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!bool", Value: text},
+	)
 }
 
 func pluralSuffix(count int, singular, plural string) string {
@@ -4545,10 +4778,10 @@ func (s *APISpec) Validate() error {
 	if err := validateBearerRefresh(s); err != nil {
 		return err
 	}
-	if err := validateOAuth2Grant(s.Auth); err != nil {
+	if err := validateOAuth2Grant(s.Auth, s.EndpointTemplateVars); err != nil {
 		return err
 	}
-	if err := validateOAuth2Refresh(s.Auth); err != nil {
+	if err := validateOAuth2Refresh(s.Auth, s.EndpointTemplateVars); err != nil {
 		return err
 	}
 	if err := validateAuthPrefix(s.Auth); err != nil {
@@ -5569,12 +5802,12 @@ var learnSeedKindRe = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
 
 // validateLearn enforces the LearnConfig shape contract: the enabled and
 // disabled switches must not contradict, synonym pairs must be single-hop
-// lowercase folds, ticker patterns must compile as Go regexps, seed kinds
-// must be SQLite-safe identifiers, each seed must carry a non-empty
-// Canonical, and canonical values must be unique within a kind. Stopword
-// sanitization (dropping whitespace-only entries) happens here too so the
-// spec's parsed view matches what the generated CLI will actually load at
-// runtime.
+// lowercase folds, ticker patterns must compile as Go regexps and must not
+// empty QueryFamily for seeded playbook examples, seed kinds must be
+// SQLite-safe identifiers, each seed must carry a non-empty Canonical, and
+// canonical values must be unique within a kind. Stopword sanitization
+// (dropping whitespace-only entries) happens here too so the spec's parsed
+// view matches what the generated CLI will actually load at runtime.
 func validateLearn(learn *LearnConfig) error {
 	if learn == nil {
 		return nil
@@ -5605,6 +5838,9 @@ func validateLearn(learn *LearnConfig) error {
 			filtered = append(filtered, sw)
 		}
 		learn.Stopwords = filtered
+	}
+	if err := learn.queryFamilyReachabilityError(learnSeededQueryFamilyExamples); err != nil {
+		return err
 	}
 	if err := validateLearnSeeds(learn.EntityLookupSeeds); err != nil {
 		return err

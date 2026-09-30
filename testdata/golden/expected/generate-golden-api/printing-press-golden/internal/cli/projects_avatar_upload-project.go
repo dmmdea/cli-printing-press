@@ -18,11 +18,9 @@ func newProjectsAvatarUploadProjectCmd(flags *rootFlags) *cobra.Command {
 	var bodyFile string
 
 	cmd := &cobra.Command{
-		Use:     "upload-project <projectId>",
-		Aliases: []string{"update"},
-		Short:   "Upload project avatar",
-		// TODO: replace placeholder example values before relying on this for live dogfood.
-		Example:     "  printing-press-golden-pp-cli projects avatar upload-project 550e8400-e29b-41d4-a716-446655440000 --x-api-version example-value",
+		Use:         "upload-project <projectId>",
+		Aliases:     []string{"update"},
+		Short:       "Upload project avatar",
 		Annotations: map[string]string{"pp:endpoint": "avatar.upload-project", "pp:method": "PUT", "pp:path": "/projects/{projectId}/avatar"},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if len(args) == 0 {
@@ -172,9 +170,11 @@ func newProjectsAvatarUploadProjectCmd(flags *rootFlags) *cobra.Command {
 				// --select wins when both are set: explicit field choice trumps the
 				// generic high-gravity allow-list. Otherwise --compact still applies
 				// when --agent is on but the user did not name fields.
+				var selectErr error
 				filtered := unwrapSingleKeyArray(data)
 				if flags.selectFields != "" {
-					filtered = filterFields(filtered, flags.selectFields)
+					filtered, selectErr = filterFieldsChecked(filtered, flags.selectFields)
+					selectErr = selectErrorForDryRun(selectErr, flags, data)
 				} else if flags.compact {
 					filtered = compactFields(filtered, nil)
 				}
@@ -206,7 +206,7 @@ func newProjectsAvatarUploadProjectCmd(flags *rootFlags) *cobra.Command {
 				if partialFailure != nil && !flags.allowPartialFailure {
 					return partialFailureErr(fmt.Errorf("partial failure in %s response: %s", "avatar", partialFailure.Message))
 				}
-				return nil
+				return selectErr
 			}
 			// Fall-through for mutate paths that did not hit the table or
 			// asJSON branches: --quiet, --csv, --plain, and default terminal
@@ -216,13 +216,11 @@ func newProjectsAvatarUploadProjectCmd(flags *rootFlags) *cobra.Command {
 			// partial failure would exit 0 for these output modes — the exact
 			// silent-swallow regression the surrounding patch is preventing
 			// for asJSON / piped output.
-			if perr := printOutputWithFlagsMeta(cmd.OutOrStdout(), data, flags, map[string]any{"source": "live"}, nil); perr != nil {
-				return perr
-			}
+			printErr := printOutputWithFlagsMeta(cmd.OutOrStdout(), data, flags, map[string]any{"source": "live"}, nil)
 			if partialFailure != nil && !flags.allowPartialFailure {
 				return partialFailureErr(fmt.Errorf("partial failure in %s response: %s", "avatar", partialFailure.Message))
 			}
-			return nil
+			return printErr
 		},
 	}
 	cmd.Flags().StringVar(&flagXApiVersion, "x-api-version", "2026-04-01", "Required API version header.")

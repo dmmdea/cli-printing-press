@@ -18,7 +18,6 @@ func newStandingsPromotedCmd(flags *rootFlags) *cobra.Command {
 		Use:         "standings",
 		Short:       "List standings for a game",
 		Long:        "List standings for a game",
-		Example:     "  sync-walker-golden-pp-cli standings --game-id 550e8400-e29b-41d4-a716-446655440000",
 		Annotations: map[string]string{"pp:endpoint": "standings.list", "pp:method": "GET", "pp:path": "/standings", "mcp:read-only": "true", "pp:requires-input": "true"},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// Bare invocation of a command with a required flag/body prints help
@@ -76,9 +75,11 @@ func newStandingsPromotedCmd(flags *rootFlags) *cobra.Command {
 			// opt out of the auto-JSON path so piped consumers that asked for a
 			// non-JSON format reach the standard pipeline below.
 			if flags.asJSON || (!isTerminal(cmd.OutOrStdout()) && !flags.csv && !flags.quiet && !flags.plain) {
+				var selectErr error
 				filtered := data
 				if flags.selectFields != "" {
-					filtered = filterFields(filtered, flags.selectFields)
+					filtered, selectErr = filterFieldsChecked(filtered, flags.selectFields)
+					selectErr = selectErrorForDryRun(selectErr, flags, data)
 				} else if flags.compact {
 					filtered = compactFields(filtered, nil)
 				}
@@ -90,7 +91,10 @@ func newStandingsPromotedCmd(flags *rootFlags) *cobra.Command {
 				if wrapErr != nil {
 					return wrapErr
 				}
-				return printOutput(cmd.OutOrStdout(), wrapped, true)
+				if err := printOutput(cmd.OutOrStdout(), wrapped, true); err != nil {
+					return err
+				}
+				return selectErr
 			}
 			if wantsHumanTable(cmd.OutOrStdout(), flags) {
 				var items []map[string]any

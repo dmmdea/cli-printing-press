@@ -15,6 +15,36 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestNovelFeatureCommandPartsRejectsShellComposition(t *testing.T) {
+	t.Parallel()
+	for _, command := range []string{"snapshot && compare", "snapshot | summarize", "snapshot; compare", "snapshot || compare", "snapshot|summarize", "snapshot&&compare", "snapshot||compare", "snapshot;compare", "snapshot;", "snapshot&", "snapshot>file"} {
+		if got := novelFeatureCommandParts(command); got != nil {
+			t.Fatalf("novelFeatureCommandParts(%q) = %#v, want nil", command, got)
+		}
+	}
+	assert.Equal(t, []string{"snapshot"}, novelFeatureCommandParts(`snapshot --filter "a|b"`))
+	assert.Equal(t, []string{"filter"}, novelFeatureCommandParts(`filter --state [active|inactive]`))
+	assert.Equal(t, []string{"snapshot"}, novelFeatureCommandParts(`snapshot <before|after>`))
+}
+
+func TestGeneratorOmitsComposedNovelFeatureCommands(t *testing.T) {
+	t.Parallel()
+	apiSpec := minimalSpec("composednovel")
+	outputDir := filepath.Join(t.TempDir(), naming.CLI(apiSpec.Name))
+	gen := New(apiSpec, outputDir)
+	for _, command := range []string{"snapshot|summarize", "snapshot&&compare", "snapshot||compare", "snapshot;compare"} {
+		gen.NovelFeatures = append(gen.NovelFeatures, NovelFeature{Name: command, Command: command, Description: "Compare local snapshots."})
+	}
+	require.NoError(t, gen.Generate())
+	entries, err := os.ReadDir(filepath.Join(outputDir, "internal", "cli"))
+	require.NoError(t, err)
+	for _, entry := range entries {
+		assert.NotContains(t, entry.Name(), "snapshot")
+		assert.False(t, strings.ContainsAny(entry.Name(), "|&;"), entry.Name())
+	}
+	requireGeneratedCompiles(t, outputDir)
+}
+
 func TestGeneratorSkipsReservedNovelFeatureRootCommands(t *testing.T) {
 	t.Parallel()
 
@@ -162,6 +192,8 @@ func TestGeneratorEmitsNovelFeatureCommandStubs(t *testing.T) {
 	assert.Contains(t, call, `"mcp:read-only": "false"`)
 	assert.Contains(t, call, `"pp:data-source": "auto"`)
 	assert.Contains(t, call, `"pp:novel-scaffold": "true"`)
+	assert.NotContains(t, call, `"pp:typed-exit-codes"`,
+		"novel feature leaves keep their own RunE and must not declare the parent exit codes")
 	assert.Contains(t, call, `StringSliceVar(&flagTag, "tag", nil`)
 	assert.Contains(t, call, `StringVar(&flagDedupeKey, "dedupe-key", ""`)
 	assert.Contains(t, call, `StringVar(&flagTtl, "ttl", ""`)
@@ -176,6 +208,7 @@ func TestGeneratorEmitsNovelFeatureCommandStubs(t *testing.T) {
 	assert.Contains(t, parent, `Short:       "Work with runs"`)
 	assert.Contains(t, parent, `Example:     "  apify-pp-cli runs classify run-123 --limit 10"`)
 	assert.Contains(t, parent, "RunE:        parentNoSubcommandRunE(flags)")
+	assert.Contains(t, parent, `"pp:typed-exit-codes": "0,2"`)
 	assert.Contains(t, parent, "addNovelCommandIfAbsent(cmd, newNovelRunsClassifyCmd(flags))")
 	assert.NotContains(t, parent, `"pp:novel-scaffold"`)
 
@@ -186,6 +219,8 @@ func TestGeneratorEmitsNovelFeatureCommandStubs(t *testing.T) {
 	assert.Contains(t, classify, `"mcp:read-only": "false"`)
 	assert.Contains(t, classify, `"pp:data-source": "auto"`)
 	assert.Contains(t, classify, `"pp:novel-scaffold": "true"`)
+	assert.NotContains(t, classify, `"pp:typed-exit-codes"`,
+		"novel feature leaves keep their own RunE and must not declare the parent exit codes")
 	assert.Contains(t, classify, `StringVar(&flagLimit, "limit", ""`)
 	assert.Contains(t, classify, `TODO: implement novel feature %q", "runs classify"`)
 	assert.Contains(t, classify, `return writeDryRun(cmd.OutOrStdout(), flags, "runs classify")`)
@@ -1355,6 +1390,8 @@ func TestGeneratorNovelFeatureHelpGuardRequiresPositionalUse(t *testing.T) {
 func TestGeneratorNovelFeatureParentShortHasNoTODO(t *testing.T) {
 	t.Parallel()
 
+	const group = "Local state that compounds"
+
 	apiSpec := minimalSpec("novelparent")
 	outputDir := filepath.Join(t.TempDir(), naming.CLI(apiSpec.Name))
 	gen := New(apiSpec, outputDir)
@@ -1363,18 +1400,63 @@ func TestGeneratorNovelFeatureParentShortHasNoTODO(t *testing.T) {
 			Name:        "Snapshot diff",
 			Command:     "snapshot diff",
 			Description: "Compare two snapshots.",
+			Group:       group,
 			Example:     "novelparent-pp-cli snapshot diff before after",
 		},
 		{
 			Name:        "Snapshot list",
 			Command:     "snapshot list",
 			Description: "List snapshots.",
+			Group:       group,
 			Example:     "novelparent-pp-cli snapshot list",
+		},
+		{
+			Name:        "History show",
+			Command:     "history show",
+			Description: "Show one history entry.",
+			Group:       group,
+			Example:     "novelparent-pp-cli history show 1",
+		},
+		{
+			Name:        "History list",
+			Command:     "history list",
+			Description: "List history entries.",
+			Group:       group,
+			Example:     "novelparent-pp-cli history list",
+		},
+		{
+			Name:        "Governor status",
+			Command:     "governor status",
+			Description: "Show the current governor.",
+			Group:       group,
+			Example:     "novelparent-pp-cli governor status",
+		},
+		{
+			Name:        "Quiet leaf",
+			Command:     "quiet leaf",
+			Description: "   ",
+			Group:       group,
+			Example:     "novelparent-pp-cli quiet leaf",
+		},
+		{
+			Name:        "Workspace",
+			Command:     "workspace",
+			Description: "Manage local workspace files.",
+			Group:       group,
+			Example:     "novelparent-pp-cli workspace",
+		},
+		{
+			Name:        "Workspace status",
+			Command:     "workspace status",
+			Description: "Show workspace status.",
+			Group:       group,
+			Example:     "novelparent-pp-cli workspace status",
 		},
 		{
 			Name:        "Single command",
 			Command:     "single",
 			Description: "A single-segment novel command.",
+			Group:       group,
 			Example:     "novelparent-pp-cli single",
 		},
 	}
@@ -1382,13 +1464,41 @@ func TestGeneratorNovelFeatureParentShortHasNoTODO(t *testing.T) {
 
 	parent := readGeneratedFile(t, outputDir, "internal", "cli", "snapshot.go")
 	assert.Contains(t, parent, `Short:       "Work with snapshot"`)
+	assert.NotContains(t, parent, group)
 	assert.Contains(t, parent, `Example:     "  novelparent-pp-cli snapshot diff before after"`)
 	assert.NotContains(t, parent, `Short:       "TODO`)
 	assert.NotContains(t, parent, `subcommands:`)
 
+	history := readGeneratedFile(t, outputDir, "internal", "cli", "history.go")
+	assert.Contains(t, history, `Short:       "Work with history"`)
+	assert.NotContains(t, history, group)
+	assert.NotContains(t, parent, `Short:       "Work with history"`)
+	assert.NotContains(t, history, `Short:       "Work with snapshot"`)
+
+	governor := readGeneratedFile(t, outputDir, "internal", "cli", "governor.go")
+	assert.Contains(t, governor, `Short:       "Work with governor"`)
+	assert.NotContains(t, governor, group)
+	assert.NotContains(t, governor, `Show the current governor.`)
+
+	quiet := readGeneratedFile(t, outputDir, "internal", "cli", "quiet.go")
+	assert.Contains(t, quiet, `Short:       "Work with quiet"`)
+	assert.NotContains(t, quiet, group)
+
+	workspace := readGeneratedFile(t, outputDir, "internal", "cli", "workspace.go")
+	assert.Contains(t, workspace, `Short:       "Manage local workspace files."`)
+	assert.NotContains(t, workspace, group)
+	assert.NotContains(t, workspace, `Show workspace status.`)
+
 	single := readGeneratedFile(t, outputDir, "internal", "cli", "single.go")
 	assert.Contains(t, single, `Short:       "A single-segment novel command."`)
 	assert.NotContains(t, single, `subcommands:`)
+
+	readme := readGeneratedFile(t, outputDir, "README.md")
+	assert.Contains(t, readme, "### "+group)
+	skill := readGeneratedFile(t, outputDir, "SKILL.md")
+	assert.Contains(t, skill, "### "+group)
+	which := readGeneratedFile(t, outputDir, "internal", "cli", "which.go")
+	assert.Contains(t, which, `Group: "`+group+`"`)
 }
 
 func TestGeneratorLeavesAuthoredParentGroupExampleUntouched(t *testing.T) {

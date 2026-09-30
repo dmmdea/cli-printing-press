@@ -37,9 +37,11 @@ import (
 )
 
 func TestGeneratedTLSVerificationDefaultsSecureWithExplicitOptOut(t *testing.T) {
-	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	}))
+	server.EnableHTTP2 = true
+	server.StartTLS()
 	defer server.Close()
 
 	secureClient := newHTTPClient(time.Second, nil, false)
@@ -133,9 +135,11 @@ import (
 )
 
 func TestGeneratedTLSOptOutsReachTransport(t *testing.T) {
-	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	}))
+	server.EnableHTTP2 = true
+	server.StartTLS()
 	defer server.Close()
 
 	for _, tc := range []struct {
@@ -230,10 +234,13 @@ func TestGeneratedTLSPersistedOptOutSurvivesAuthReducedSave(t *testing.T) {
 
 	listCmd := exec.Command("go", "test", "-mod=mod", "-list", "^TestGeneratedTLSPersistedOptOutSurvivesAuthReducedSave$", "./internal/config")
 	listCmd.Dir = outputDir
-	cacheDir, err := goBuildCacheDir(outputDir)
-	require.NoError(t, err)
-	listCmd.Env = append(os.Environ(), "GOCACHE="+cacheDir)
-	listOut, err := listCmd.CombinedOutput()
+	var listOut []byte
+	err := withGoBuildCache(outputDir, func(cacheDir string) error {
+		listCmd.Env = append(os.Environ(), "GOCACHE="+cacheDir)
+		var runErr error
+		listOut, runErr = listCmd.CombinedOutput()
+		return runErr
+	})
 	require.NoError(t, err, string(listOut))
 	require.Contains(t, string(listOut), "TestGeneratedTLSPersistedOptOutSurvivesAuthReducedSave")
 

@@ -108,20 +108,32 @@ func PublishWorkingCLI(state *PipelineState, targetDir string) (string, error) {
 	}
 
 	if err := CopyDir(workingDir, finalDir); err != nil {
+		// CopyDir may have created the destination before failing. It did not
+		// exist before this call, and a leftover tree makes the retry fail
+		// with "already exists".
+		_ = os.RemoveAll(finalDir)
 		return "", fmt.Errorf("publishing CLI: %w", err)
 	}
 
+	prevPublished := state.PublishedDir
 	state.PublishedDir = finalDir
+	// The destination did not exist before this call. Drop it if a later step
+	// fails so the next attempt is not rejected because the path already exists.
+	abandonPublish := func(err error) (string, error) {
+		state.PublishedDir = prevPublished
+		_ = os.RemoveAll(finalDir)
+		return "", err
+	}
 
 	if err := writeCLIManifestForPublish(state, finalDir); err != nil {
-		return "", err
+		return abandonPublish(err)
 	}
 
 	// Refresh the MCPB manifest.json for the final published location.
 	// Generate already wrote one alongside .printing-press.json; rewriting
 	// here picks up any provenance fields the publish step added.
-	if err := WriteMCPBManifest(finalDir); err != nil {
-		fmt.Fprintf(os.Stderr, "warning: could not write MCPB manifest.json: %v\n", err)
+	if err := EnsureMCPBManifest(finalDir); err != nil {
+		return abandonPublish(fmt.Errorf("writing MCPB manifest: %w", err))
 	}
 
 	if err := state.Save(); err != nil {
@@ -238,13 +250,6 @@ func writeCLIManifestForPublish(state *PipelineState, dir string) error {
 			}
 			if existing.PrinterName != "" {
 				m.PrinterName = existing.PrinterName
-			}
-			// Backfill the creator from the carried-forward legacy fields so a
-			// CLI generated before the creator model persists a creator on
-			// republish (the public registry reads the written manifest, not
-			// publish-time transient state).
-			if (m.Creator == nil || m.Creator.IsZero()) && (strings.TrimSpace(m.Printer) != "" || strings.TrimSpace(m.PrinterName) != "") {
-				m.Creator = &spec.Person{Handle: strings.TrimSpace(m.Printer), Name: strings.TrimSpace(m.PrinterName)}
 			}
 			if existing.Category != "" {
 				m.Category = existing.Category
@@ -404,6 +409,24 @@ func writeCLIManifestForPublish(state *PipelineState, dir string) error {
 				state.RunID)
 		}
 	}
+
+	if m.Category == "" && state != nil && strings.TrimSpace(state.Category) != "" {
+		m.Category = strings.TrimSpace(state.Category)
+	}
+	if m.Category == "" && state != nil {
+		if rs, ok := loadGenerateResearchState(state.ResearchDir()); ok && strings.TrimSpace(rs.Category) != "" {
+			m.Category = strings.TrimSpace(rs.Category)
+		}
+	}
+	if strings.TrimSpace(m.Category) == "" {
+		cliName := m.CLIName
+		if cliName == "" && state != nil {
+			cliName = naming.CLI(state.APIName)
+		}
+		fmt.Fprintf(os.Stderr, "warning: promoting %s without a public-library category; pass generate --category <slug> so publish and verify-skill use the category-specific install path\n", cliName)
+	}
+
+	backfillPromoteManifestAttribution(&m)
 
 	clearFields := map[string]struct{}{}
 	if m.SpecURL != "" && m.SpecPath == "" {
@@ -639,6 +662,9 @@ type PublishableManuscriptCopyOptions struct {
 // CopyPublishableManuscriptDir copies manuscript artifacts that may be bundled
 // into published CLIs. Raw browser-sniff captures stay in local runstate by
 // default because they can carry cookies, session identifiers, and PII.
+// Live-dogfood transcripts and pipeline runstate are always omitted: they
+// carry API response bodies and absolute host paths, and IncludeRawCaptures
+// does not opt them back in. Phase 5 acceptance and skip markers stay.
 func CopyPublishableManuscriptDir(src, dst string) error {
 	return CopyPublishableManuscriptDirWithOptions(src, dst, PublishableManuscriptCopyOptions{})
 }
@@ -666,6 +692,12 @@ func shouldSkipPublishableManuscriptFile(path string, info fs.FileInfo, opts Pub
 	if strings.HasSuffix(strings.ToLower(filepath.Base(path)), ".pre-pii-scrub") {
 		return true
 	}
+	// Live transcripts and pipeline runstate carry response bodies and host
+	// paths. This check stays ahead of IncludeRawCaptures so that flag remains
+	// limited to browser-sniff evidence. Phase 5 marker filenames stay copyable.
+	if isManuscriptPipelineRunstate(path, info) || isRawLiveDogfoodTranscript(filepath.Base(path)) {
+		return true
+	}
 	if opts.IncludeRawCaptures {
 		return false
 	}
@@ -674,6 +706,31 @@ func shouldSkipPublishableManuscriptFile(path string, info fs.FileInfo, opts Pub
 	}
 	if strings.EqualFold(filepath.Ext(path), ".har") {
 		return true
+	}
+	return false
+}
+
+func isManuscriptPipelineRunstate(path string, info fs.FileInfo) bool {
+	if !strings.EqualFold(filepath.Base(path), "pipeline") {
+		return false
+	}
+	// A symlink named pipeline is not a directory until followed. Skipping
+	// the link avoids copying a pointer at the runstate tree.
+	return info.IsDir() || info.Mode()&fs.ModeSymlink != 0
+}
+
+func isRawLiveDogfoodTranscript(name string) bool {
+	name = strings.ToLower(name)
+	for _, pattern := range []string{
+		"publish-live-gate*.json",
+		"*-publish-live-gate.json",
+		"dogfood-results*.json",
+		"*-dogfood-results.json",
+	} {
+		matched, err := filepath.Match(pattern, name)
+		if err == nil && matched {
+			return true
+		}
 	}
 	return false
 }

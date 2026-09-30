@@ -17,11 +17,9 @@ func newTicketsPromotedCmd(flags *rootFlags) *cobra.Command {
 	var bodyFilter string
 
 	cmd := &cobra.Command{
-		Use:   "tickets",
-		Short: "Query tickets",
-		Long:  "Query tickets",
-		// TODO: replace placeholder example values before relying on this for live dogfood.
-		Example:     "  printing-press-golden-pp-cli tickets --x-api-version example-value",
+		Use:         "tickets",
+		Short:       "Query tickets",
+		Long:        "Query tickets",
 		Annotations: map[string]string{"pp:endpoint": "tickets.query", "pp:method": "POST", "pp:path": "/tickets/query", "mcp:read-only": "true", "pp:requires-input": "true"},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// Bare invocation of a command with a required flag/body prints help
@@ -104,9 +102,11 @@ func newTicketsPromotedCmd(flags *rootFlags) *cobra.Command {
 			// opt out of the auto-JSON path so piped consumers that asked for a
 			// non-JSON format reach the standard pipeline below.
 			if flags.asJSON || (!isTerminal(cmd.OutOrStdout()) && !flags.csv && !flags.quiet && !flags.plain) {
+				var selectErr error
 				filtered := data
 				if flags.selectFields != "" {
-					filtered = filterFields(filtered, flags.selectFields)
+					filtered, selectErr = filterFieldsChecked(filtered, flags.selectFields)
+					selectErr = selectErrorForDryRun(selectErr, flags, data)
 				} else if flags.compact {
 					filtered = compactFields(filtered, map[string]bool{"id": true})
 				}
@@ -118,7 +118,10 @@ func newTicketsPromotedCmd(flags *rootFlags) *cobra.Command {
 				if wrapErr != nil {
 					return wrapErr
 				}
-				return printOutput(cmd.OutOrStdout(), wrapped, true)
+				if err := printOutput(cmd.OutOrStdout(), wrapped, true); err != nil {
+					return err
+				}
+				return selectErr
 			}
 			if wantsHumanTable(cmd.OutOrStdout(), flags) {
 				var items []map[string]any

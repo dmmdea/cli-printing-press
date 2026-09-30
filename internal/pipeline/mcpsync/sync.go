@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/mvanhorn/cli-printing-press/v4/internal/generator"
@@ -264,6 +265,7 @@ func Sync(cliDir string, opts Options) (Result, error) {
 		return Result{}, err
 	}
 	features := loadNovelFeatures(cliDir)
+	preserveExistingLearnLoop(cliDir, parsed)
 	// Migration-only steps run when the surface is on the legacy
 	// template. Already-migrated CLIs skip these.
 	if !alreadyMigrated {
@@ -436,14 +438,14 @@ func extractMCPRecipeIntentSource(source, modulePath string) ([]byte, error) {
 				recipeHandlers[node.Name.Name] = true
 				recipeDecls = append(recipeDecls, node)
 			}
-			if node.Name.Name == "init" || strings.HasPrefix(node.Name.Name, "appendRecipe") || node.Name.Name == "recipeValueString" {
+			if node.Name.Name == "init" || strings.HasPrefix(node.Name.Name, "appendRecipe") || node.Name.Name == "recipeValueString" || node.Name.Name == "recipeDestinationBlocked" || node.Name.Name == "recipeCommandPath" {
 				recipeDecls = append(recipeDecls, node)
 			}
 		case *ast.GenDecl:
 			if node.Tok != token.VAR {
 				continue
 			}
-			if containsMCPIntentIdentifier(node, "recipeCLIPath") || containsMCPIntentIdentifier(node, "recipeCLIPathErr") {
+			if containsMCPIntentIdentifier(node, "recipeCLIPath") || containsMCPIntentIdentifier(node, "recipeCLIPathErr") || containsMCPIntentIdentifier(node, "recipeCommandRoot") {
 				recipeDecls = append(recipeDecls, node)
 			}
 		}
@@ -475,6 +477,9 @@ func extractMCPRecipeIntentSource(source, modulePath string) ([]byte, error) {
 	fmt.Fprintf(&out, "%spackage mcp\n\nimport (\n\t\"context\"\n\t\"fmt\"\n\t\"strings\"\n\n\tmcplib \"github.com/mark3labs/mcp-go/mcp\"\n\t\"github.com/mark3labs/mcp-go/server\"\n", header)
 	if declsContainIdentifier(recipeDecls, "bound") {
 		fmt.Fprintf(&out, "\t%q\n", modulePath+"/internal/mcp/bound")
+	}
+	if declsContainIdentifier(recipeDecls, "cli") {
+		fmt.Fprintf(&out, "\t%q\n", modulePath+"/internal/cli")
 	}
 	fmt.Fprintf(&out, "\t%q\n)\n\nfunc RegisterRecipeIntents(s *server.MCPServer) {\n", modulePath+"/internal/mcp/cobratree")
 	out.Write(registration.Bytes())
@@ -515,11 +520,34 @@ func containsMCPIntentIdentifier(node ast.Node, name string) bool {
 }
 
 func mcpIntentRegistrationHandler(stmt ast.Stmt) (string, bool) {
-	exprStmt, ok := stmt.(*ast.ExprStmt)
-	if !ok {
-		return "", false
+	switch node := stmt.(type) {
+	case *ast.ExprStmt:
+		return addToolHandlerName(node.X)
+	case *ast.BlockStmt:
+		var handler string
+		found := false
+		for _, inner := range node.List {
+			name, ok := mcpIntentRegistrationHandler(inner)
+			if !ok {
+				continue
+			}
+			handler = name
+			found = true
+		}
+		return handler, found
+	case *ast.IfStmt:
+		if name, ok := mcpIntentRegistrationHandler(node.Body); ok {
+			return name, true
+		}
+		if node.Else != nil {
+			return mcpIntentRegistrationHandler(node.Else)
+		}
 	}
-	call, ok := exprStmt.X.(*ast.CallExpr)
+	return "", false
+}
+
+func addToolHandlerName(expr ast.Expr) (string, bool) {
+	call, ok := expr.(*ast.CallExpr)
 	if !ok || len(call.Args) == 0 {
 		return "", false
 	}
@@ -596,15 +624,78 @@ func loadNovelFeatures(cliDir string) []generator.NovelFeature {
 	if err := json.Unmarshal(data, &manifest); err != nil {
 		return nil
 	}
-	features := make([]generator.NovelFeature, 0, len(manifest.NovelFeatures))
-	for _, nf := range manifest.NovelFeatures {
+	recorded := manifest.NovelFeatures
+	if len(manifest.NovelFeaturesBuilt) > 0 {
+		recorded = manifest.NovelFeaturesBuilt
+	}
+	features := make([]generator.NovelFeature, 0, len(recorded))
+	for _, nf := range recorded {
 		features = append(features, generator.NovelFeature{
 			Name:        nf.Name,
 			Command:     nf.Command,
 			Description: nf.Description,
 		})
 	}
+	return mergeNovelFeatureRationalesFromTools(cliDir, features)
+}
+
+// commandMirrorCapabilityRE matches the generated command_mirror_capabilities
+// entries in tools.go. Key order is the mcp_tools.go.tmpl contract.
+var commandMirrorCapabilityRE = regexp.MustCompile(`\{"name": ("(?:\\.|[^"\\])*"), "command": ("(?:\\.|[^"\\])*")(?:, "cli_command": "(?:\\.|[^"\\])*")?, "description": ("(?:\\.|[^"\\])*"), "rationale": ("(?:\\.|[^"\\])*"), "via": "mcp-command-mirror"\}`)
+
+// mergeNovelFeatureRationalesFromTools fills empty Rationale values from the
+// existing tools.go surface. mcp-sync has no --research-dir, so the
+// previously generated MCP context is the recorded source; this does not
+// invent features that are not already in the manifest.
+func mergeNovelFeatureRationalesFromTools(cliDir string, features []generator.NovelFeature) []generator.NovelFeature {
+	if len(features) == 0 {
+		return features
+	}
+	data, err := os.ReadFile(filepath.Join(cliDir, "internal", "mcp", "tools.go"))
+	if err != nil {
+		return features
+	}
+	byCommand := map[string]string{}
+	for _, match := range commandMirrorCapabilityRE.FindAllStringSubmatch(string(data), -1) {
+		if len(match) != 5 {
+			continue
+		}
+		command, err := strconv.Unquote(match[2])
+		if err != nil || command == "" {
+			continue
+		}
+		rationale, err := strconv.Unquote(match[4])
+		if err != nil || rationale == "" {
+			continue
+		}
+		byCommand[command] = rationale
+	}
+	for i := range features {
+		if features[i].Rationale != "" {
+			continue
+		}
+		if rationale := byCommand[features[i].Command]; rationale != "" {
+			features[i].Rationale = rationale
+		}
+	}
 	return features
+}
+
+// preserveExistingLearnLoop keeps learn.enabled on when mcp-sync reloads a
+// spec that never recorded the generate-time default. GenerateMCPSurface
+// deliberately does not apply ApplyLearnLoopDefault, because published CLIs
+// may lack the learn package; flipping the default there would emit a broken
+// import. When the package is already in the tree, dropping learn_protocol
+// from tools.go is a silent surface regression.
+func preserveExistingLearnLoop(cliDir string, parsed *spec.APISpec) {
+	if parsed == nil || parsed.Learn.Disabled || parsed.Learn.Enabled || parsed.Learn.EnabledSet {
+		return
+	}
+	info, err := os.Stat(filepath.Join(cliDir, "internal", "learn"))
+	if err != nil || !info.IsDir() {
+		return
+	}
+	parsed.Learn.Enabled = true
 }
 
 func ensureEndpointAnnotations(cliDir string, parsed *spec.APISpec, features []generator.NovelFeature) error {

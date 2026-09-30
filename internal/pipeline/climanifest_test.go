@@ -720,6 +720,26 @@ func TestPublishWorkingCLIWritesManifestForYAMLSpec(t *testing.T) {
 	assert.Equal(t, expectedChecksum, got.SpecChecksum, "publish must checksum YAML-archived specs")
 }
 
+func TestPublishWorkingCLIRemovesOutputWhenMCPBManifestFails(t *testing.T) {
+	home := setPressTestEnv(t)
+
+	workingDir := filepath.Join(home, "working", "mcpb-fail-pp-cli")
+	require.NoError(t, os.MkdirAll(filepath.Join(workingDir, "internal", "mcp"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(workingDir, "main.go"), []byte("package main\nfunc main() {}\n"), 0o644))
+
+	state := NewState("mcpb-fail", workingDir)
+	require.NoError(t, os.MkdirAll(filepath.Dir(state.StatePath()), 0o755))
+	require.NoError(t, state.Save())
+
+	publishDir := filepath.Join(home, "library", "mcpb-fail-pp-cli")
+	_, err := PublishWorkingCLI(state, publishDir)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no cmd/*-pp-mcp entry point")
+	_, statErr := os.Stat(publishDir)
+	assert.True(t, os.IsNotExist(statErr))
+	assert.Empty(t, state.PublishedDir)
+}
+
 func TestPublishWorkingCLIManifestWithoutSpec(t *testing.T) {
 	home := setPressTestEnv(t)
 
@@ -1374,6 +1394,52 @@ func TestWriteMCPBManifest(t *testing.T) {
 		writeManifest(t, dir, CLIManifest{APIName: "no-mcp", MCPReady: "full"})
 
 		require.NoError(t, WriteMCPBManifest(dir))
+		_, statErr := os.Stat(filepath.Join(dir, MCPBManifestFilename))
+		assert.True(t, os.IsNotExist(statErr))
+	})
+
+	t.Run("infers MCP binary from command directory", func(t *testing.T) {
+		dir := t.TempDir()
+		writeManifest(t, dir, CLIManifest{APIName: "demo", CLIName: "demo-pp-cli"})
+		require.NoError(t, os.MkdirAll(filepath.Join(dir, "cmd", "demo-pp-mcp"), 0o755))
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "cmd", "demo-pp-mcp", "main.go"), []byte("package main\nfunc main() {}\n"), 0o644))
+
+		require.NoError(t, WriteMCPBManifest(dir))
+		got := readMCPBManifest(t, dir)
+		assert.Equal(t, "demo-pp-mcp", got.Name)
+		assert.Equal(t, "bin/demo-pp-mcp", got.Server.EntryPoint)
+
+		manifest, err := ReadCLIManifest(dir)
+		require.NoError(t, err)
+		assert.Empty(t, manifest.MCPBinary)
+	})
+
+	t.Run("internal mcp package without a command entry point is an error", func(t *testing.T) {
+		dir := t.TempDir()
+		writeManifest(t, dir, CLIManifest{APIName: "demo", CLIName: "demo-pp-cli"})
+		require.NoError(t, os.MkdirAll(filepath.Join(dir, "internal", "mcp"), 0o755))
+
+		err := WriteMCPBManifest(dir)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "no cmd/*-pp-mcp entry point")
+		_, statErr := os.Stat(filepath.Join(dir, MCPBManifestFilename))
+		assert.True(t, os.IsNotExist(statErr))
+
+		err = EnsureMCPBManifest(dir)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "no cmd/*-pp-mcp entry point")
+		_, statErr = os.Stat(filepath.Join(dir, MCPBManifestFilename))
+		assert.True(t, os.IsNotExist(statErr))
+	})
+
+	t.Run("MCP surface without CLI manifest is an error at package time", func(t *testing.T) {
+		dir := t.TempDir()
+		require.NoError(t, os.MkdirAll(filepath.Join(dir, "cmd", "demo-pp-mcp"), 0o755))
+
+		require.NoError(t, WriteMCPBManifest(dir))
+		err := EnsureMCPBManifest(dir)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), CLIManifestFilename)
 		_, statErr := os.Stat(filepath.Join(dir, MCPBManifestFilename))
 		assert.True(t, os.IsNotExist(statErr))
 	})
@@ -2222,6 +2288,72 @@ func TestRefreshCLIManifestFromSpecRefreshesDisplayName(t *testing.T) {
 	assert.Equal(t, "Cal.com", got.DisplayName)
 }
 
+func TestRefreshCLIManifestFromSpecPreservesNovelFeaturesBuilt(t *testing.T) {
+	dir := t.TempDir()
+	built := []NovelFeatureManifest{
+		{Name: "Health", Command: "health", Description: "Summarize health."},
+		{Name: "Stale", Command: "stale", Description: "Find stale items."},
+	}
+	require.NoError(t, os.WriteFile(filepath.Join(dir, CLIManifestFilename), []byte(`{
+  "schema_version": 1,
+  "api_name": "example",
+  "cli_name": "example-pp-cli",
+  "auth_type": "api_key",
+  "novel_features": [{"name":"Health","command":"health","description":"Summarize health."}],
+  "novel_features_built": [
+    {"name":"Health","command":"health","description":"Summarize health."},
+    {"name":"Stale","command":"stale","description":"Find stale items."}
+  ],
+  "research_note": "keep-me"
+}
+`), 0o644))
+
+	require.NoError(t, RefreshCLIManifestFromSpec(dir, &spec.APISpec{
+		Name: "example",
+		Auth: spec.AuthConfig{Type: "none"},
+	}))
+
+	data, err := os.ReadFile(filepath.Join(dir, CLIManifestFilename))
+	require.NoError(t, err)
+	var raw map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(data, &raw))
+	assert.JSONEq(t, `[{"name":"Health","command":"health","description":"Summarize health."},{"name":"Stale","command":"stale","description":"Find stale items."}]`, string(raw["novel_features_built"]))
+	assert.JSONEq(t, `"keep-me"`, string(raw["research_note"]), "unknown research-originated keys must survive refresh")
+
+	got, err := ReadCLIManifest(dir)
+	require.NoError(t, err)
+	assert.Equal(t, "none", got.AuthType, "spec-derived auth_type must still refresh")
+	require.Len(t, got.NovelFeaturesBuilt, 2)
+	assert.Equal(t, built, got.NovelFeaturesBuilt)
+	require.Len(t, got.NovelFeatures, 1)
+}
+
+func TestRefreshCLIManifestFromSpecPreservesCompactNovelFeaturesBuilt(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, CLIManifestFilename), []byte(`{
+  "schema_version": 1,
+  "api_name": "example",
+  "cli_name": "example-pp-cli",
+  "novel_features_built": [{"name":"Health","command":"health"}]
+}
+`), 0o644))
+
+	require.NoError(t, RefreshCLIManifestFromSpec(dir, &spec.APISpec{Name: "example"}))
+
+	data, err := os.ReadFile(filepath.Join(dir, CLIManifestFilename))
+	require.NoError(t, err)
+	var raw map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(data, &raw))
+	assert.JSONEq(t, `[{"name":"Health","command":"health"}]`, string(raw["novel_features_built"]))
+
+	got, err := ReadCLIManifest(dir)
+	require.NoError(t, err)
+	require.Len(t, got.NovelFeaturesBuilt, 1)
+	assert.Equal(t, "Health", got.NovelFeaturesBuilt[0].Name)
+	assert.Equal(t, "health", got.NovelFeaturesBuilt[0].Command)
+	assert.Empty(t, got.NovelFeaturesBuilt[0].Description)
+}
+
 func writeManifest(t *testing.T, dir string, m CLIManifest) {
 	t.Helper()
 	data, err := json.Marshal(m)
@@ -3008,6 +3140,39 @@ func TestWriteManifestForGenerateNoCategoryAnywhere(t *testing.T) {
 
 	got := readPublishedManifest(t, dir)
 	assert.Empty(t, got.Category, "manifest.Category should stay empty when no source provides one")
+}
+
+func TestPersistGenerateCategoryWritesResearchStateAndPipelineState(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("PRINTING_PRESS_HOME", tmp)
+	t.Setenv("PRINTING_PRESS_SCOPE", "test-scope")
+	t.Setenv("PRINTING_PRESS_REPO_ROOT", tmp)
+
+	workDir := filepath.Join(tmp, "working", "test-pp-cli")
+	require.NoError(t, os.MkdirAll(workDir, 0o755))
+	state := NewStateWithRun("test", workDir, "run-persist-cat", "test-scope")
+	require.NoError(t, state.Save())
+
+	researchDir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(researchDir, "state.json"), []byte(`{"api_name":"test","run_id":"run-persist-cat"}`+"\n"), 0o644))
+
+	require.NoError(t, PersistGenerateCategory(researchDir, workDir, "ai"))
+
+	loaded, err := FindStateByWorkingDir(workDir)
+	require.NoError(t, err)
+	assert.Equal(t, "ai", loaded.Category)
+
+	rs, ok := loadGenerateResearchState(researchDir)
+	require.True(t, ok)
+	assert.Equal(t, "ai", rs.Category)
+}
+
+func TestPersistGenerateCategoryReturnsParseError(t *testing.T) {
+	researchDir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(researchDir, "state.json"), []byte("not json"), 0o644))
+	err := PersistGenerateCategory(researchDir, "", "ai")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "parsing research state")
 }
 
 func TestWriteManifestForGenerateRepointsSpecPathToArchivedSpec(t *testing.T) {

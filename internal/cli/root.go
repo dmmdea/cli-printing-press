@@ -11,7 +11,6 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -81,6 +80,7 @@ func NewRootCommand(commandName string) *cobra.Command {
 	rootCmd.AddCommand(newContributorsCmd())
 	rootCmd.AddCommand(newVisionCmd())
 	rootCmd.AddCommand(newVersionCmd())
+	rootCmd.AddCommand(newSkillCompatCmd())
 	rootCmd.AddCommand(newPrintCmd())
 	rootCmd.AddCommand(newBrowserSniffCmd())
 	rootCmd.AddCommand(newCrowdSniffCmd())
@@ -237,6 +237,9 @@ func newGenerateCmd() *cobra.Command {
 					NovelFeatures: generateResult.NovelFeatures,
 				}); err != nil {
 					fmt.Fprintf(os.Stderr, "warning: could not write manifest: %v\n", err)
+				}
+				if err := pipeline.PersistGenerateCategory(researchDir, absOut, parsed.Category); err != nil {
+					fmt.Fprintf(os.Stderr, "warning: could not persist generate category: %v\n", err)
 				}
 
 				fmt.Fprintf(os.Stderr, "Generated %s at %s (from docs)\n", parsed.Name, absOut)
@@ -543,6 +546,9 @@ func newGenerateCmd() *cobra.Command {
 			}); err != nil {
 				fmt.Fprintf(os.Stderr, "warning: could not write manifest: %v\n", err)
 			}
+			if err := pipeline.PersistGenerateCategory(researchDir, absOut, apiSpec.Category); err != nil {
+				fmt.Fprintf(os.Stderr, "warning: could not persist generate category: %v\n", err)
+			}
 
 			// Archive a snapshot of the spec alongside the CLI; multi-spec
 			// runs use the merged form (see archiveSpecBytes for why).
@@ -678,6 +684,16 @@ func runGenerateProject(apiSpec *spec.APISpec, absOut string, opts generateProje
 	browsersniff.ApplyReachabilityDefaults(apiSpec, trafficAnalysis)
 	applyHTTPTransportDefault(apiSpec, trafficAnalysis)
 	gen.TrafficAnalysis = trafficAnalysis
+	if err := pipeline.RejectUnverifiedNovelHosts(pipeline.NovelHostInput{
+		CLIDir:         absOut,
+		ResearchDir:    opts.researchDir,
+		Spec:           apiSpec,
+		SpecPaths:      opts.specFiles,
+		Traffic:        trafficAnalysis,
+		DiscoveryPages: gen.DiscoveryPages,
+	}); err != nil {
+		return generateProjectResult{}, &ExitError{Code: ExitGenerationError, Err: err}
+	}
 	if err := gen.Generate(); err != nil {
 		return generateProjectResult{}, &ExitError{Code: ExitGenerationError, Err: fmt.Errorf("generating project: %w", err)}
 	}
@@ -1386,7 +1402,87 @@ func mergeSpecsWithOptions(specs []*spec.APISpec, name string, opts mergeSpecOpt
 		}
 	}
 
+	applyMultiSpecTemplateVars(merged, specs)
+
 	return merged
+}
+
+// applyMultiSpecTemplateVars preserves template-variable bindings when the
+// merge reconstructs the spec. Without this the merged spec loses each
+// source's {placeholder} wiring, so a per-tenant path segment degrades into
+// a positional argument on every command instead of a root flag backed by
+// the declared env var.
+func applyMultiSpecTemplateVars(merged *spec.APISpec, specs []*spec.APISpec) {
+	seenVars := map[string]struct{}{}
+	overrideSource := map[string]*spec.APISpec{}
+	for _, s := range specs {
+		for _, name := range s.EndpointTemplateVars {
+			if strings.TrimSpace(name) == "" {
+				continue
+			}
+			if _, dup := seenVars[name]; dup {
+				continue
+			}
+			seenVars[name] = struct{}{}
+			merged.EndpointTemplateVars = append(merged.EndpointTemplateVars, name)
+		}
+		for _, placeholder := range sortedStringMapKeys(s.EndpointTemplateEnvOverrides) {
+			override := s.EndpointTemplateEnvOverrides[placeholder]
+			if strings.TrimSpace(placeholder) == "" || strings.TrimSpace(override) == "" {
+				continue
+			}
+			if existing, taken := merged.EndpointTemplateEnvOverrides[placeholder]; taken {
+				if existing != override {
+					fmt.Fprintf(os.Stderr, "warning: spec %q binds template var {%s} to %s but spec %q already bound it to %s; keeping %s\n",
+						s.Name, placeholder, override, overrideSource[placeholder].Name, existing, existing)
+				}
+				continue
+			}
+			if merged.EndpointTemplateEnvOverrides == nil {
+				merged.EndpointTemplateEnvOverrides = map[string]string{}
+			}
+			merged.EndpointTemplateEnvOverrides[placeholder] = override
+			overrideSource[placeholder] = s
+		}
+		mergeFirstWins(&merged.EndpointTemplateVarDefaults, s.EndpointTemplateVarDefaults)
+		mergeFirstWins(&merged.EndpointPathParamDefaults, s.EndpointPathParamDefaults)
+	}
+	// The merged spec has its own name and auth model, so an override that was
+	// benign per-spec can now collide with a credential env var.
+	merged.DropCollidingEndpointTemplateEnvOverrides()
+	// Global promotion keeps whatever is already listed without re-checking the
+	// coverage threshold, so a placeholder that is global in one source spec
+	// would force a root flag on every merged command. Leave the list empty and
+	// let PromoteGlobalPathTemplateVars recompute it from the merged endpoints.
+	merged.GlobalPathTemplateVars = nil
+}
+
+// mergeFirstWins keeps the first spec's binding when two specs declare the
+// same key. A later overwrite would make defaults depend on merge order.
+func mergeFirstWins(dst *map[string]string, src map[string]string) {
+	for _, key := range sortedStringMapKeys(src) {
+		if strings.TrimSpace(key) == "" {
+			continue
+		}
+		if _, taken := (*dst)[key]; taken {
+			continue
+		}
+		if *dst == nil {
+			*dst = map[string]string{}
+		}
+		(*dst)[key] = src[key]
+	}
+}
+
+// sortedStringMapKeys keeps merge results and conflict warnings in a
+// deterministic order.
+func sortedStringMapKeys(in map[string]string) []string {
+	keys := make([]string, 0, len(in))
+	for key := range in {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func prefixedMultiSpecResourceName(s *spec.APISpec, resourceName string) string {
@@ -1746,10 +1842,16 @@ func compatibleOAuthScopeAuth(base, incoming spec.AuthConfig) bool {
 		}
 		return normalizeAuthURL(base.TokenURL) == normalizeAuthURL(incoming.TokenURL)
 	}
-	if strings.TrimSpace(base.AuthorizationURL) == "" {
+	if base.Type != incoming.Type || base.EffectiveOAuth2Grant() != incoming.EffectiveOAuth2Grant() {
 		return false
 	}
-	if base.Type != incoming.Type || base.EffectiveOAuth2Grant() != incoming.EffectiveOAuth2Grant() {
+	// Two-legged grants never carry an authorization URL, so the token
+	// endpoint is the only authority the consent request can belong to.
+	if base.EffectiveOAuth2Grant() == spec.OAuth2GrantClientCredentials {
+		return normalizeAuthURL(base.TokenURL) == normalizeAuthURL(incoming.TokenURL) &&
+			strings.TrimSpace(base.RefreshTokenMechanism) == strings.TrimSpace(incoming.RefreshTokenMechanism)
+	}
+	if strings.TrimSpace(base.AuthorizationURL) == "" {
 		return false
 	}
 	if normalizeAuthURL(base.AuthorizationURL) != normalizeAuthURL(incoming.AuthorizationURL) {
@@ -2555,6 +2657,13 @@ func finalizeForceMerge(snapshotDir, freshDir string, currentSpecBytes []byte, v
 // preservation and print every skipped TEMPLATED-* hand-edit. Same-spec
 // regen still carries those edits; the drop list is the cross-spec
 // honesty so the operator sees the loss instead of a mode suffix alone.
+// Same-version force synthesizes a clean generate (current press, current
+// spec, no research/traffic/generation extras) as the three-way original.
+// Shared bodies that still match that original are regenerations and take
+// fresh; bodies that differ from it are hand-edits and overlay. Raw fresh
+// is never that original: extras not in the spec checksum can legitimately
+// rewrite shared functions, and treating every difference as a hand-edit
+// would overlay the stale snapshot body.
 //
 // When the merge updates go.mod (snapshot had hand-added requires), the
 // caller must re-run `go mod tidy` against freshDir to refresh go.sum —
@@ -2631,8 +2740,11 @@ func synthesizeForceRegenBase(snapshotDir string, currentSpecBytes []byte, novel
 		return "", nil
 	}
 	priorVersion := strings.TrimSpace(manifest.PrintingPressVersion)
-	if priorVersion == "" || sameSemver(priorVersion, version.Version) {
+	if priorVersion == "" {
 		return "", nil
+	}
+	if sameSemver(priorVersion, version.Version) {
+		return synthesizeSameVersionForceRegenBase(currentSpecBytes)
 	}
 	if !validPrintingPressVersion(priorVersion) {
 		fmt.Fprintf(os.Stderr, "warning: cannot synthesize force-regen base from invalid printing_press_version %q\n", priorVersion)
@@ -2673,6 +2785,34 @@ func synthesizeForceRegenBase(snapshotDir string, currentSpecBytes []byte, novel
 	return baseDir, cleanup
 }
 
+// Overlay needs a clean same-version original so it can keep real
+// hand-edits without treating intentional shared-body rewrites or stale
+// emissions as edits to restore.
+func synthesizeSameVersionForceRegenBase(currentSpecBytes []byte) (string, func()) {
+	if len(currentSpecBytes) == 0 {
+		return "", nil
+	}
+	apiSpec, err := parseSpecBytes("spec.yaml", currentSpecBytes, openapi.ParseOptions{Lenient: true})
+	if err != nil || apiSpec == nil {
+		fmt.Fprintf(os.Stderr, "warning: cannot synthesize same-version force-regen base: %v\n", err)
+		return "", nil
+	}
+	tmp, err := os.MkdirTemp("", "printing-press-force-base-*")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: cannot create same-version force-regen base tempdir: %v\n", err)
+		return "", nil
+	}
+	cleanup := func() { _ = os.RemoveAll(tmp) }
+	baseDir := filepath.Join(tmp, "base")
+	fmt.Fprintln(os.Stderr, "Synthesizing same-version force-regen base from spec (this may take a moment)...")
+	if err := generator.New(apiSpec, baseDir).Generate(); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: same-version force-regen base generation failed: %v\n", err)
+		cleanup()
+		return "", nil
+	}
+	return baseDir, cleanup
+}
+
 func snapshotPrintingPressVersionDiffers(snapshotDir string) bool {
 	manifest, err := pipeline.ReadCLIManifest(snapshotDir)
 	if err != nil {
@@ -2680,6 +2820,15 @@ func snapshotPrintingPressVersionDiffers(snapshotDir string) bool {
 	}
 	prior := strings.TrimSpace(manifest.PrintingPressVersion)
 	return prior != "" && !sameSemver(prior, version.Version)
+}
+
+func snapshotRecordsRunningVersion(snapshotDir string) bool {
+	manifest, err := pipeline.ReadCLIManifest(snapshotDir)
+	if err != nil {
+		return false
+	}
+	prior := strings.TrimSpace(manifest.PrintingPressVersion)
+	return prior != "" && sameSemver(prior, version.Version)
 }
 
 func sameSemver(a, b string) bool {
@@ -2899,10 +3048,15 @@ func newVersionCmd() *cobra.Command {
 		Example: `  cli-printing-press version`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if asJSON {
-				return json.NewEncoder(cmd.OutOrStdout()).Encode(map[string]string{
-					"version": version.Version,
-					"go":      runtime.Version(),
-				})
+				home := userHomeDir()
+				payload := versionJSONPayload(home)
+				if err := json.NewEncoder(cmd.OutOrStdout()).Encode(payload); err != nil {
+					return err
+				}
+				if payload.SkillStatus == skillStatusStale {
+					writeSkillStaleWarning(cmd.ErrOrStderr(), discoverInstalledSkillCompat(home))
+				}
+				return nil
 			}
 			fmt.Fprintf(cmd.OutOrStdout(), "%s %s\n", cmd.Root().Use, version.Version)
 			return nil

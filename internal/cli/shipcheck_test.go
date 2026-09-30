@@ -798,6 +798,48 @@ func TestShipcheck_JSONEnvelope_OneFailure(t *testing.T) {
 	}
 }
 
+func TestShipcheck_JSONEnvelope_DogfoodAndWorkflowVerifyFailure(t *testing.T) {
+	h := newShipcheckHarness(t)
+	t.Setenv("STUB_EXIT_DOGFOOD", "3")
+	t.Setenv("STUB_EXIT_WORKFLOW_VERIFY", "3")
+
+	out := captureStdout(t, func() {
+		err := runShipcheckCmd(t, "--dir", h.dir, "--json")
+		if err == nil {
+			t.Fatal("expected non-nil error when dogfood and workflow-verify fail")
+		}
+		exitErr, ok := err.(*ExitError)
+		if !ok {
+			t.Fatalf("expected *ExitError; got %T: %v", err, err)
+		}
+		if exitErr.Code != ExitGenerationError {
+			t.Fatalf("umbrella exit code = %d, want %d", exitErr.Code, ExitGenerationError)
+		}
+	})
+
+	var env shipcheckJSONEnvelope
+	if err := json.Unmarshal([]byte(extractFinalJSONObject(t, out)), &env); err != nil {
+		t.Fatalf("envelope is not valid JSON: %v", err)
+	}
+	if env.Passed || env.Verdict != "FAIL" || env.ExitCode != ExitGenerationError {
+		t.Fatalf("envelope = passed=%v verdict=%s exit=%d, want FAIL exit %d", env.Passed, env.Verdict, env.ExitCode, ExitGenerationError)
+	}
+
+	saw := map[string]bool{}
+	for _, leg := range env.Legs {
+		if leg.Name == "dogfood" || leg.Name == "workflow-verify" {
+			saw[leg.Name] = true
+			if leg.Passed || leg.Verdict != "FAIL" || leg.ExitCode != ExitGenerationError {
+				t.Errorf("%s leg = passed=%v verdict=%s exit=%d, want FAIL exit %d",
+					leg.Name, leg.Passed, leg.Verdict, leg.ExitCode, ExitGenerationError)
+			}
+		}
+	}
+	if !saw["dogfood"] || !saw["workflow-verify"] {
+		t.Fatalf("envelope missing dogfood or workflow-verify legs: %v", saw)
+	}
+}
+
 func TestShipcheck_HoldsOnUnverifiedScorecard(t *testing.T) {
 	h := newShipcheckHarness(t)
 	if err := os.WriteFile(filepath.Join(h.dir, pipeline.CLIManifestFilename), []byte(`{
@@ -829,6 +871,47 @@ func TestShipcheck_HoldsOnUnverifiedScorecard(t *testing.T) {
 	}
 	if !strings.Contains(out, "unverified") {
 		t.Errorf("shipcheck output missing unverified detail: %q", out)
+	}
+}
+
+func TestShipcheck_AllowsUnscoredLiveAPIVerification(t *testing.T) {
+	h := newShipcheckHarness(t)
+	cliDir := filepath.Join(h.dir, "internal", "cli")
+	if err := os.MkdirAll(cliDir, 0o755); err != nil {
+		t.Fatalf("creating CLI fixture: %v", err)
+	}
+	const cliSource = `package cli
+
+func widgetsPath() string { return "/widgets" }
+`
+	if err := os.WriteFile(filepath.Join(cliDir, "widgets.go"), []byte(cliSource), 0o644); err != nil {
+		t.Fatalf("writing CLI fixture: %v", err)
+	}
+	specPath := filepath.Join(h.dir, "spec.yaml")
+	const spec = `name: widgets
+version: "1.0.0"
+base_url: https://api.example.com
+resources:
+  widgets:
+    endpoints:
+      list:
+        method: GET
+        path: /widgets
+`
+	if err := os.WriteFile(specPath, []byte(spec), 0o644); err != nil {
+		t.Fatalf("writing spec fixture: %v", err)
+	}
+
+	sc, err := pipeline.RunScorecard(h.dir, t.TempDir(), specPath, nil)
+	if err != nil {
+		t.Fatalf("running scorecard: %v", err)
+	}
+	if _, err := pipeline.PersistScorecardToManifest(filepath.Join(h.dir, pipeline.CLIManifestFilename), sc, ""); err != nil {
+		t.Fatalf("persisting scorecard: %v", err)
+	}
+
+	if err := runShipcheckCmd(t, "--dir", h.dir); err != nil {
+		t.Fatalf("unscored live API verification should not hold shipping: %v", err)
 	}
 }
 

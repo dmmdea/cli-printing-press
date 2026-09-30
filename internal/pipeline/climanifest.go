@@ -161,8 +161,12 @@ type CLIManifest struct {
 	AuthOptional               bool                        `json:"auth_optional,omitempty"`
 	ReviewedSecretSuppressions []ReviewedSecretSuppression `json:"reviewed_secret_suppressions,omitempty"`
 	NovelFeatures              []NovelFeatureManifest      `json:"novel_features,omitempty"`
-	Scorecard                  *CLIManifestScorecard       `json:"scorecard,omitempty"`
-	Verify                     *CLIManifestVerify          `json:"verify,omitempty"`
+	// NovelFeaturesBuilt is the dogfood-verified subset persisted by
+	// scorecard. It is research-originated and is not spec-derived, so
+	// regen paths that lack a research dir must leave it in place.
+	NovelFeaturesBuilt []NovelFeatureManifest `json:"novel_features_built,omitempty"`
+	Scorecard          *CLIManifestScorecard  `json:"scorecard,omitempty"`
+	Verify             *CLIManifestVerify     `json:"verify,omitempty"`
 	// generatedEnvReads is a write-scoped scan of os.Getenv names already
 	// emitted into the printed CLI. It is not serialized; WriteMCPBManifest
 	// and reconcile attach it so a kept colliding override can bind the
@@ -242,7 +246,7 @@ func (m CLIManifest) IsSyntheticSpec() bool {
 type NovelFeatureManifest struct {
 	Name        string `json:"name"`
 	Command     string `json:"command"`
-	Description string `json:"description"`
+	Description string `json:"description,omitempty"`
 }
 
 // ReadCLIBinaryName reads .printing-press.json from dir and returns the
@@ -294,9 +298,11 @@ func readCLIManifestFile(path string) (CLIManifest, error) {
 //
 // Generate-time fields (spec_url, spec_path, spec_checksum,
 // generated_at, printing_press_version, schema_version, novel_features,
-// category, cli_name, api_name, api_version, description)
-// are preserved as-is. Only the spec-driven MCP/auth/display fields
-// are refreshed.
+// novel_features_built, category, cli_name, api_name, api_version,
+// description) are preserved as-is. Research-originated keys that the
+// typed struct does not model are kept via the raw merge so a refresh
+// without --research-dir cannot zero the publish transcendence gate.
+// Only the spec-driven MCP/auth/display fields are refreshed.
 //
 // Returns nil silently when .printing-press.json is missing — callers
 // generating from scratch don't need a provenance-refresh step.
@@ -311,6 +317,10 @@ func RefreshCLIManifestFromSpec(dir string, parsed *spec.APISpec) error {
 		}
 		return fmt.Errorf("reading CLI manifest for refresh: %w", err)
 	}
+	var existingRaw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &existingRaw); err != nil {
+		return fmt.Errorf("parsing CLI manifest for refresh: %w", err)
+	}
 	var m CLIManifest
 	if err := json.Unmarshal(data, &m); err != nil {
 		return fmt.Errorf("parsing CLI manifest for refresh: %w", err)
@@ -320,7 +330,7 @@ func RefreshCLIManifestFromSpec(dir string, parsed *spec.APISpec) error {
 	if preserveExistingDescription(existingDescription) {
 		m.Description = existingDescription
 	}
-	return WriteCLIManifest(dir, m)
+	return writeCLIManifestPreservingRaw(dir, m, existingRaw)
 }
 
 // WriteCLIManifest marshals m as indented JSON and writes it to
@@ -443,30 +453,63 @@ func AppendContributor(dir string, p spec.Person, front bool) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("reading CLI manifest: %w", err)
 	}
+	out, added, changed, err := planAppendContributor(data, p, front)
+	if err != nil || !changed {
+		return added, err
+	}
+	if err := writeFileAtomic(path, out, 0o644); err != nil {
+		return false, fmt.Errorf("writing CLI manifest: %w", err)
+	}
+	return added, nil
+}
+
+// planAppendContributor returns the manifest bytes to persist. changed is
+// false when those bytes must stay as they are, so a caller can reject a
+// later README or NOTICE update before anything is written.
+func planAppendContributor(data []byte, p spec.Person, front bool) (out []byte, added, changed bool, err error) {
+	p = p.Clean()
+	if p.IsZero() {
+		return data, false, false, nil
+	}
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(data, &raw); err != nil {
-		return false, fmt.Errorf("parsing CLI manifest: %w", err)
+		return nil, false, false, fmt.Errorf("parsing CLI manifest: %w", err)
 	}
 
 	var creator spec.Person
 	if rc, ok := raw["creator"]; ok {
 		if err := json.Unmarshal(rc, &creator); err != nil {
-			return false, fmt.Errorf("parsing creator: %w", err)
+			return nil, false, false, fmt.Errorf("parsing creator: %w", err)
 		}
 	}
 	if spec.SamePerson(p, creator) {
-		return false, nil
+		return data, false, false, nil
+	}
+	if creator.IsZero() {
+		printer := personFromPrinterFields(raw)
+		if !printer.IsZero() && spec.SamePerson(p, printer) {
+			enc, err := json.Marshal(p)
+			if err != nil {
+				return nil, false, false, fmt.Errorf("encoding creator: %w", err)
+			}
+			raw["creator"] = enc
+			out, err := marshalCLIManifestObject(raw)
+			if err != nil {
+				return nil, false, false, err
+			}
+			return out, false, true, nil
+		}
 	}
 
 	var contributors []spec.Person
 	if rc, ok := raw["contributors"]; ok {
 		if err := json.Unmarshal(rc, &contributors); err != nil {
-			return false, fmt.Errorf("parsing contributors: %w", err)
+			return nil, false, false, fmt.Errorf("parsing contributors: %w", err)
 		}
 	}
 	for _, c := range contributors {
 		if spec.SamePerson(p, c) {
-			return false, nil
+			return data, false, false, nil
 		}
 	}
 
@@ -477,18 +520,26 @@ func AppendContributor(dir string, p spec.Person, front bool) (bool, error) {
 	}
 	enc, err := json.Marshal(contributors)
 	if err != nil {
-		return false, fmt.Errorf("encoding contributors: %w", err)
+		return nil, false, false, fmt.Errorf("encoding contributors: %w", err)
 	}
 	raw["contributors"] = enc
 
-	out, err := marshalCLIManifestObject(raw)
+	out, err = marshalCLIManifestObject(raw)
 	if err != nil {
-		return false, err
+		return nil, false, false, err
 	}
-	if err := writeFileAtomic(path, out, 0o644); err != nil {
-		return false, fmt.Errorf("writing CLI manifest: %w", err)
+	return out, true, true, nil
+}
+
+func personFromPrinterFields(raw map[string]json.RawMessage) spec.Person {
+	var handle, name string
+	if b, ok := raw["printer"]; ok {
+		_ = json.Unmarshal(b, &handle)
 	}
-	return true, nil
+	if b, ok := raw["printer_name"]; ok {
+		_ = json.Unmarshal(b, &name)
+	}
+	return spec.Person{Handle: strings.TrimSpace(handle), Name: strings.TrimSpace(name)}.Clean()
 }
 
 // writeFileAtomic writes data to a sibling temp file and renames it over path,
@@ -1101,8 +1152,9 @@ func DeriveRunIDFromResearchDir(researchDir string) string {
 }
 
 type generateResearchState struct {
-	APIName string `json:"api_name"`
-	RunID   string `json:"run_id"`
+	APIName  string `json:"api_name"`
+	RunID    string `json:"run_id"`
+	Category string `json:"category,omitempty"`
 }
 
 func loadGenerateResearchState(researchDir string) (generateResearchState, bool) {
@@ -1120,7 +1172,70 @@ func loadGenerateResearchState(researchDir string) (generateResearchState, bool)
 	}
 	state.APIName = strings.TrimSpace(state.APIName)
 	state.RunID = strings.TrimSpace(state.RunID)
+	state.Category = strings.TrimSpace(state.Category)
 	return state, state.APIName != "" || state.RunID != ""
+}
+
+// PersistGenerateCategory keeps generate --category reachable at promote:
+// archived OpenAPI specs omit the public-library slug, so the working-tree
+// manifest cannot be rebuilt from the spec alone.
+func PersistGenerateCategory(researchDir, outputDir, category string) error {
+	category = strings.TrimSpace(category)
+	if category == "" {
+		return nil
+	}
+	var errs []error
+	if err := persistCategoryInResearchState(researchDir, category); err != nil {
+		errs = append(errs, err)
+	}
+	if strings.TrimSpace(outputDir) == "" {
+		return errors.Join(errs...)
+	}
+	state, err := FindStateByWorkingDir(outputDir)
+	if err != nil || state == nil {
+		return errors.Join(errs...)
+	}
+	if strings.TrimSpace(state.Category) == category {
+		return errors.Join(errs...)
+	}
+	state.Category = category
+	if err := state.Save(); err != nil {
+		errs = append(errs, fmt.Errorf("saving pipeline category: %w", err))
+	}
+	return errors.Join(errs...)
+}
+
+func persistCategoryInResearchState(researchDir, category string) error {
+	if strings.TrimSpace(researchDir) == "" {
+		return nil
+	}
+	path := filepath.Join(researchDir, "state.json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("reading research state: %w", err)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return fmt.Errorf("parsing research state: %w", err)
+	}
+	raw["category"] = category
+	out, err := json.MarshalIndent(raw, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encoding research state: %w", err)
+	}
+	out = append(out, '\n')
+	info, err := os.Stat(path)
+	mode := os.FileMode(0o644)
+	if err == nil {
+		mode = info.Mode()
+	}
+	if err := writeFileAtomic(path, out, mode); err != nil {
+		return fmt.Errorf("writing research state: %w", err)
+	}
+	return nil
 }
 
 // ResolveRunIDFromResearchDir reads the run_id recorded by Run Initialization

@@ -19,6 +19,9 @@ A printed CLI wraps an API; it does not replace one. Novel-feature commands must
 - Carve-outs: commands that read from `internal/store`; commands that operate on the local SQLite file via `database/sql`; commands that call the API and then cache to the store; commands whose data is curated static content via `// pp:novel-static-reference`; commands that make a real hidden client call via `// pp:client-call`, but only when the hidden helper performs a real external API call. Do not use `// pp:client-call` for hardcoded payloads, local-only transforms, or fake endpoint stubs.
 Enforced by the absorb manifest's Kill Check (`skills/printing-press/references/absorb-scoring.md`) and dogfood's `reimplementation_check`, which flags handler files showing neither a client call nor a store access without an opt-out.
 
+### Printed chrome fingerprint
+When changing printed chrome-family identity (`chromeMajor`, `sec-ch-ua` GREASE brand, User-Agent in `chrome_profile.go.tmpl`, or `HelloChrome_*`): bump those literals together, and do not raise the advertised Chrome major above the `HelloChrome_Auto` alias in the printed `utls` version in `go.mod.tmpl`. Do not match live Chrome. Leave the existing Surf-era snapshot unless you are doing that coordinated bump. The impersonation-off browser-shaped UA in `client.go.tmpl` / `auth_browser.go.tmpl` is a separate frozen string; do not "align" it to `chromeMajor` or to current Chrome. See [`docs/solutions/conventions/printed-chrome-fingerprint-tracks-utls-parrot.md`](docs/solutions/conventions/printed-chrome-fingerprint-tracks-utls-parrot.md).
+
 ## Agent-Native Surface
 Every printed CLI exposes two surfaces: a CLI surface for humans and an MCP surface for agents. Any action a user can take should be reachable by an agent, but operator ergonomics belong on the human-facing CLI, not in an agent's tool catalog.
 
@@ -35,6 +38,7 @@ MCP hosts use `readOnlyHint` / `destructiveHint` / `idempotentHint` / `openWorld
 - Endpoint mirrors: conventional REST `GET` -> read-only + open-world; RPC-over-GET without a read signal (or an explicit / name-token mutation) is not read-only. `DELETE` -> destructive + open-world, `POST`/`PUT`/`PATCH` -> open-world unless a read signal applies.
 - Built-in tools: `context`, `sql`, `search` are read-only and local-only.
 - Runtime walker shell-out tools get no annotations by default. Opt into read-only with `cmd.Annotations["mcp:read-only"] = "true"` for novel commands that only read from the API, the local store, or the CLI tree itself. Skip the annotation when the command can mutate external state (writes via API, store updates other than telemetry-class writes below, git pushes) or write to user-visible files outside the local cache (commands accepting `--output <file>`, `--repo <dir>`, etc.).
+- Declare every novel flag whose value chooses a filesystem write destination with `cmd.Annotations["mcp:write-flags"] = "save-to,report-path"` (comma-, semicolon-, or whitespace-separated Cobra long names) on the command that defines the flag. The walker drops those flags, plus the unambiguous destination names in `blockedDestinationFlags` (`output`, `out`, `output-dir`, `output-file`, `out-dir`, `out-file`, `o`, `db`, `audit-dir`, `receipt-file`), from the MCP schema and rejects them as structured arguments. A parent annotation also blocks a persistent flag that parent supplies and a child inherits. A nearer command that redeclares the same persistent name owns that flag. Recipe tools resolve Cobra aliases and apply the same block at registration, so a README recipe cannot re-expose the destination. `mcp:read-only` does not weaken that block. Do not list input paths (`--file`, `--path`).
 - Telemetry-class local writes do not disqualify `mcp:read-only`: a best-effort local write that never fails the command and is never observable in domain output (recall's usage-event insert, journal appends) is telemetry, not a store update in the sense above. Keep `readOnlyHint: true` on such commands.
 - Annotate commands whose only writes land in the CLI's own local store (teach-style learn writes, playbook amendments) with `cmd.Annotations["mcp:local-write"] = "true"`: the walker emits `destructiveHint: false` + `openWorldHint: false` and leaves `readOnlyHint` unset. Do not apply it to commands that delete user-visible data (`learnings forget`, `learnings reject` keep honest destructive semantics).
 Wrong annotations are worse than missing ones. A false `readOnlyHint: true` on a mutating tool is a real bug; a missing annotation is just a permission prompt.
@@ -249,6 +253,11 @@ See [`docs/RELEASE.md`](docs/RELEASE.md) for the merge-the-release-PR flow.
 - Distinct from `min-binary-version`: that is the release-managed, skill-frontmatter compatibility floor (the hard "skill cannot run below this" baseline, tracking the major and moving only on a major bump). The currency floor is a freely-tunable freshness gate. Do not conflate them.
 - `TestSkillsEnforceCurrencyFloor` in [`internal/pipeline/contracts_test.go`](internal/pipeline/contracts_test.go) locks the file shape and both contracts' enforce-every-run gate and clamp.
 
+## Skill-version floor
+The binary's `MinSkillVersion` (`internal/cli/skill_compat.go`) is the oldest printing-press skill frontmatter `version:` this binary will run with — the reverse of `min-binary-version`. When skill shape changes so a stale install would follow deleted commands, bump `MinSkillVersion`, the skill `version:` field, and the setup-contract `# skill-version:` / `_this_skill_version=` values together. Preflight hard-blocks with `[skill-stale]` (reinstall via `scripts/install.sh --skills-only`, then restart the session; no skip). `version --json` also warns on stderr when a well-known install path still has an older copy. `TestPrintingPressSkillVersionMatchesBinaryFloor` and `TestSkillsEnforceCurrencyFloor` lock the contract.
+
+See [`docs/SKILLS.md`](docs/SKILLS.md) for the frontmatter bump rule.
+
 ## Testing
 When you change code, check for a `_test.go` file in the same package. If one exists, read it; your change likely requires a test update. If tests fail after your change, investigate whether it is a bug in your code or a stale test; do not just delete the test.
 Add tests for new non-trivial logic. Match the package's existing style (typically table-driven with `testify/assert`). Skip tests for CLI glue, trivial wrappers, and code only meaningfully tested via integration (`FULL_RUN=1`).
@@ -266,7 +275,7 @@ PRs touching `.github/workflows/**` are gated by Greptile rules in [`greptile.js
 Runs informationally on landing — promote to a required branch-protection check only after a one-week green window. Canonical incident background lives in the [published-library solutions doc](https://github.com/mvanhorn/printing-press-library/blob/main/docs/solutions/security/2026-05-supply-chain-hardening.md).
 
 ## Local Artifacts
-Generated artifacts live under `~/printing-press/`, not in this repo: `library/<api-slug>/`, `manuscripts/<api-slug>/`, and `.runstate/<scope>/`. The API slug is derived by the generator from the spec title (`cleanSpecName`), and the binary name is `<api-slug>-pp-cli`. Never hardcode an API slug when the generator can derive it. See [`docs/ARTIFACTS.md`](docs/ARTIFACTS.md) for local-vs-public flow and divergence rules.
+Generated artifacts live under `~/printing-press/`, not in this repo: `library/<api-slug>/`, `manuscripts/<api-slug>/`, and `.runstate/<scope>/`. Isolated generated-CLI `GOCACHE` is `~/.cache/printing-press/go-build` (safe to delete; validate and generator tests wipe it when it exceeds 2 GiB). An explicit `GOCACHE` is left untouched. The API slug is derived by the generator from the spec title (`cleanSpecName`), and the binary name is `<api-slug>-pp-cli`. Never hardcode an API slug when the generator can derive it. See [`docs/ARTIFACTS.md`](docs/ARTIFACTS.md) for local-vs-public flow and divergence rules.
 
 ## Plan documents stay local
 When writing a plan document for cli-printing-press work, do not `git add` files under `docs/plans/`. This repo is public; plans frequently describe in-progress, unreleased, or third-party-collaborator work that should not be world-readable. The `/docs/plans/` entry in `.gitignore` enforces this for new files. `TestPlansDirectoryGitignored` in [`internal/cli/release_test.go`](internal/cli/release_test.go) fails if the gitignore line is removed.
@@ -292,13 +301,13 @@ This copies the skills to `~/.claude/skills/`.
 
 ## Skill Authoring
 When a machine change alters what an agent should do or what a command guarantees, update the relevant `SKILL.md` router and its phase files under `skills/printing-press/phases/` in the same change; do not leave the skill as a stale manual workaround for behavior the machine now owns.
-Detail in [`docs/SKILLS.md`](docs/SKILLS.md): install targets, workflow parity, the thin-spine plus `phases/` / `references/` pattern, and the `context: fork` / `user-invocable` frontmatter fields.
+Detail in [`docs/SKILLS.md`](docs/SKILLS.md): install targets, workflow parity, the thin-spine plus `phases/` / `references/` pattern, the skill `version:` / `MinSkillVersion` bump rule, and the `context: fork` / `user-invocable` frontmatter fields.
 
 ## Code & Comment Hygiene
 ### Write-time defaults
 - No speculative future-proofing in comments.
 - No dates, incidents, or ticket numbers in code comments.
-- Exception for dependency-pin / floor comments: `GO-YYYY-NNNN` advisory IDs and CVE IDs are allowed so the floor stays tied to a named advisory (precedent: `internal/generator/xnet_guard.go` citing `GO-2026-5025..5030`). Still forbidden: GitHub issue/PR numbers, incident tickets, dates.
+- Exception for dependency-pin / floor comments: `GO-YYYY-NNNN` advisory IDs and CVE IDs are allowed so the floor stays tied to a named advisory (precedent: `internal/generator/xnet_guard.go` citing `GO-2026-5942`). Still forbidden: GitHub issue/PR numbers, incident tickets, dates.
 - Code comments must be self-contained; do not make them load-bearing on in-repo skills, plans, or reference prose.
 - Do not restate the field or function name in its comment; document why, not what.
 - Categorical strings -> typed const at introduction.

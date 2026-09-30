@@ -390,10 +390,12 @@ Rules:
 - `disabled: true` is the generation-time opt-out. Combining it with an
   explicit `enabled: true` is rejected at parse time as contradictory.
 - Validated by the same learn validation as internal YAML specs: ticker
-  patterns must compile as Go regexps, seed kinds must be lowercase
-  identifiers, canonicals must be non-empty and unique within a kind, and
-  synonym pairs must be non-empty lowercase single-hop folds (no chains, no
-  self-references).
+  patterns must compile as Go regexps and must not classify every remaining
+  content token in seeded playbook `query_family_examples` as a ticker
+  (that empties QueryFamily and makes recall unreachable), seed kinds must
+  be lowercase identifiers, canonicals must be non-empty and unique within
+  a kind, and synonym pairs must be non-empty lowercase single-hop folds
+  (no chains, no self-references).
 
 Example:
 
@@ -414,18 +416,23 @@ x-learn:
 ### `x-pp-example`
 
 Overrides the generated command's `--help` Example with a verbatim, authored
-invocation. The synthesized example only includes **required** params, so an
-endpoint whose params are all optional — the common "pass one of `channelId` /
-`handle` / `url`" shape — otherwise advertises a bare command the API rejects
-with a 4xx. That broken example also fails the live-dogfood happy-path and
-json-fidelity probes, which run the Example verbatim.
+invocation. The synthesized example includes required parameters. An operation
+with no parameter examples is synthesized from the request body instead: the
+media-type `example` (or the first `examples` entry), otherwise the required
+body properties' own `example` values. An endpoint whose params are all
+optional — the common "pass one of `channelId` / `handle` / `url`" shape —
+otherwise advertises a bare command the API rejects with a 4xx. That broken
+example also fails the live-dogfood happy-path and json-fidelity probes, which
+run the Example verbatim. `pp:happy-args` is a separate surface and is not
+filled from the request-body example.
 
 Parsed field: `Endpoint.Example` (the same field the internal YAML spec sets via
 `example:`).
 
 Rules:
-- Optional. Endpoints without `x-pp-example` keep today's synthesized example
-  byte-for-byte.
+- Optional. Endpoints without `x-pp-example` keep a synthesized Example.
+  Operations that already have parameter examples keep that synthesis.
+  Body-only operations use the request-body example described above.
 - Operation-level only. The value is the full invocation including the binary
   name (`<api-slug>-pp-cli <command> <args>`); the parser normalizes it to the
   canonical two-space indent on each line, so authors may omit the leading
@@ -545,6 +552,10 @@ Rules:
   a resource-specific problem.
 - Value must be a non-empty string after `TrimSpace`. Whitespace-only
   values are treated as absent.
+- In a multi-spec print the binding merges across every contributing spec,
+  so the `{tenant}` wiring survives the merge; when two specs bind
+  `{tenant}` to different env-var names the merge warns on stderr naming
+  both specs and keeps the first spec's name.
 - The placeholder name is `tenant`. Specs that use a different
   placeholder (`{workspace}`, `{org}`) should set
   `EndpointTemplateVars` + `EndpointTemplateEnvOverrides` directly in
@@ -1796,9 +1807,11 @@ paths:
 ### `x-happy-args`
 
 Declares live-dogfood happy-path fixture arguments for one operation. Use it
-when generic synthesized inputs cannot satisfy the endpoint contract, such as a
-search endpoint that requires `q` or a lookup endpoint that requires one of
-several conditional query flags.
+when generate-time synthesis cannot satisfy the endpoint contract: the generator
+already emits `pp:happy-args` from parameter `example`, `enum`, `default`, and
+`format` when every required input is derivable. Keep the extension for opaque
+IDs, coordinates with no schema hint, or conditional query flags that generic
+values cannot satisfy.
 
 Parsed field: `Endpoint.HappyArgs`
 

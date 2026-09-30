@@ -549,10 +549,21 @@ marker has them. README-only edits are outside this fingerprint and do not
 invalidate the gate.
 
 If `SKIP_LIVE_TEST_REASON` is unset, run full live dogfood and write a fresh
-acceptance marker into that proofs directory:
+acceptance marker into that proofs directory. Send the raw `--json` transcript
+to a private temporary directory outside every manuscript tree. It contains
+API response bodies and absolute host paths. `mktemp -d` creates that directory
+mode `0700`; the transcript file is mode `0600`. After the gate, delete the
+directory: on failure, print the failing commands first, then delete it; on
+success, delete it before continuing. `publish package` enforces the same
+boundary: it omits `publish-live-gate*.json`, `*-publish-live-gate.json`,
+dogfood result dumps (`dogfood-results*.json`, `*-dogfood-results.json`), and
+`pipeline/` trees, including copies already saved under proofs by an earlier
+dogfood run. It still copies `phase5-acceptance.json` and `phase5-skip.json`.
 
 ```bash
-LIVE_GATE_JSON="$PROOFS_DIR/publish-live-gate.json"
+LIVE_GATE_DIR=$(mktemp -d "${TMPDIR:-/tmp}/printing-press-publish.XXXXXX")
+chmod 700 "$LIVE_GATE_DIR"
+LIVE_GATE_JSON="$LIVE_GATE_DIR/${API_SLUG}-${RUN_ID}-publish-live-gate.json"
 LIVE_GATE_ARGS=(
   dogfood
   --dir "$CLI_DIR"
@@ -568,11 +579,20 @@ if [ -n "$AUTH_ENV" ]; then
 fi
 
 rm -f "$PROOFS_DIR/phase5-skip.json"
-if ! "$PRINTING_PRESS_BIN" "${LIVE_GATE_ARGS[@]}" >"$LIVE_GATE_JSON"; then
-  echo "Publish live gate failed. See $LIVE_GATE_JSON and $PROOFS_DIR/phase5-acceptance.json."
+if ! (
+  umask 077
+  set +e
+  "$PRINTING_PRESS_BIN" "${LIVE_GATE_ARGS[@]}" >"$LIVE_GATE_JSON"
+  live_gate_status=$?
+  chmod 600 "$LIVE_GATE_JSON" 2>/dev/null || true
+  exit "$live_gate_status"
+); then
+  echo "Publish live gate failed. See $PROOFS_DIR/phase5-acceptance.json."
   jq -r '.tests[]? | select(.status == "fail") | "- \(.command) [\(.kind)]: \(.reason // "failed")"' "$LIVE_GATE_JSON" 2>/dev/null || true
+  rm -rf "$LIVE_GATE_DIR"
   exit 1
 fi
+rm -rf "$LIVE_GATE_DIR"
 ```
 
 On failure, stop exactly like Step 4's `passed: false`: no managed clone, no
@@ -887,11 +907,12 @@ always pass `--module-path "$MODULE_PATH"`. Omitting it silently skips the
 go.mod/import rewrite (`RewriteModulePath` is gated on the flag), so the
 packaged CLI keeps `module <cli-name>` and the library CI rejects the PR with a
 module-path mismatch. `publish package` verifies the staged tree's module path
-after the rewrite and fails packaging when it is not library-canonical (whether
-`--module-path` was omitted or set to a non-canonical value). Standalone
-`publish validate` on a source tree surfaces the check as a warning — the bare
-module name is expected there pre-rewrite; the authoritative failure is in the
-package step.
+after the rewrite: with `--module-path`, the staged `go.mod` must declare
+exactly that path (bare CLI-name modules still fail); without `--module-path`,
+the canonical `github.com/mvanhorn/printing-press-library/library/` prefix is
+required. Standalone `publish validate` on a source tree surfaces the check as
+a warning — the bare module name is expected there pre-rewrite; the
+authoritative failure is in the package step.
 
 Run `publish package` with `--target` to stage the CLI into a unique temporary
 directory, then copy it into the publish repo:
@@ -902,11 +923,20 @@ mkdir -p "$PUBLISH_STAGING_ROOT"
 STAGING_PARENT="$(mktemp -d "$PUBLISH_STAGING_ROOT/<api-slug>-XXXXXX")"
 STAGING_DIR="$STAGING_PARENT/package"
 
+# Reprints pass the existing public-library entry so package stamps its
+# runtime version declaration layout instead of leaving 0.0.0-dev.
+BASE_CLI_DIR="$(find "$PUBLISH_REPO_DIR/library" -mindepth 2 -maxdepth 2 -type d -name "<api-slug>" -print -quit)"
+PACKAGE_BASE_ARGS=()
+if [ -n "$BASE_CLI_DIR" ]; then
+  PACKAGE_BASE_ARGS=(--base-dir "$BASE_CLI_DIR")
+fi
+
 cli-printing-press publish package \
   --dir <cli-dir> \
   --category <category> \
   --target "$STAGING_DIR" \
   --module-path "$MODULE_PATH" \
+  "${PACKAGE_BASE_ARGS[@]}" \
   --json
 ```
 
@@ -929,14 +959,17 @@ if [ ! -d "$STAGED_CLI_DIR" ]; then
 fi
 mkdir -p "$DEST_CATEGORY_DIR"
 
-# Preserve release-ledger files from the current public-library entry before
-# removing it. New CLIs omit .printing-press-release.json until the library's
+# Preserve release-ledger files and existing shipcheck reports from the
+# current public-library entry before removing it. New CLIs omit .printing-press-release.json until the library's
 # post-merge workflow stamps a real release; reprints keep existing changelog
 # history and release metadata until that workflow stamps the next release.
+# Fresh prints strip dogfood-results.json and workflow-verify-report.json from
+# the staged tree; reprints must copy those catalog files back so the overlay
+# does not delete them.
 RELEASE_LEDGER_TMP="$(mktemp -d)"
 PUBLISH_SWAP_DIR="$(mktemp -d "$DEST_CATEGORY_DIR/.<api-slug>.XXXXXX")"
 trap 'rm -rf "$RELEASE_LEDGER_TMP" "$PUBLISH_SWAP_DIR"' EXIT
-for LEDGER_FILE in CHANGELOG.md .printing-press-release.json; do
+for LEDGER_FILE in CHANGELOG.md .printing-press-release.json dogfood-results.json workflow-verify-report.json; do
   EXISTING_LEDGER="$(find "$PUBLISH_REPO_DIR/library" -mindepth 3 -maxdepth 3 -path "*/<api-slug>/$LEDGER_FILE" -print -quit)"
   if [ -n "$EXISTING_LEDGER" ]; then
     cp "$EXISTING_LEDGER" "$RELEASE_LEDGER_TMP/$LEDGER_FILE"
@@ -948,7 +981,7 @@ done
 # with the old CLI removed.
 cp -R "$STAGED_CLI_DIR/." "$PUBLISH_SWAP_DIR/"
 
-for LEDGER_FILE in CHANGELOG.md .printing-press-release.json; do
+for LEDGER_FILE in CHANGELOG.md .printing-press-release.json dogfood-results.json workflow-verify-report.json; do
   if [ -f "$RELEASE_LEDGER_TMP/$LEDGER_FILE" ]; then
     cp "$RELEASE_LEDGER_TMP/$LEDGER_FILE" "$PUBLISH_SWAP_DIR/$LEDGER_FILE"
   fi
@@ -980,7 +1013,9 @@ VERSION_DECL_DIFF="$(git diff --unified=0 "$VERSION_DECL_BASE_REF" -- \
 printf '%s\n' "$VERSION_DECL_DIFF" \
   | grep -E '^[+-][[:space:]]*var version[[:space:]]*=' || true
 
-# If the command prints a change, reconcile the replacement to the base tree:
+# If the command prints a change, stop. Do not hand-edit version declarations.
+# publish package --base-dir should already have reconciled the replacement to
+# the base tree:
 # - A root.go declaration stays in root.go with the exact stamped value; remove
 #   only the duplicate declaration from version.go and keep its command code.
 # - A version.go declaration stays in version.go with the exact stamped value;
@@ -990,7 +1025,8 @@ printf '%s\n' "$VERSION_DECL_DIFF" \
 # - If the base has no declaration in one of these runtime surfaces, preserve
 #   that no declaration layout and its existing literal/reference form. Do not
 #   introduce the fresh print's 0.0.0-dev declaration.
-# Re-run the diff command after editing. Do not continue until the command prints no matching lines.
+# Re-run publish package with --base-dir pointing at the existing library entry,
+# then repeat this diff. Do not continue until the command prints no matching lines.
 
 # Remove root-level binaries (should not be committed). publish package
 # already strips these before the copy; this rm -f is belt-and-suspenders

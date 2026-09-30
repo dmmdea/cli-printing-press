@@ -10,9 +10,13 @@ Generated artifacts live under the user's home directory, not in this repo.
 - `~/printing-press/manuscripts/<api-slug>/` — archived research and verification proofs, keyed by API slug. One API can have multiple runs.
 - `~/printing-press/.runstate/<scope>/` — mutable per-workspace state such as current run and sync cursors.
 
+Isolated generated-CLI compile cache: `~/.cache/printing-press/go-build`. Validate and generator tests point `GOCACHE` here so parallel generated-module builds reuse the stdlib compile without polluting the operator's default Go cache. The directory is safe to delete. The generator wipes it when it exceeds 2 GiB; an explicit `GOCACHE` is left untouched.
+
 The API slug is derived by the generator from the spec title (`cleanSpecName`), not manually chosen. The CLI binary name is `<api-slug>-pp-cli`. Never hardcode an API slug when the generator can derive it; names with periods normalize differently than you'd guess.
 
 **Manuscripts hold authored synthesis, not third-party inputs.** A shippable manuscript is the research brief, absorb-manifest, proofs, and discovery captures — what the run produced. Cloning a reference library to study a protocol (common for device CLIs, which reverse-engineer a wire format from a working implementation) is research *input*: cite it by URL and commit, do not copy the repo into `manuscripts/<slug>/research/sources/`. Publishing copies of someone else's code is a licensing problem and a secret/PII vector. `publish package` drops any `sources/` directory from shipped manuscripts as a machine backstop (`shouldSkipPublishableManuscriptFile`), but the research flow should keep downloaded references in scratch outside the manuscript tree in the first place.
+
+`publish package` also drops raw live-dogfood transcripts (`publish-live-gate*.json`, `*-publish-live-gate.json`, `dogfood-results*.json`, `*-dogfood-results.json`) and any `pipeline/` runstate directory. Those files hold API response bodies and absolute host paths. `phase5-acceptance.json` and `phase5-skip.json` stay, because `lock promote` and `publish validate` read them from the packaged proofs directory. `--include-raw-captures` stays limited to raw browser-sniff captures.
 
 The `-pp-` infix exists to avoid colliding with official CLIs. The binary `notion-pp-cli` can coexist with whatever `notion-cli` the vendor ships. The library directory is just `notion/`; the `-pp-cli` suffix appears on binary names, not directory names.
 

@@ -66,8 +66,8 @@ func TestGeneratedBLEDeviceEscapesDisplayNameInRootCommand(t *testing.T) {
 }
 
 // TestGeneratedBLEDeviceEmitsPublishArtifacts verifies the device generator
-// emits the four standard publish artifacts the public library's
-// completeness verifier expects (AGENTS.md, LICENSE, NOTICE, .goreleaser.yaml).
+// emits the standard publish artifacts the public library's completeness
+// verifier expects (AGENTS.md, LICENSE, NOTICE, .goreleaser.yaml, .gitignore).
 // A device generate previously dropped all four — the "fork-and-drop" gap the
 // shared version.go template fixed for the version command.
 func TestGeneratedBLEDeviceEmitsPublishArtifacts(t *testing.T) {
@@ -79,7 +79,7 @@ func TestGeneratedBLEDeviceEmitsPublishArtifacts(t *testing.T) {
 	outputDir := filepath.Join(t.TempDir(), "ble-temperature-sensor")
 	require.NoError(t, NewDevice(ds, outputDir).Generate())
 
-	for _, name := range []string{"AGENTS.md", "CLAUDE.md", "LICENSE", "NOTICE", ".goreleaser.yaml"} {
+	for _, name := range []string{"AGENTS.md", "CLAUDE.md", "LICENSE", "NOTICE", ".goreleaser.yaml", ".gitignore"} {
 		assert.FileExists(t, filepath.Join(outputDir, name))
 	}
 
@@ -91,7 +91,7 @@ func TestGeneratedBLEDeviceEmitsPublishArtifacts(t *testing.T) {
 	// goreleaser file legitimately carries goreleaser's own `{{ .Version }}`
 	// (note the leading space), so assert specifically on the Go-template form
 	// `{{.` / `{{range`-style openers that would mean a field went unrendered.
-	for _, name := range []string{"AGENTS.md", "LICENSE", "NOTICE", ".goreleaser.yaml"} {
+	for _, name := range []string{"AGENTS.md", "LICENSE", "NOTICE", ".goreleaser.yaml", ".gitignore"} {
 		body := readFileString(t, filepath.Join(outputDir, name))
 		assert.NotContains(t, body, "{{.", "%s contains an unrendered Go template directive", name)
 		assert.NotEmpty(t, strings.TrimSpace(body), "%s is empty", name)
@@ -118,7 +118,15 @@ func TestGeneratedBLEDeviceEmitsPublishArtifacts(t *testing.T) {
 	assert.Contains(t, goreleaser, "main: ./cmd/"+naming.MCP(ds.Name))
 	assert.Contains(t, goreleaser, naming.CLI(ds.Name)+"/internal/cli.version=")
 	assert.Contains(t, goreleaser, "-X main.version={{ .Version }}")
+	assert.Contains(t, goreleaser, "-trimpath")
+	assert.GreaterOrEqual(t, strings.Count(goreleaser, "-trimpath"), 2)
 	assert.Contains(t, goreleaser, `description: "`)
+
+	gitignore := readFileString(t, filepath.Join(outputDir, ".gitignore"))
+	assert.Contains(t, gitignore, "/"+naming.CLI(ds.Name)+"\n")
+	assert.Contains(t, gitignore, "/"+naming.MCP(ds.Name)+"\n")
+	assert.NotContains(t, gitignore, "\n"+naming.CLI(ds.Name)+"\n")
+	assert.NotContains(t, gitignore, "\n"+naming.MCP(ds.Name)+"\n")
 
 	// AGENTS.md is the device-aware variant: it uses BLE/replay concepts and the
 	// codec/novelCommands customization model, never HTTP auth/sync/SQL.
@@ -785,8 +793,6 @@ func runGeneratedJSONCommand(t *testing.T, outputDir, homeDir string, args ...st
 	cmdArgs := append([]string{"run", "-mod=mod", "./cmd/ble-session-appliance-pp-cli", "--json"}, args...)
 	cmd := exec.Command("go", cmdArgs...)
 	cmd.Dir = outputDir
-	cacheDir, err := goBuildCacheDir(outputDir)
-	require.NoError(t, err)
 	modCacheDir := os.Getenv("GOMODCACHE")
 	if modCacheDir == "" {
 		output, err := exec.Command("go", "env", "GOMODCACHE").Output()
@@ -794,14 +800,19 @@ func runGeneratedJSONCommand(t *testing.T, outputDir, homeDir string, args ...st
 		modCacheDir = strings.TrimSpace(string(output))
 	}
 	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	cmd.Env = append(os.Environ(),
-		"GOCACHE="+cacheDir,
-		"GOMODCACHE="+modCacheDir,
-		"HOME="+homeDir,
-		"XDG_CACHE_HOME="+filepath.Join(homeDir, ".cache"),
-	)
-	output, err := cmd.Output()
+	var output []byte
+	err := withGoBuildCache(outputDir, func(cacheDir string) error {
+		cmd.Stderr = &stderr
+		cmd.Env = append(os.Environ(),
+			"GOCACHE="+cacheDir,
+			"GOMODCACHE="+modCacheDir,
+			"HOME="+homeDir,
+			"XDG_CACHE_HOME="+filepath.Join(homeDir, ".cache"),
+		)
+		var runErr error
+		output, runErr = cmd.Output()
+		return runErr
+	})
 	require.NoError(t, err, stderr.String())
 	var result any
 	require.NoError(t, json.Unmarshal(output, &result))

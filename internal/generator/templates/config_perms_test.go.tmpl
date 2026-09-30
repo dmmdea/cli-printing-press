@@ -29,13 +29,18 @@ import (
 // refusal assertions never depend on a spec-specific field name.
 const sampleReadPermsSecret = "RT-LIVE-90DAY-SECRET-DO-NOT-LEAK"
 
-// clearCredEnv isolates every path Load can use before unsetting credential
-// values. LoadCredentials can fall through from config.Load to the separate
-// credentials store, so clearing auth variables alone would still allow an
-// ambient credentials file to re-seed a supposed miss.
-func clearCredEnv(t *testing.T) {
+// isolateCredentials isolates every credential source Load can consult.
+// Clearing auth variables alone still lets LoadCredentials fall through to
+// the operator's real credentials file and re-seed a supposed miss.
+func isolateCredentials(t *testing.T) {
 	t.Helper()
-	testenv.Isolate(t, cliutil.DataDir)
+	restore, err := cliutil.SetHomeOverride("")
+	if err != nil {
+		t.Fatalf("reset home override: %v", err)
+	}
+	t.Cleanup(restore)
+	home := testenv.Isolate(t, cliutil.ConfigDir, cliutil.DataDir, cliutil.StateDir, cliutil.CacheDir)
+	t.Setenv("{{envName .Name}}_HOME", home)
 {{- if .Auth.EnvVarSpecs}}
 {{- range .Auth.EnvVarSpecs}}
 	t.Setenv("{{.Name}}", "")
@@ -150,7 +155,7 @@ func configFileName() string {
 // hit; broadening it to group/world-readable makes Load refuse it on read (a
 // silent miss), not trust it and not error.
 func TestLoad_RefusesOverPermissiveConfigOnRead(t *testing.T) {
-	clearCredEnv(t)
+	isolateCredentials(t)
 	dir := t.TempDir()
 	p := filepath.Join(dir, configFileName())
 	writeTokenConfig(t, p)
@@ -204,7 +209,7 @@ func TestLoad_RefusesOverPermissiveConfigOnRead(t *testing.T) {
 }
 
 func TestLoad_DoesNotRecordRefusalForCredentialFreeLooseConfig(t *testing.T) {
-	clearCredEnv(t)
+	isolateCredentials(t)
 	dir := t.TempDir()
 	p := filepath.Join(dir, configFileName())
 	writeCredentialFreeConfig(t, p)
@@ -229,7 +234,7 @@ func TestLoad_DoesNotRecordRefusalForCredentialFreeLooseConfig(t *testing.T) {
 // operator is left with a working tool, never using the exposed on-disk token.
 func TestLoad_ReseedsFromEnvAfterOverPermissiveRefusal(t *testing.T) {
 	const envValue = "PAT-FROM-ENV-BOOTSTRAP"
-	clearCredEnv(t)
+	isolateCredentials(t)
 	t.Setenv("{{if .Auth.EnvVarSpecs}}{{(index .Auth.EnvVarSpecs 0).Name}}{{else}}{{index .Auth.EnvVars 0}}{{end}}", envValue)
 	dir := t.TempDir()
 	p := filepath.Join(dir, configFileName())
@@ -263,7 +268,7 @@ func TestLoad_RefusesSymlinkToLoosePermsTarget(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("POSIX symlink-perms test; Windows perms enforced via DACL")
 	}
-	clearCredEnv(t)
+	isolateCredentials(t)
 	dir := t.TempDir()
 	target := filepath.Join(dir, "target."+strings.TrimPrefix(filepath.Ext(configFileName()), "."))
 	writeTokenConfig(t, target)
@@ -294,7 +299,7 @@ func TestLoad_DanglingSymlinkIsMiss(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("POSIX symlink test")
 	}
-	clearCredEnv(t)
+	isolateCredentials(t)
 	dir := t.TempDir()
 	link := filepath.Join(dir, configFileName())
 	if err := os.Symlink(filepath.Join(dir, "does-not-exist"+filepath.Ext(configFileName())), link); err != nil {
@@ -319,7 +324,7 @@ func TestLoad_DanglingSymlinkIsMiss(t *testing.T) {
 // path: malformed explicit configs must surface an error regardless of whether
 // their credentials are trusted, and that error must never echo the raw token.
 func TestLoad_CorruptConfigDoesNotLeakSecret(t *testing.T) {
-	clearCredEnv(t)
+	isolateCredentials(t)
 	dir := t.TempDir()
 	p := filepath.Join(dir, configFileName())
 	writeCorruptTokenConfig(t, p)

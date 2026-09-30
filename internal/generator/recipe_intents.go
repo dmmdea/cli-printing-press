@@ -5,6 +5,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"github.com/mvanhorn/cli-printing-press/v4/internal/naming"
 	"github.com/mvanhorn/cli-printing-press/v4/internal/shellargs"
@@ -135,6 +136,12 @@ func recipeIntentFromRecipe(apiName string, recipe Recipe) (RecipeIntent, bool) 
 			continue
 		}
 		useEquals := hasValue
+		if recipeFlagIsBlockedDestination(name) {
+			if !hasValue && i+1 < len(tokens) && !strings.HasPrefix(tokens[i+1], "-") {
+				i++
+			}
+			continue
+		}
 		if recipeFlagIsStatic(name) {
 			intent.Command = append(intent.Command, "--"+name)
 			intent.Args = append(intent.Args, RecipeIntentArg{Static: true, Token: "--" + name})
@@ -188,6 +195,17 @@ func recipeIntentFromRecipe(apiName string, recipe Recipe) (RecipeIntent, bool) 
 
 func recipeFlagIsStatic(name string) bool {
 	return name == "json" || name == "agent"
+}
+
+// recipeFlagIsBlockedDestination drops unambiguous destination names while
+// the recipe text is parsed. Annotated sinks are not known from the README:
+// the emitted recipe tool calls cobratree.DestinationFlagBlocked against the
+// live Cobra tree at registration and call time. That lookup follows command
+// aliases and write sinks inherited from the ancestor that supplies the
+// persistent flag. Those names are neither advertised nor forwarded, and a
+// client-supplied value is rejected.
+func recipeFlagIsBlockedDestination(name string) bool {
+	return mcpBlockedDestinationFlagSet[name]
 }
 
 func recipeParamType(value string) RecipeIntentParamType {
@@ -293,6 +311,9 @@ func recipePositionalInputName(token string) (string, bool) {
 	token = strings.TrimSpace(token)
 	if token == "" {
 		return "", false
+	}
+	if strings.ContainsFunc(token, unicode.IsSpace) {
+		return "value", true
 	}
 	if isRecipePlaceholder(token) {
 		name := strings.Trim(token, "<>[]")

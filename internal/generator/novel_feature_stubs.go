@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"sort"
 	"strings"
@@ -398,7 +399,16 @@ func sortedNovelChildren(node *novelFeatureStubNode) []*novelFeatureStubNode {
 	return out
 }
 
+var novelFeatureArgumentHintRE = regexp.MustCompile(`\[[^\[\]\r\n]+\]|<[^<>\r\n]+>`)
+
 func novelFeatureCommandParts(command string) []string {
+	// Shell composition describes a workflow, not one runnable Cobra command.
+	// Pipes inside argument hints denote alternatives, not shell composition.
+	chainInput := novelFeatureArgumentHintRE.ReplaceAllString(command, "argument")
+	segments, err := shellargs.SplitChain(chainInput)
+	if err != nil || len(segments) != 1 || segments[0].Text != strings.TrimSpace(chainInput) {
+		return nil
+	}
 	parts := make([]string, 0)
 	for token := range strings.FieldsSeq(strings.ToLower(command)) {
 		token = strings.Trim(token, `"'`)
@@ -407,6 +417,9 @@ func novelFeatureCommandParts(command string) []string {
 		}
 		if strings.HasPrefix(token, "-") || novelFeatureTokenIsPositional(token) {
 			break
+		}
+		if strings.ContainsAny(token, "|&;>") {
+			return nil
 		}
 		parts = append(parts, toKebab(token))
 	}
@@ -458,42 +471,10 @@ func novelFeatureUse(segment, command string) string {
 	return strings.Join(append([]string{segment}, positional...), " ")
 }
 
+// Group is a README and SKILL theme heading shared by unrelated parents, so it
+// is not a command description.
 func novelFeatureParentShort(node *novelFeatureStubNode) string {
-	if group := commonNovelFeatureGroup(node); group != "" {
-		return group
-	}
 	return "Work with " + strings.ReplaceAll(node.segment, "-", " ")
-}
-
-func commonNovelFeatureGroup(node *novelFeatureStubNode) string {
-	var first string
-	allGrouped := true
-	var walk func(*novelFeatureStubNode)
-	walk = func(cur *novelFeatureStubNode) {
-		if cur == nil || !allGrouped {
-			return
-		}
-		if cur.feature != nil {
-			group := naming.OneLine(cur.feature.Group)
-			if group == "" {
-				allGrouped = false
-				return
-			}
-			if first == "" {
-				first = group
-			} else if !strings.EqualFold(first, group) {
-				allGrouped = false
-			}
-		}
-		for _, child := range sortedNovelChildren(cur) {
-			walk(child)
-		}
-	}
-	walk(node)
-	if !allGrouped {
-		return ""
-	}
-	return first
 }
 
 func novelFeatureStubIdent(parts []string) string {

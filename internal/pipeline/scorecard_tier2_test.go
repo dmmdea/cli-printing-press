@@ -273,7 +273,7 @@ func runMessages() {
 		writeScorecardFixture(t, dir, "internal/cli/helpers.go", `
 package cli
 
-func filterFields() {}
+func unusedSelectHelper() {}
 
 func outputCSV() {}
 
@@ -282,9 +282,11 @@ func boundCtx() {}
 func writeHarnessRefusal() {}
 
 func novelAuthHeader() {}
+
+func filterFields() {}
 `)
 
-		// 2 dead flags (csvOutput, stdinInput), 2 dead functions (filterFields, outputCSV)
+		// 2 dead flags (csvOutput, stdinInput), 2 dead functions (unusedSelectHelper, outputCSV)
 		assert.Equal(t, 1, scoreDeadCode(dir))
 	})
 
@@ -2875,6 +2877,22 @@ func doctorCheckBrowserCDP(cdpURL string) error {
 }
 
 func doctorReport() {
+	_ = "auth token config version"
+}
+`)
+
+		assert.Equal(t, 10, scoreDoctor(dir))
+	})
+
+	t.Run("scores client GetWithHeaders health probe", func(t *testing.T) {
+		dir := t.TempDir()
+		writeScorecardFixture(t, dir, "internal/cli/doctor.go", `package cli
+
+func newDoctorCmd() {}
+
+func doctorCheck() {
+	reachBody, reachErr := c.GetWithHeaders(cmd.Context(), "/", nil, map[string]string{client.HTMLResponseHeader: "true"})
+	_, _ = reachBody, reachErr
 	_ = "auth token config version"
 }
 `)

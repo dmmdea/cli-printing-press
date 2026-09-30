@@ -4,6 +4,8 @@
 package cobratree
 
 import (
+	"strings"
+
 	mcplib "github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 	"github.com/spf13/cobra"
@@ -26,11 +28,8 @@ func RegisterAll(s *server.MCPServer, root *cobra.Command, cliPath func() (strin
 			return
 		}
 
-		toolName := toolNameForPath(path)
+		toolName := availableToolName(s, toolNameForPath(path))
 		if toolName == "" {
-			return
-		}
-		if s.GetTool(toolName) != nil {
 			return
 		}
 		blockedStructuredArgs := blockedStructuredArgsForCommand(cmd)
@@ -62,6 +61,8 @@ func RegisterAll(s *server.MCPServer, root *cobra.Command, cliPath func() (strin
 		// The companion CLI owns the one live tenant gate for mirrored
 		// commands. The parent MCP middleware must not probe a second time.
 		tool.Meta.AdditionalFields["pp:tenant-gate"] = "child-cli"
+		// Preserve the canonical Cobra identity when normalized names collide.
+		tool.Meta.AdditionalFields[mirrorCLICommandMetaKey] = strings.Join(path, " ")
 		s.AddTool(tool, shellOutToCLI(cliPath, path, blockedCLIArgs, allowedStructuredArgs, positionals, readOnly, positionalWriteSinkIndexes(cmd)))
 	})
 }
@@ -82,11 +83,27 @@ func walk(cmd *cobra.Command, path []string, visit func(*cobra.Command, []string
 }
 
 func descriptionFor(cmd *cobra.Command) string {
-	if cmd.Long != "" {
-		return cmd.Long
+	return cobratreeToolDescription(cmd.Short, cmd.Long, cmd.CommandPath())
+}
+
+// Operator Long/--help manuals blow the MCP per-tool token budget on
+// every print. The scorer estimates this same catalog text.
+func cobratreeToolDescription(short, long, commandPath string) string {
+	if desc := strings.TrimSpace(short); desc != "" {
+		return desc
 	}
-	if cmd.Short != "" {
-		return cmd.Short
+	if desc := firstHelpParagraph(long); desc != "" {
+		return desc
 	}
-	return "Run `" + cmd.CommandPath() + "` through the companion CLI binary."
+	return "Run `" + commandPath + "` through the companion CLI binary."
+}
+
+func firstHelpParagraph(s string) string {
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	before, _, _ := strings.Cut(s, "\n\n")
+	return strings.TrimSpace(before)
 }

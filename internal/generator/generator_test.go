@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -48,6 +49,8 @@ func TestGenerateProjectsCompile(t *testing.T) {
 	mustInclude := []string{
 		"go.mod",
 		"Makefile",
+		".gitignore",
+		".goreleaser.yaml",
 		"AGENTS.md",
 		"CLAUDE.md",
 		"README.md",
@@ -61,6 +64,7 @@ func TestGenerateProjectsCompile(t *testing.T) {
 		"internal/cli/platform_window.go",
 		"internal/cli/platform_window_test.go",
 		"internal/cli/feedback.go",
+		"internal/cli/deliver_download_test.go",
 		"internal/cli/agent_context.go",
 		"internal/cli/root_test.go",
 		"internal/cli/sync_hint.go",
@@ -151,9 +155,12 @@ func TestGenerateProjectsCompile(t *testing.T) {
 		// +1: cmd/<cli>-pp-mcp/http_auth_test.go for the HTTP caller-auth contract.
 		// +4: cliutil.WithFileLock (filelock.go + unix/windows + test) so
 		// learn-loop audit/teach.log rotation is cross-process safe.
-		{name: "stytch", specPath: filepath.Join("..", "..", "testdata", "stytch.yaml"), expectedFiles: 176},
-		{name: "clerk", specPath: filepath.Join("..", "..", "testdata", "clerk.yaml"), expectedFiles: 180},
-		{name: "loops", specPath: filepath.Join("..", "..", "testdata", "loops.yaml"), expectedFiles: 178},
+		// +1: root .gitignore so local binaries are ignored without hiding cmd/<name>/.
+		// +1: internal/cli/deliver_download_test.go, private download-path coverage.
+		// +1: internal/cli/export_perms_test.go when export is emitted.
+		{name: "stytch", specPath: filepath.Join("..", "..", "testdata", "stytch.yaml"), expectedFiles: 180},
+		{name: "clerk", specPath: filepath.Join("..", "..", "testdata", "clerk.yaml"), expectedFiles: 184},
+		{name: "loops", specPath: filepath.Join("..", "..", "testdata", "loops.yaml"), expectedFiles: 181},
 	}
 
 	for _, tt := range tests {
@@ -396,7 +403,7 @@ func TestGenerateCliutilPackage(t *testing.T) {
 
 	cliutilTestSrc, err := os.ReadFile(filepath.Join(cliutilDir, "cliutil_test.go"))
 	require.NoError(t, err)
-	assert.Contains(t, string(cliutilTestSrc), "token=abc.def-ghi",
+	assert.Contains(t, string(cliutilTestSrc), "token=your-token-here",
 		"emitted cliutil tests must cover token=<value> credential redaction")
 
 	// The generated cliutil package must compile and its tests must pass.
@@ -2583,17 +2590,65 @@ func countFiles(t *testing.T, root string) int {
 
 func runGoCommand(t *testing.T, dir string, args ...string) {
 	t.Helper()
+	runGoCommandWithEnv(t, dir, nil, args...)
+}
+
+func runGoCommandWithEnv(t *testing.T, dir string, extraEnv []string, args ...string) {
+	t.Helper()
 	if testing.Short() && len(args) > 0 && (args[0] == "build" || args[0] == "test") {
 		t.Skip("generated CLI compile tests run in the full generated-test CI lane")
 	}
-	runGoCommandRequired(t, dir, args...)
+	output, err := runGoCommandOutputWithEnv(t, dir, extraEnv, args...)
+	require.NoError(t, err, output)
 }
 
 func requireGeneratedCompiles(t *testing.T, dir string) {
 	t.Helper()
+	requireGeneratedCompilesWithEnv(t, dir, nil)
+}
+
+func requireGeneratedCompilesWithEnv(t *testing.T, dir string, extraEnv []string) {
+	t.Helper()
 	// No-op in this test harness; module resolution is exercised via -mod=mod.
-	runGoCommand(t, dir, "mod", "tidy")
-	runGoCommand(t, dir, "build", "./...")
+	runGoCommandWithEnv(t, dir, extraEnv, "mod", "tidy")
+	runGoCommandWithEnv(t, dir, extraEnv, "build", "./...")
+}
+
+const go127Toolchain = "go1.27.0"
+
+var (
+	go127Once   sync.Once
+	go127Avail  bool
+	go127Reason string
+)
+
+func go127ToolchainAvailable(t *testing.T) bool {
+	t.Helper()
+	go127Once.Do(func() {
+		cmd := exec.Command("go", "version")
+		cmd.Env = append(os.Environ(), "GOTOOLCHAIN="+go127Toolchain)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			go127Reason = strings.TrimSpace(string(out) + " " + err.Error())
+			return
+		}
+		go127Avail = strings.Contains(string(out), "go1.27")
+		if !go127Avail {
+			go127Reason = strings.TrimSpace(string(out))
+		}
+	})
+	if !go127Avail && go127Reason != "" {
+		t.Logf("Go 1.27 toolchain unavailable: %s", go127Reason)
+	}
+	return go127Avail
+}
+
+func requireGeneratedCompilesGo127(t *testing.T, dir string) {
+	t.Helper()
+	if !go127ToolchainAvailable(t) {
+		t.Skip("Go 1.27 toolchain not available to typecheck enetx/http2's go1.27-tagged source")
+	}
+	requireGeneratedCompilesWithEnv(t, dir, []string{"GOTOOLCHAIN=" + go127Toolchain})
 }
 
 func runGoCommandRequired(t *testing.T, dir string, args ...string) {
@@ -2608,6 +2663,11 @@ func runGoCommandRequired(t *testing.T, dir string, args ...string) {
 // the usual must-succeed case.
 func runGoCommandOutput(t *testing.T, dir string, args ...string) (string, error) {
 	t.Helper()
+	return runGoCommandOutputWithEnv(t, dir, nil, args...)
+}
+
+func runGoCommandOutputWithEnv(t *testing.T, dir string, extraEnv []string, args ...string) (string, error) {
+	t.Helper()
 
 	// Generated-project compile tests exercise module resolution via -mod=mod;
 	// production Validate still owns the go mod tidy quality gate.
@@ -2620,11 +2680,15 @@ func runGoCommandOutput(t *testing.T, dir string, args ...string) (string, error
 
 	cmd := exec.Command("go", args...)
 	cmd.Dir = dir
-	cacheDir, err := goBuildCacheDir(dir)
-	require.NoError(t, err)
-	cmd.Env = append(os.Environ(), "GOCACHE="+cacheDir)
-	cmd.Env = append(cmd.Env, sandboxHomeEnv(t)...)
-	output, err := cmd.CombinedOutput()
+	var output []byte
+	err := withGoBuildCache(dir, func(cacheDir string) error {
+		cmd.Env = append(os.Environ(), "GOCACHE="+cacheDir)
+		cmd.Env = append(cmd.Env, sandboxHomeEnv(t)...)
+		cmd.Env = append(cmd.Env, extraEnv...)
+		var runErr error
+		output, runErr = cmd.CombinedOutput()
+		return runErr
+	})
 	return string(output), err
 }
 
@@ -2846,21 +2910,93 @@ func TestGenerateBrowserChromeTransport(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, string(gomod), "go "+currentGoDirectiveVersion()+"\n")
 	assert.Contains(t, string(gomod), "toolchain "+currentGoToolchainVersion())
-	assert.Contains(t, string(gomod), "github.com/enetx/surf")
+	assert.Contains(t, string(gomod), "github.com/refraction-networking/utls "+chromeUTLSVersion)
+	assert.NotContains(t, string(gomod), "github.com/enetx/")
+	assert.NotContains(t, string(gomod), "github.com/quic-go/quic-go")
 
-	clientGo, err := os.ReadFile(filepath.Join(outputDir, "internal", "client", "client.go"))
-	require.NoError(t, err)
-	assert.Contains(t, string(clientGo), `"github.com/enetx/surf"`)
-	assert.Contains(t, string(clientGo), "Impersonate()")
-	assert.Contains(t, string(clientGo), "Chrome()")
-	assert.Contains(t, string(clientGo), "ForceHTTP2()")
-	assert.NotContains(t, string(clientGo), "ForceHTTP3()")
+	clientGo := readGeneratedFile(t, outputDir, "internal", "client", "client.go")
+	assert.NotContains(t, clientGo, "github.com/enetx/")
+	assert.Contains(t, clientGo, "return chromeClient(timeout, jar, skipTLSVerify)")
+
+	chromeGo := readGeneratedFile(t, outputDir, "internal", "client", "chrome.go")
+	assert.Contains(t, chromeGo, `chromeALPN = []string{"h2"}`)
+	assert.NotContains(t, chromeGo, `"http/1.1"`)
+	assert.Contains(t, chromeGo, "chromeHeaderTripper{")
+	assert.Contains(t, chromeGo, "context.AfterFunc")
+	assert.Contains(t, chromeGo, "httpproxy.FromEnvironment()")
+	assert.Contains(t, chromeGo, `case "http", "https":`)
+	assert.NoFileExists(t, filepath.Join(outputDir, "internal", "client", "chrome_h3.go"))
+
+	profileGo := readGeneratedFile(t, outputDir, "internal", "client", "chrome_profile.go")
+	assert.Contains(t, profileGo, "utls.HelloChrome_Auto")
+	assert.Contains(t, profileGo, `chromeMajor = "145"`)
+	assert.Contains(t, profileGo, `Chrome/" + chromeMajor + ".0.0.0`)
+	assert.Contains(t, profileGo, `{name: "Accept", value: chromeAccept}`)
 
 	readme, err := os.ReadFile(filepath.Join(outputDir, "README.md"))
 	require.NoError(t, err)
 	assert.Contains(t, string(readme), "Chrome-compatible HTTP transport")
-	// The H3 sibling below compiles the same surf-backed client path; this
-	// test stays focused on the non-H3 rendering branch.
+	assert.NotContains(t, string(readme), "Surf")
+
+	requireGeneratedCompiles(t, outputDir)
+	requireGeneratedCompilesGo127(t, outputDir)
+}
+
+const chromeUTLSVersion = "v1.8.2"
+
+func TestPrintedChromeModulesBanEnetx(t *testing.T) {
+	t.Parallel()
+
+	banned := []string{"github.com/enetx/surf", "github.com/enetx/g", "github.com/enetx/http", "github.com/enetx/http2", "github.com/enetx/http3"}
+	for _, tc := range []struct {
+		name      string
+		transport string
+		wantQUIC  bool
+	}{
+		{name: "h2", transport: spec.HTTPTransportBrowserChromeH2},
+		{name: "h3", transport: spec.HTTPTransportBrowserChromeH3, wantQUIC: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			apiSpec := minimalSpec("banenetx" + tc.name)
+			apiSpec.BaseURL = "https://www.example.com"
+			apiSpec.Auth = spec.AuthConfig{Type: "none"}
+			apiSpec.HTTPTransport = tc.transport
+			outputDir := filepath.Join(t.TempDir(), naming.CLI(apiSpec.Name))
+			require.NoError(t, New(apiSpec, outputDir).Generate())
+
+			require.NoError(t, filepath.WalkDir(outputDir, func(path string, d os.DirEntry, err error) error {
+				if err != nil || d.IsDir() {
+					return err
+				}
+				if filepath.Ext(path) != ".go" && filepath.Base(path) != "go.mod" {
+					return nil
+				}
+				content, readErr := os.ReadFile(path)
+				if readErr != nil {
+					return readErr
+				}
+				for _, mod := range banned {
+					assert.NotContains(t, string(content), mod, path)
+				}
+				return nil
+			}))
+
+			gomod := readGeneratedFile(t, outputDir, "go.mod")
+			assert.Equal(t, tc.wantQUIC, strings.Contains(gomod, "github.com/quic-go/quic-go v0.60.0\n"), gomod)
+
+			if testing.Short() {
+				t.Skip("dependency graph resolution runs in the full generated-test CI lane")
+			}
+			deps, err := runGoCommandOutput(t, outputDir, "list", "-mod=mod", "-deps", "./...")
+			require.NoError(t, err, deps)
+			for _, mod := range banned {
+				assert.NotContains(t, deps, mod)
+			}
+			assert.Equal(t, tc.wantQUIC, strings.Contains(deps, "github.com/quic-go/quic-go"))
+			assert.Contains(t, deps, "github.com/refraction-networking/utls")
+		})
+	}
 }
 
 func TestGenerateBrowserChromeH3Transport(t *testing.T) {
@@ -2894,36 +3030,23 @@ func TestGenerateBrowserChromeH3Transport(t *testing.T) {
 	gen := New(apiSpec, outputDir)
 	require.NoError(t, gen.Generate())
 
-	clientGo, err := os.ReadFile(filepath.Join(outputDir, "internal", "client", "client.go"))
-	require.NoError(t, err)
-	assert.Contains(t, string(clientGo), `"github.com/enetx/surf"`)
-	assert.Contains(t, string(clientGo), "ForceHTTP3()")
-	// surf's Chrome impersonation manages the Accept header alongside
-	// User-Agent on the H3 transport too; the generator must not emit a
-	// competing default.
-	assert.NotContains(t, string(clientGo), `req.Header.Set("Accept",`)
+	clientGo := readGeneratedFile(t, outputDir, "internal", "client", "client.go")
+	assert.NotContains(t, clientGo, "github.com/enetx/")
+	assert.Contains(t, clientGo, "return chromeClient(timeout, jar, skipTLSVerify)")
+	assert.NotContains(t, clientGo, `req.Header.Set("Accept",`,
+		"chrome header overlay owns Accept on the H3 path")
 
-	// ResponseHeaderTimeout override must emit on the H3 path too —
-	// surf's per-stage timeout (10s default) caps any browser-impersonate
-	// transport regardless of the H2/H3 variant. Without these asserts a
-	// future refactor could silently strip the override from the H3
-	// branch and slow-streaming H3 endpoints would fail at surf's default
-	// with no test catching it. Mirrors the assertions in
-	// TestBrowserTransport_OverridesResponseHeaderTimeout (which exercises
-	// the H2 default).
-	assert.Contains(t, string(clientGo), `enetxhttp "github.com/enetx/http"`)
-	assert.Contains(t, string(clientGo), "surfClient.GetTransport().(*enetxhttp.Transport)")
-	assert.Contains(t, string(clientGo), "t.ResponseHeaderTimeout = timeout")
+	chromeH3 := readGeneratedFile(t, outputDir, "internal", "client", "chrome_h3.go")
+	assert.Contains(t, chromeH3, "http3.Transport{")
+
+	gomod := readGeneratedFile(t, outputDir, "go.mod")
+	assert.Contains(t, gomod, "github.com/quic-go/quic-go v0.60.0\n")
+	assert.NotContains(t, gomod, "github.com/enetx/")
 
 	runGoCommand(t, outputDir, "mod", "tidy")
 	runGoCommand(t, outputDir, "test", "./internal/client")
 }
 
-// TestGenerateBrowserChromeH2Transport pins the explicit
-// browser-chrome-h2 enum: the client emits ForceHTTP2() and no
-// ForceHTTP3(). Separate from the bare browser-chrome case (no version
-// force) so a future refactor cannot collapse the two without a failing
-// test.
 func TestGenerateBrowserChromeH2Transport(t *testing.T) {
 	t.Parallel()
 
@@ -2950,17 +3073,16 @@ func TestGenerateBrowserChromeH2Transport(t *testing.T) {
 	outputDir := filepath.Join(t.TempDir(), "websurfaceh2-pp-cli")
 	require.NoError(t, New(apiSpec, outputDir).Generate())
 
-	clientGo, err := os.ReadFile(filepath.Join(outputDir, "internal", "client", "client.go"))
-	require.NoError(t, err)
-	assert.Contains(t, string(clientGo), `"github.com/enetx/surf"`)
-	assert.Contains(t, string(clientGo), "ForceHTTP2()")
-	assert.NotContains(t, string(clientGo), "ForceHTTP3()")
+	chromeGo := readGeneratedFile(t, outputDir, "internal", "client", "chrome.go")
+	assert.Contains(t, chromeGo, `chromeALPN = []string{"h2"}`)
+	assert.NotContains(t, chromeGo, `"http/1.1"`)
+	assert.NoFileExists(t, filepath.Join(outputDir, "internal", "client", "chrome_h3.go"))
+	assert.NotContains(t, readGeneratedFile(t, outputDir, "go.mod"), "github.com/quic-go/quic-go")
+
+	runGoCommand(t, outputDir, "mod", "tidy")
+	runGoCommand(t, outputDir, "test", "./internal/client")
 }
 
-// TestGenerateBrowserChromeNoVersionForce pins the bare browser-chrome
-// enum (no -h2 / -h3 suffix): the surf client is used but no
-// ForceHTTPN() call is emitted, so Chrome's negotiated version wins.
-// Operators who want an explicit H/2 force must set browser-chrome-h2.
 func TestGenerateBrowserChromeNoVersionForce(t *testing.T) {
 	t.Parallel()
 
@@ -2987,11 +3109,21 @@ func TestGenerateBrowserChromeNoVersionForce(t *testing.T) {
 	outputDir := filepath.Join(t.TempDir(), "websurfacenoforce-pp-cli")
 	require.NoError(t, New(apiSpec, outputDir).Generate())
 
-	clientGo, err := os.ReadFile(filepath.Join(outputDir, "internal", "client", "client.go"))
-	require.NoError(t, err)
-	assert.Contains(t, string(clientGo), `"github.com/enetx/surf"`)
-	assert.NotContains(t, string(clientGo), "ForceHTTP2()")
-	assert.NotContains(t, string(clientGo), "ForceHTTP3()")
+	chromeGo := readGeneratedFile(t, outputDir, "internal", "client", "chrome.go")
+	assert.Contains(t, chromeGo, `chromeALPN = []string{"h2", "http/1.1"}`)
+	assert.NoFileExists(t, filepath.Join(outputDir, "internal", "client", "chrome_h3.go"))
+	assert.NotContains(t, readGeneratedFile(t, outputDir, "go.mod"), "github.com/quic-go/quic-go")
+	runGoCommand(t, outputDir, "mod", "tidy")
+	runGoCommand(t, outputDir, "test", "./internal/client")
+}
+
+func TestChromeOverlayOwnsUserAgent(t *testing.T) {
+	t.Parallel()
+
+	chrome := &spec.APISpec{HTTPTransport: spec.HTTPTransportBrowserChrome}
+	assert.True(t, (&clientTemplateData{APISpec: chrome, UseChromeImpersonation: true}).ChromeOverlayOwnsUserAgent())
+	assert.False(t, (&clientTemplateData{APISpec: chrome, UseChromeImpersonation: false}).ChromeOverlayOwnsUserAgent())
+	assert.False(t, (&clientTemplateData{APISpec: &spec.APISpec{}, UseChromeImpersonation: true}).ChromeOverlayOwnsUserAgent())
 }
 
 func TestGenerateBrowserHTTPTransportDisablesHTTP2(t *testing.T) {
@@ -3029,11 +3161,13 @@ func TestGenerateBrowserHTTPTransportDisablesHTTP2(t *testing.T) {
 	assert.Contains(t, clientGo, `transport := http.DefaultTransport.(*http.Transport).Clone()`)
 	assert.Contains(t, clientGo, `transport.TLSClientConfig.NextProtos = []string{"http/1.1"}`)
 	assert.Contains(t, clientGo, `transport.TLSNextProto = make(map[string]func(authority string, c *tls.Conn) http.RoundTripper)`)
-	assert.NotContains(t, clientGo, `"github.com/enetx/surf"`)
-	assert.NotContains(t, clientGo, `Impersonate()`)
+	assert.NotContains(t, clientGo, "github.com/enetx/")
+	assert.NotContains(t, clientGo, "chromeClient(")
+	assert.NoFileExists(t, filepath.Join(outputDir, "internal", "client", "chrome.go"))
 
 	gomod := readGeneratedFile(t, outputDir, "go.mod")
-	assert.NotContains(t, gomod, "github.com/enetx/surf")
+	assert.NotContains(t, gomod, "github.com/enetx/")
+	assert.NotContains(t, gomod, "github.com/refraction-networking/utls")
 	requireGeneratedCompiles(t, outputDir)
 
 	runtimeTest := `package client
@@ -3276,13 +3410,15 @@ func TestGenerateCookieHTMLDefaultsBrowserChromeTransport(t *testing.T) {
 	require.NoError(t, New(apiSpec, outputDir).Generate())
 
 	gomod := readGeneratedFile(t, outputDir, "go.mod")
-	assert.Contains(t, gomod, "github.com/enetx/surf")
+	assert.Contains(t, gomod, "github.com/refraction-networking/utls")
+	assert.NotContains(t, gomod, "github.com/enetx/")
 
+	chromeGo := readGeneratedFile(t, outputDir, "internal", "client", "chrome.go")
+	assert.Contains(t, chromeGo, "chromeHeaderTripper{")
 	clientGo := readGeneratedFile(t, outputDir, "internal", "client", "client.go")
-	assert.Contains(t, clientGo, `"github.com/enetx/surf"`)
-	assert.Contains(t, clientGo, "Impersonate()")
-	assert.Contains(t, clientGo, "Chrome()")
 	assert.NotContains(t, clientGo, `req.Header.Set("User-Agent", "cookiehtml-pp-cli/0.1.0")`)
+
+	requireGeneratedCompiles(t, outputDir)
 }
 
 func TestGenerateHTMLExtractionEndpoint(t *testing.T) {
@@ -3429,7 +3565,7 @@ func TestGenerateHTMLExtractionEndpoint(t *testing.T) {
 	require.FileExists(t, filepath.Join(outputDir, "internal", "cli", "html_extract.go"))
 	gomod, err := os.ReadFile(filepath.Join(outputDir, "go.mod"))
 	require.NoError(t, err)
-	assert.Contains(t, string(gomod), "golang.org/x/net v0.55.0")
+	assert.Contains(t, string(gomod), "golang.org/x/net "+safeXNetVersion)
 
 	runGoCommand(t, outputDir, "mod", "tidy")
 	binaryPath := filepath.Join(outputDir, "webhtml-pp-cli")
@@ -4129,6 +4265,23 @@ func TestGenerateHTMLExtractionPerModeGating(t *testing.T) {
 		runGoCommand(t, dir, "mod", "tidy")
 		runGoCommand(t, dir, "build", "./...")
 	})
+
+	t.Run("table-only emits span-aware helpers and omits embedded-json", func(t *testing.T) {
+		t.Parallel()
+
+		dir := filepath.Join(t.TempDir(), "tableonly-pp-cli")
+		require.NoError(t, New(specWithMode("tableonly", spec.HTMLExtractModeTable), dir).Generate())
+		body := read(t, dir)
+		assert.True(t, hasFunc(body, "extractHTMLTable"))
+		assert.True(t, hasFunc(body, "expandHTMLTableHeaderKeys"))
+		assert.True(t, hasFunc(body, "htmlSpanAttr"))
+		assert.Contains(t, body, "colspan")
+		assert.Contains(t, body, "rowspan")
+		assert.False(t, hasFunc(body, "extractEmbeddedJSON"))
+		assert.False(t, hasFunc(body, "extractHTMLPageOrLinks"))
+		runGoCommand(t, dir, "mod", "tidy")
+		runGoCommand(t, dir, "build", "./...")
+	})
 }
 
 func TestGenerateStandardTransportForOfficialAPI(t *testing.T) {
@@ -4166,11 +4319,13 @@ func TestGenerateStandardTransportForOfficialAPI(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, string(gomod), "go "+currentGoDirectiveVersion()+"\n")
 	assert.Contains(t, string(gomod), "toolchain "+currentGoToolchainVersion())
-	assert.NotContains(t, string(gomod), "github.com/enetx/surf")
+	assert.NotContains(t, string(gomod), "github.com/enetx/")
+	assert.NotContains(t, string(gomod), "github.com/refraction-networking/utls")
 
-	clientGo, err := os.ReadFile(filepath.Join(outputDir, "internal", "client", "client.go"))
-	require.NoError(t, err)
-	assert.NotContains(t, string(clientGo), `"github.com/enetx/surf"`)
+	clientGo := readGeneratedFile(t, outputDir, "internal", "client", "client.go")
+	assert.NotContains(t, clientGo, "github.com/enetx/")
+	assert.NotContains(t, clientGo, "chromeClient(")
+	assert.NoFileExists(t, filepath.Join(outputDir, "internal", "client", "chrome.go"))
 }
 
 func TestGenerateWithOwnerField(t *testing.T) {
@@ -4702,6 +4857,12 @@ func TestGenerateMCPSQLToolBoundsExecutionAndMaterialisation(t *testing.T) {
 		"handleSQL must not append every scanned row before encoding")
 	assert.Regexp(t, `(?s)func handleSQL\(.*queryCtx, cancel := bound\.WithSQLQueryDeadline\(ctx\).*QueryContext\(queryCtx, query\)`, mcpCode,
 		"handleSQL must thread the deadline context into QueryContext")
+	assert.Regexp(t, `(?s)func handleSQL\(.*db\.DB\(\)\.Conn\(queryCtx\).*sqlite\.Limit\(conn, sqlite3\.SQLITE_LIMIT_LENGTH, mcpSQLMaxValueBytes\).*QueryContext\(queryCtx, query\)`, mcpCode,
+		"handleSQL must set SQLITE_LIMIT_LENGTH on the same connection used for QueryContext")
+	assert.Contains(t, mcpCode, "const mcpSQLMaxValueBytes = 4 << 20",
+		"handleSQL must cap SQL values at 4 MiB before the row/byte budgets apply")
+	assert.Contains(t, mcpCode, "mcpSQLValueTooBig(err)",
+		"handleSQL must map SQLITE_TOOBIG to a cap-named error")
 	assert.NotRegexp(t, `(?s)func handleSQL\(.*query \+= .*LIMIT`, mcpCode,
 		"handleSQL must not inject SQL LIMIT text; that would change aggregate semantics")
 	assert.Regexp(t, `if err := rows\.Err\(\); err != nil`, mcpCode,
@@ -4717,8 +4878,12 @@ func TestGenerateMCPSQLToolBoundsExecutionAndMaterialisation(t *testing.T) {
 	assert.Contains(t, mcpTestCode, "TestMCPSQLAggregateKeepsOriginalSemantics")
 	assert.Contains(t, mcpTestCode, "TestMCPSQLCallerDeadlineCancelsSlowQuery")
 	assert.Contains(t, mcpTestCode, "TestMCPSQLLongColumnNamesStaySQLEnvelope")
+	assert.Contains(t, mcpTestCode, "TestMCPSQLOversizedValueIsRefused")
+	assert.Contains(t, mcpTestCode, "TestMCPSQLValueOneByteUnderCapReturns")
+	assert.Contains(t, mcpTestCode, "TestMCPSQLLaterRowOversizedValueIsRefused")
 
-	runGoCommand(t, outputDir, "test", "./internal/mcp", "-run", "TestMCPSQL(HugeResult|CompleteResult|Aggregate|CallerDeadline|LongColumnNames)")
+	requireGeneratedCompiles(t, outputDir)
+	runGoCommand(t, outputDir, "test", "./internal/mcp", "-run", "TestMCPSQL(HugeResult|CompleteResult|Aggregate|CallerDeadline|LongColumnNames|OversizedValue|ValueOneByteUnderCap|LaterRowOversized)")
 	runGoCommand(t, outputDir, "test", "./internal/mcp/bound", "-run", "Test(WithSQLQueryDeadline|SQLScanState)")
 }
 
@@ -4740,7 +4905,8 @@ func TestGenerateMCPStoreGuidanceTestsPass(t *testing.T) {
 	gen.VisionSet = VisionTemplateSet{Store: true, Search: true, MCP: true}
 	require.NoError(t, gen.Generate())
 
-	runGoCommand(t, outputDir, "test", "./internal/mcp", "-run", "TestMCP(Search|SQL)(MissingStore|EmptyStore|DomainTable)|TestMCPLocalStoreMetaIncludesOldestSyncedAt")
+	runGoCommandRequired(t, outputDir, "test", "./internal/mcp", "-run", "TestMCP(Search|SQL)(MissingStore|EmptyStore|DomainTable)|TestMCPLocalStoreMetaIncludesOldestSyncedAt|TestMCPStoreStatusDistinguishesCompletedEmptyAndPartialSync|TestMCPUnmigratedCheckpointsCannotProveCompletion")
+	requireGeneratedCompiles(t, outputDir)
 }
 
 func TestGenerateMCPToolResultTextBudgetTestsPass(t *testing.T) {
@@ -6028,6 +6194,67 @@ func TestGenerateStoreUpsertBatchDispatchesToTypedTable(t *testing.T) {
 
 	runGoCommand(t, outputDir, "mod", "tidy")
 	runGoCommand(t, outputDir, "test", "./internal/store")
+}
+
+func TestGeneratedUpsertBatchReportsCommittedCountAfterRollback(t *testing.T) {
+	t.Parallel()
+
+	apiSpec := adsCampaignSpec()
+	outputDir := filepath.Join(t.TempDir(), naming.CLI(apiSpec.Name))
+	gen := New(apiSpec, outputDir)
+	gen.VisionSet = VisionTemplateSet{Store: true, MCP: true}
+	require.NoError(t, gen.Generate())
+
+	storeTest := `package store
+
+import (
+	"context"
+	"encoding/json"
+	"path/filepath"
+	"testing"
+)
+
+func TestUpsertBatchDetailed_RollbackReportsZeroStored(t *testing.T) {
+	s, err := OpenWithContext(context.Background(), filepath.Join(t.TempDir(), "store.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	if _, err := s.DB().Exec(` + "`" + `CREATE TRIGGER abort_campaign_insert
+		BEFORE INSERT ON campaigns
+		WHEN NEW.id = 'fatal'
+		BEGIN
+			SELECT RAISE(ROLLBACK, 'forced transaction rollback');
+		END` + "`" + `); err != nil {
+		t.Fatal(err)
+	}
+
+	items := []json.RawMessage{
+		json.RawMessage(` + "`" + `{"id":"ok","name":"first"}` + "`" + `),
+		json.RawMessage(` + "`" + `{"id":"fatal","name":"second"}` + "`" + `),
+	}
+	stored, _, _, err := s.UpsertBatchDetailed("campaigns", items)
+	if err == nil {
+		t.Fatal("UpsertBatchDetailed returned nil error after forced rollback")
+	}
+	if stored != 0 {
+		t.Fatalf("stored = %d, want 0 after transaction rollback", stored)
+	}
+	for _, table := range []string{"resources", "campaigns"} {
+		var count int
+		if err := s.DB().QueryRow("SELECT COUNT(*) FROM " + table).Scan(&count); err != nil {
+			t.Fatalf("count %s: %v", table, err)
+		}
+		if count != 0 {
+			t.Fatalf("%s count = %d, want 0 after transaction rollback", table, count)
+		}
+	}
+}
+`
+	require.NoError(t, os.WriteFile(filepath.Join(outputDir, "internal", "store", "rollback_count_test.go"), []byte(storeTest), 0o644))
+	runGoCommandRequired(t, outputDir, "test", "./internal/store", "-run", "TestUpsertBatchDetailed_RollbackReportsZeroStored")
+	requireGeneratedCompiles(t, outputDir)
 }
 
 // TestUpsertDispatchPreservesMultiWordResourceCasing is the regression test
@@ -7724,7 +7951,8 @@ func TestGeneratedOutput_MutatingCommandsHaveEnvelope(t *testing.T) {
 	// envelope; collection envelopes are unwrapped first so rows nest once.
 	assert.Contains(t, content, "filtered := unwrapSingleKeyArray(data)")
 	assert.Contains(t, content, "compactFields(filtered,")
-	assert.Contains(t, content, "filterFields(filtered, flags.selectFields)")
+	assert.Contains(t, content, "filterFieldsChecked(filtered, flags.selectFields)")
+	assert.Contains(t, content, "selectErrorForDryRun(selectErr, flags, data)")
 	assert.Contains(t, content, `json.Unmarshal(filtered, &parsed)`)
 
 	// Envelope bypasses printOutputWithFlags to avoid double-filtering, then
@@ -7732,11 +7960,34 @@ func TestGeneratedOutput_MutatingCommandsHaveEnvelope(t *testing.T) {
 	assert.Contains(t, content, `wrapPlatformStructuredOutput(json.RawMessage(envelopeJSON), flags, resultKey, true)`)
 	assert.Contains(t, content, `printOutput(cmd.OutOrStdout(), structured, true)`)
 
+	// After a successful print, disallowed partial failure (exit 6) must
+	// beat --select all-miss (exit 2). Mutations that partially fail keep
+	// exit 6 even when every --select path misses.
+	printIdx := strings.Index(content, `if perr := printOutput(cmd.OutOrStdout(), structured, true); perr != nil`)
+	require.GreaterOrEqual(t, printIdx, 0, "envelope path must print structured output")
+	afterPrint := content[printIdx:]
+	partialIdx := strings.Index(afterPrint, `return partialFailureErr(`)
+	selectIdx := strings.Index(afterPrint, `return selectErr`)
+	require.GreaterOrEqual(t, partialIdx, 0, "envelope path must return partialFailureErr")
+	require.GreaterOrEqual(t, selectIdx, 0, "envelope path must return selectErr")
+	assert.Less(t, partialIdx, selectIdx, "partialFailure (exit 6) must precede selectErr (exit 2)")
+
+	fallthroughPrint := strings.Index(content, `printErr := printOutputWithFlagsMeta(`)
+	require.GreaterOrEqual(t, fallthroughPrint, 0, "mutate fall-through must print via printOutputWithFlagsMeta")
+	afterFallthrough := content[fallthroughPrint:]
+	fallPartial := strings.Index(afterFallthrough, `return partialFailureErr(`)
+	fallPrintErr := strings.Index(afterFallthrough, `return printErr`)
+	require.GreaterOrEqual(t, fallPartial, 0, "mutate fall-through must return partialFailureErr")
+	require.GreaterOrEqual(t, fallPrintErr, 0, "mutate fall-through must return printErr")
+	assert.Less(t, fallPartial, fallPrintErr, "partialFailure (exit 6) must precede printErr/selectErr on fall-through")
+
 	// Dry-run is flagged honestly in the envelope
 	assert.Contains(t, content, `flags.dryRun`)
 	assert.Contains(t, content, `envelope["dry_run"] = true`)
 	assert.Contains(t, content, `envelope["status"] = 0`)
 	assert.Contains(t, content, `envelope["success"] = false`)
+
+	requireGeneratedCompiles(t, outputDir)
 }
 
 // TestGeneratedOutput_PartialFailureDetectionRuntime drops a runtime
@@ -8055,8 +8306,11 @@ func TestPaginatedGetExemptsCursorParamFromZeroStripping(t *testing.T) {
 	require.NoError(t, err, "template must exist: %s", path)
 	body := string(data)
 
-	cleanStart := strings.Index(body, "clean := map[string]string{}")
-	require.GreaterOrEqual(t, cleanStart, 0, "paginatedGet must declare a clean map")
+	fnStart := strings.Index(body, "func paginatedGet(")
+	require.GreaterOrEqual(t, fnStart, 0, "paginatedGet must exist")
+	cleanRel := strings.Index(body[fnStart:], "clean := map[string]string{}")
+	require.GreaterOrEqual(t, cleanRel, 0, "paginatedGet must declare a clean map")
+	cleanStart := fnStart + cleanRel
 	loopEnd := strings.Index(body[cleanStart:], "if !fetchAll")
 	require.GreaterOrEqual(t, loopEnd, 0, "expected fetchAll branch after clean loop")
 	cleanBlock := body[cleanStart : cleanStart+loopEnd]
@@ -8065,6 +8319,8 @@ func TestPaginatedGetExemptsCursorParamFromZeroStripping(t *testing.T) {
 		"paginatedGet's clean loop must reference cursorParam so the cursor key is exempt from zero-stripping")
 	assert.NotContains(t, cleanBlock, `if v != "" && v != "0" && v != "false"`,
 		`the unconditional v != "" && v != "0" && v != "false" filter incorrectly drops cursor="0" for offset-paginated APIs`)
+	assert.NotContains(t, cleanBlock, `v != "0" && v != "false"`,
+		"paginatedGet must not drop operator-set false/0 by inspecting the stringified value alone")
 }
 
 // The exemption above must stay scoped to offset pagination. Under id-cursor
@@ -8100,8 +8356,11 @@ func TestPaginatedGetScopesCursorZeroExemptionToOffsetPagination(t *testing.T) {
 	require.NoError(t, err, "generated helper must exist: %s", path)
 	body := string(data)
 
-	cleanStart := strings.Index(body, "clean := map[string]string{}")
-	require.GreaterOrEqual(t, cleanStart, 0, "paginatedGet must declare a clean map")
+	fnStart := strings.Index(body, "func paginatedGet(")
+	require.GreaterOrEqual(t, fnStart, 0, "paginatedGet must exist")
+	cleanRel := strings.Index(body[fnStart:], "clean := map[string]string{}")
+	require.GreaterOrEqual(t, cleanRel, 0, "paginatedGet must declare a clean map")
+	cleanStart := fnStart + cleanRel
 	loopEnd := strings.Index(body[cleanStart:], "if !fetchAll")
 	require.GreaterOrEqual(t, loopEnd, 0, "expected fetchAll branch after clean loop")
 	cleanBlock := body[cleanStart : cleanStart+loopEnd]
@@ -8306,8 +8565,10 @@ func TestEndpointFixturesEmittedFromSpec(t *testing.T) {
 		"non-promoted endpoint commands should carry spec-declared live dogfood tier requirements")
 
 	withoutHappyArgs := readGeneratedFile(t, outputDir, "internal", "cli", "items_get.go")
-	assert.Contains(t, withoutHappyArgs, `Example:     "  endpoint-fixtures-pp-cli items get 550e8400-e29b-41d4-a716-446655440000"`,
-		"endpoints without example must keep the existing synthesized example")
+	assert.NotContains(t, withoutHappyArgs, "550e8400-e29b-41d4-a716-446655440000",
+		"endpoints without a derivable id must not invent a synthetic UUID Example")
+	assert.NotContains(t, withoutHappyArgs, "Example:",
+		"endpoints without a derivable id must omit the synthesized Cobra Example")
 	assert.NotContains(t, withoutHappyArgs, "pp:happy-args",
 		"endpoints without happy_args must keep the existing annotation shape")
 	assert.NotContains(t, withoutHappyArgs, "pp:requires-tier",
@@ -8700,6 +8961,112 @@ func TestClassifyDeleteError404RequiresIgnoreMissing(t *testing.T) {
 
 	requireGeneratedCompiles(t, outputDir)
 	runGoCommandRequired(t, outputDir, "test", "-run", "Test(Classify|WriteNoop)", "./internal/cli")
+}
+
+func TestGeneratedHelpers_ClassifiesTypedRateLimitError(t *testing.T) {
+	t.Parallel()
+
+	apiSpec := &spec.APISpec{
+		Name:    "testratelimitclass",
+		Version: "0.1.0",
+		BaseURL: "https://api.example.com",
+		Resources: map[string]spec.Resource{
+			"items": {
+				Description: "Manage items",
+				Endpoints: map[string]spec.Endpoint{
+					"list": {Method: "GET", Path: "/items", Description: "List items"},
+				},
+			},
+		},
+	}
+
+	outputDir := filepath.Join(t.TempDir(), "testratelimitclass-pp-cli")
+	require.NoError(t, New(apiSpec, outputDir).Generate())
+
+	helpers := readGeneratedFile(t, outputDir, "internal", "cli", "helpers.go")
+	typedMatch := "var rateLimited *platform.RateLimitedError"
+	require.Equal(t, 2, strings.Count(helpers, typedMatch),
+		"both emitted classifiers must errors.As *platform.RateLimitedError before the HTTP-status switch")
+
+	modulePath := generatedModulePath(t, outputDir)
+	testPath := filepath.Join(outputDir, "internal", "cli", "rate_limit_classify_test.go")
+	inlineTest := fmt.Sprintf(`package cli
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+	"testing"
+
+	%q
+)
+
+func TestClassifyTypedRateLimit(t *testing.T) {
+	limited := &platform.RateLimitedError{EndpointClass: "read", Attempts: 3}
+	wrapped := fmt.Errorf("get items: %%w", limited)
+
+	only := classifyAPIErrorOnly(limited)
+	if got := ExitCode(only); got != 7 {
+		t.Fatalf("classifyAPIErrorOnly(RateLimitedError) exit = %%d, want 7", got)
+	}
+	if got := ExitCode(classifyAPIErrorOnly(wrapped)); got != 7 {
+		t.Fatalf("classifyAPIErrorOnly(wrapped RateLimitedError) exit = %%d, want 7", got)
+	}
+
+	var out bytes.Buffer
+	classified := classifyAPIError(&out, limited, &rootFlags{asJSON: true})
+	if got := ExitCode(classified); got != 7 {
+		t.Fatalf("classifyAPIError(RateLimitedError) exit = %%d, want 7", got)
+	}
+	var envelope map[string]any
+	if err := json.Unmarshal(out.Bytes(), &envelope); err != nil {
+		t.Fatalf("typed rate-limit JSON envelope: %%v; body=%%q", err, out.String())
+	}
+	if envelope["code"] != float64(7) {
+		t.Fatalf("typed rate-limit envelope code = %%v, want 7", envelope["code"])
+	}
+	errText, _ := envelope["error"].(string)
+	if !strings.Contains(errText, "rate limited") {
+		t.Fatalf("typed rate-limit envelope error = %%q, want rate limited", errText)
+	}
+
+	out.Reset()
+	wrappedClassified := classifyAPIError(&out, wrapped, &rootFlags{asJSON: true})
+	if got := ExitCode(wrappedClassified); got != 7 {
+		t.Fatalf("classifyAPIError(wrapped RateLimitedError) exit = %%d, want 7", got)
+	}
+
+	out.Reset()
+	http429 := classifyAPIError(&out, errors.New("HTTP 429: slow down"), &rootFlags{asJSON: true})
+	if got := ExitCode(http429); got != 7 {
+		t.Fatalf("HTTP 429 exit = %%d, want 7", got)
+	}
+	if err := json.Unmarshal(out.Bytes(), &envelope); err != nil {
+		t.Fatalf("HTTP 429 JSON envelope: %%v; body=%%q", err, out.String())
+	}
+	if envelope["code"] != float64(7) {
+		t.Fatalf("HTTP 429 envelope code = %%v, want 7", envelope["code"])
+	}
+
+	if got := ExitCode(classifyAPIErrorOnly(errors.New("HTTP 500: boom"))); got != 5 {
+		t.Fatalf("HTTP 500 exit = %%d, want 5", got)
+	}
+
+	typed := usageErr(errors.New("semantic API envelope rejected input"))
+	if got := classifyAPIErrorOnly(typed); got != typed {
+		t.Fatalf("typed cliError pass-through changed: %%#v", got)
+	}
+	if got := ExitCode(typed); got != 2 {
+		t.Fatalf("typed cliError exit = %%d, want 2", got)
+	}
+}
+`, modulePath+"/internal/platform")
+
+	require.NoError(t, os.WriteFile(testPath, []byte(inlineTest), 0o644))
+	requireGeneratedCompiles(t, outputDir)
+	runGoCommandRequired(t, outputDir, "test", "-run", "TestClassifyTypedRateLimit", "./internal/cli")
 }
 
 func TestGeneratedExport_ValidatesResourceArgument(t *testing.T) {
@@ -9359,7 +9726,7 @@ func TestBuildPromotedCommands(t *testing.T) {
 		assert.True(t, names["password-forgot"], "POST-only password-forgot resource should promote")
 	})
 
-	t.Run("single-endpoint POST with body beyond max flag depth is not promoted", func(t *testing.T) {
+	t.Run("single-endpoint POST with a depth-boundary JSON object is promoted", func(t *testing.T) {
 		t.Parallel()
 		s := &spec.APISpec{
 			Name:    "test",
@@ -9403,7 +9770,8 @@ func TestBuildPromotedCommands(t *testing.T) {
 		}
 
 		promoted := buildPromotedCommands(s)
-		assert.Empty(t, promoted, "deep-body single-endpoint POST must remain non-promoted so canonical endpoint command with --stdin stays reachable")
+		require.Len(t, promoted, 1, "the depth-boundary object flag keeps the complete body reachable in promoted commands")
+		assert.Equal(t, "orders", promoted[0].PromotedName)
 	})
 
 	t.Run("multi-endpoint resource still requires GET for promotion (write-only resources stay nested)", func(t *testing.T) {
@@ -9734,7 +10102,8 @@ func TestGeneratedOutput_PromotedCommandKeepsSubresourceParents(t *testing.T) {
 
 	cardsSrc, err := os.ReadFile(filepath.Join(outputDir, "internal", "cli", "account_cards_get-account.go"))
 	require.NoError(t, err)
-	assert.Regexp(t, `Example:\s+"  promsub-pp-cli account cards get-account `, string(cardsSrc))
+	assert.Contains(t, string(cardsSrc), `"get-account <accountId>"`)
+	assert.NotContains(t, string(cardsSrc), "550e8400-e29b-41d4-a716-446655440000")
 	assert.NotRegexp(t, `Example:\s+"  promsub-pp-cli account get-account `, string(cardsSrc))
 }
 
@@ -9748,17 +10117,18 @@ func TestExampleLineUsesRenderedCommandAndFlagNames(t *testing.T) {
 		Method: "POST",
 		Path:   "/account/{accountId}/request-send-money",
 		Params: []spec.Param{
-			{Name: "accountId", Type: "string", Required: true, Positional: true},
+			{Name: "accountId", Type: "string", Required: true, Positional: true, Example: "acct_123"},
 		},
 		Body: []spec.Param{
-			{Name: "idempotencyKey", Type: "string", Required: true},
+			{Name: "idempotencyKey", Type: "string", Required: true, Example: "idem-1"},
 		},
 	}
 
 	got := g.exampleLine("account request-send-money", "request_send_money", endpoint)
 
 	assert.Contains(t, got, "example-render-pp-cli account request-send-money request-send-money")
-	assert.Contains(t, got, "--idempotency-key your-token-here")
+	assert.Contains(t, got, "acct_123")
+	assert.Contains(t, got, "--idempotency-key idem-1")
 	assert.NotContains(t, got, "request_send_money")
 	assert.NotContains(t, got, "--idempotencyKey")
 }
@@ -9912,11 +10282,15 @@ func TestGeneratedCommandExampleKeepsDispatchParamDefault(t *testing.T) {
 
 	rankSrc, err := os.ReadFile(filepath.Join(outputDir, "internal", "cli", "domain_rank.go"))
 	require.NoError(t, err)
-	assert.Contains(t, string(rankSrc), `dispatch-default-pp-cli domain rank --type domain_rank --domain example-value`)
+	assert.NotContains(t, string(rankSrc), "example-value")
+	assert.NotContains(t, string(rankSrc), "TODO: replace placeholder example values")
+	assert.NotContains(t, string(rankSrc), "Example:")
+	assert.NotContains(t, string(rankSrc), "pp:happy-args")
 
 	listSrc, err := os.ReadFile(filepath.Join(outputDir, "internal", "cli", "domain_list.go"))
 	require.NoError(t, err)
-	assert.Contains(t, string(listSrc), `dispatch-default-pp-cli domain list --limit 50`)
+	assert.Contains(t, string(listSrc), `dispatch-default-pp-cli domain list --limit 100`)
+	assert.Contains(t, string(listSrc), `"pp:happy-args": "--limit=100"`)
 }
 
 func TestGeneratedCommandExampleUsesSchemaHintsForRequiredParams(t *testing.T) {
@@ -9953,8 +10327,12 @@ func TestGeneratedCommandExampleUsesSchemaHintsForRequiredParams(t *testing.T) {
 	require.NoError(t, New(apiSpec, outputDir).Generate())
 
 	source := readGeneratedFile(t, outputDir, "internal", "cli", "reports_create.go")
-	assert.Contains(t, source, `schema-hints-pp-cli reports create --example-param from-example --enum-param snippet --default-param from-default --app INSTANTLY --fallback example-value --kind summary`)
-	assert.Contains(t, source, `// TODO: replace placeholder example values before relying on this for live dogfood.`)
+	assert.NotContains(t, source, "example-value",
+		"mixed derivable/underivable required params must not ship placeholder Example strings")
+	assert.NotContains(t, source, `// TODO: replace placeholder example values before relying on this for live dogfood.`)
+	assert.NotContains(t, source, "pp:happy-args",
+		"happy-args must stay unset when any required input is underivable")
+	assert.NotContains(t, source, "Example:")
 	requireGeneratedCompiles(t, outputDir)
 }
 
@@ -10030,8 +10408,10 @@ func TestGeneratedCommandExampleFallsBackWhenNarrativeDoesNotMatchCommand(t *tes
 	require.NoError(t, gen.Generate())
 
 	source := readGeneratedFile(t, outputDir, "internal", "cli", "users_list.go")
-	assert.Contains(t, source, `narrative-fallback-pp-cli users list --pcgs-no example-value`)
+	assert.NotContains(t, source, "example-value")
 	assert.NotContains(t, source, "p_12345")
+	assert.NotContains(t, source, "Example:")
+	assert.NotContains(t, source, "pp:happy-args")
 }
 
 func TestGeneratedCommandExampleUsesNarrativeRecipeWhenQuickStartDoesNotMatch(t *testing.T) {
@@ -10335,8 +10715,9 @@ func TestGeneratedPromotedCommandExampleRejectsNarrativeChildCommand(t *testing.
 	require.NoError(t, gen.Generate())
 
 	source := readGeneratedFile(t, outputDir, "internal", "cli", "promoted_account.go")
-	assert.Contains(t, source, `"  narrative-promoted-child-pp-cli account 550e8400-e29b-41d4-a716-446655440000"`)
+	assert.NotContains(t, source, "550e8400-e29b-41d4-a716-446655440000")
 	assert.NotContains(t, source, "account cards get-account")
+	assert.NotContains(t, source, "Example:")
 }
 
 func TestGeneratedPromotedCommandExampleRejectsUnpromotedNarrativePath(t *testing.T) {
@@ -10367,8 +10748,9 @@ func TestGeneratedPromotedCommandExampleRejectsUnpromotedNarrativePath(t *testin
 	require.NoError(t, gen.Generate())
 
 	source := readGeneratedFile(t, outputDir, "internal", "cli", "promoted_lookup.go")
-	assert.Contains(t, source, `"  narrative-unpromoted-path-pp-cli lookup --pcgs-no example-value"`)
+	assert.NotContains(t, source, "example-value")
 	assert.NotContains(t, source, `"  narrative-unpromoted-path-pp-cli lookup create --pcgs-no 7356"`)
+	assert.NotContains(t, source, "Example:")
 }
 
 func TestDetectAgentMoneyWorkflowFromGenericMoneyMovementShape(t *testing.T) {
@@ -11510,9 +11892,9 @@ func TestGeneratedOutput_ResourceParentsVisibleWhenAPIBrowserGenerated(t *testin
 	t.Parallel()
 
 	// Multi-endpoint resource -> parent group; single-endpoint resource -> promoted command.
-	// The promoted command's presence triggers api_discovery.go emission, but resource
-	// parents must remain visible in root help. API discovery identifies them from command
-	// metadata instead of repurposing Cobra's Hidden bit.
+	// Resource parents trigger api_discovery.go emission. They stay visible in
+	// root help; API discovery identifies them from pp:api-resource metadata
+	// instead of Cobra's Hidden bit.
 	apiSpec := &spec.APISpec{
 		Name:    "hiddentest",
 		Version: "0.1.0",
@@ -11543,6 +11925,12 @@ func TestGeneratedOutput_ResourceParentsVisibleWhenAPIBrowserGenerated(t *testin
 	require.FileExists(t, filepath.Join(outputDir, "internal", "cli", "api_discovery.go"))
 	require.FileExists(t, filepath.Join(outputDir, "internal", "cli", "promoted_customers.go"))
 
+	discovery, err := os.ReadFile(filepath.Join(outputDir, "internal", "cli", "api_discovery.go"))
+	require.NoError(t, err)
+	assert.NotContains(t, string(discovery), "ALL endpoints")
+	assert.NotContains(t, string(discovery), "full API coverage")
+	assert.NotContains(t, string(discovery), "Browse and call any API endpoint")
+
 	orders, err := os.ReadFile(filepath.Join(outputDir, "internal", "cli", "orders.go"))
 	require.NoError(t, err)
 	assert.NotContains(t, string(orders), "Hidden: true",
@@ -11568,9 +11956,9 @@ func TestGeneratedOutput_ResourceParentsVisibleWhenAPIBrowserGenerated(t *testin
 func TestGeneratedOutput_ResourceParentsNotHiddenWithoutAPIBrowser(t *testing.T) {
 	t.Parallel()
 
-	// Without any single-endpoint resource to promote, api_discovery.go is not generated;
-	// hiding the resources in that case would just collapse --help without giving users
-	// a way to list them, so the parent files stay visible.
+	// Multi-endpoint resources emit an api browser even without promoted
+	// shortcuts, and the parents stay visible in --help rather than being
+	// Hidden behind that browser.
 	apiSpec := &spec.APISpec{
 		Name:    "novisibletest",
 		Version: "0.1.0",
@@ -11599,12 +11987,29 @@ func TestGeneratedOutput_ResourceParentsNotHiddenWithoutAPIBrowser(t *testing.T)
 	gen := New(apiSpec, outputDir)
 	require.NoError(t, gen.Generate())
 
-	assert.NoFileExists(t, filepath.Join(outputDir, "internal", "cli", "api_discovery.go"))
+	require.FileExists(t, filepath.Join(outputDir, "internal", "cli", "api_discovery.go"))
+	rootSrc, err := os.ReadFile(filepath.Join(outputDir, "internal", "cli", "root.go"))
+	require.NoError(t, err)
+	assert.Contains(t, string(rootSrc), "newAPICmd(flags)")
+
+	discovery, err := os.ReadFile(filepath.Join(outputDir, "internal", "cli", "api_discovery.go"))
+	require.NoError(t, err)
+	assert.NotContains(t, string(discovery), "ALL endpoints")
+	assert.NotContains(t, string(discovery), "full API coverage")
 
 	orders, err := os.ReadFile(filepath.Join(outputDir, "internal", "cli", "orders.go"))
 	require.NoError(t, err)
 	assert.NotContains(t, string(orders), "Hidden: true",
-		"raw resource parent must not be Hidden when no api browser is generated")
+		"raw resource parent must remain visible when the api browser is generated")
+
+	runGoCommand(t, outputDir, "mod", "tidy")
+	binaryPath := filepath.Join(outputDir, "novisibletest-pp-cli")
+	runGoCommand(t, outputDir, "build", "-o", binaryPath, "./cmd/novisibletest-pp-cli")
+
+	apiOut, err := exec.Command(binaryPath, "api").Output()
+	require.NoError(t, err)
+	assert.Contains(t, string(apiOut), "orders")
+	assert.Contains(t, string(apiOut), "items")
 }
 
 func TestGeneratedOutput_AgentContextIncludesResourceGroups(t *testing.T) {
@@ -12099,7 +12504,8 @@ func TestGeneratedAuthCredentialCommandReferencesMatchCobraTree(t *testing.T) {
 		client := readGeneratedFile(t, outputDir, "internal", "client", "client.go")
 		assert.Contains(t, client, "auth set-credentials")
 		doctor := readGeneratedFile(t, outputDir, "internal", "cli", "doctor.go")
-		assert.Contains(t, doctor, `credentialRemediation := "run auth set-credentials or auth logout"`)
+		assert.Contains(t, doctor, `remediationHint := "run auth set-credentials or auth logout"`)
+		assert.NotContains(t, doctor, "credentialRemediation")
 	})
 }
 
@@ -12379,8 +12785,9 @@ func TestGeneratedDoctor_HealthCheckPathProbesEndpoint(t *testing.T) {
 	doctorSrc := readGeneratedFile(t, outputDir, "internal", "cli", "doctor.go")
 	assert.Contains(t, doctorSrc, `healthPath := "api/marketStatus"`)
 	assert.Contains(t, doctorSrc, `if !strings.HasPrefix(healthPath, "/") {`)
-	assert.Contains(t, doctorSrc, `reachBody, reachErr := c.Get(cmd.Context(), healthPath, nil)`)
+	assert.Contains(t, doctorSrc, `reachBody, reachErr := c.GetWithHeaders(cmd.Context(), healthPath, nil, map[string]string{client.HTMLResponseHeader: "true"})`)
 	assert.NotContains(t, doctorSrc, `reachBody, reachErr := c.Get(cmd.Context(), "/", nil)`)
+	assert.NotContains(t, doctorSrc, `reachBody, reachErr := c.Get(cmd.Context(), healthPath, nil)`)
 }
 
 func TestGeneratedDoctor_InterstitialMarkersAreTitleAnchored(t *testing.T) {
@@ -12559,8 +12966,13 @@ func TestGeneratedHelpers_DeadCodeRemoved(t *testing.T) {
 
 	// Verify useful functions are still present
 	assert.Contains(t, content, "printOutputWithFlags")
-	assert.Contains(t, content, "filterFields")
+	assert.Contains(t, content, "func filterFields(data json.RawMessage, fields string) json.RawMessage")
+	assert.Contains(t, content, "func filterFieldsChecked(data json.RawMessage, fields string) (json.RawMessage, error)")
+	assert.Contains(t, content, "func selectErrorForDryRun(err error, flags *rootFlags, data json.RawMessage) error")
+	assert.NotContains(t, content, "payloadHasDryRunTrue")
 	assert.Contains(t, content, "classifyAPIError")
+
+	requireGeneratedCompiles(t, outputDir)
 }
 
 func TestGenerate_CookieAuthUsesBrowserTemplate(t *testing.T) {
@@ -12735,7 +13147,9 @@ func TestGenerate_CookieAuthWindowsCompatibility(t *testing.T) {
 	assert.Contains(t, content, "pyBin")
 	assert.Contains(t, content, "pyArgs")
 	assert.NotContains(t, content, `exec.Command("python3", "-c", script)`)
-	assert.Contains(t, content, `exec.Command(tool.pyBin,`)
+	assert.NotContains(t, content, `exec.Command(tool.pyBin,`)
+	assert.Contains(t, content, "runPythonFile(tool.pyBin, tool.pyArgs, script, scriptArgs...)")
+	assert.Contains(t, content, `return exec.Command("python3", args...), nil`)
 
 	// Windows no-extractor remedy must name file import, not --browser
 	// (an alias of the --chrome path that just failed).
@@ -13168,7 +13582,8 @@ func TestGenerateWhichDoesNotFallbackToEndpointGuesses(t *testing.T) {
 	whichGo, err := os.ReadFile(filepath.Join(outputDir, "internal", "cli", "which.go"))
 	require.NoError(t, err)
 	whichSrc := string(whichGo)
-	assert.Contains(t, whichSrc, `var whichIndex = []whichEntry{}`)
+	assert.Contains(t, whichSrc, `Command: "products"`)
+	assert.Contains(t, whichSrc, `pp:which-promoted`)
 	assert.NotContains(t, whichSrc, `Command: "products list"`)
 	assert.NotContains(t, whichSrc, `Command: "products reviews list"`)
 	assert.Contains(t, whichSrc, `"pp:typed-exit-codes": "0,2"`)
@@ -13178,7 +13593,8 @@ func TestGenerateWhichDoesNotFallbackToEndpointGuesses(t *testing.T) {
 	runGoCommand(t, outputDir, "build", "-o", binaryPath, "./cmd/whichfallback-pp-cli")
 	whichOut, err := exec.Command(binaryPath, "which", "reviews", "--json").CombinedOutput()
 	require.Error(t, err)
-	assert.Contains(t, string(whichOut), "no curated capability index")
+	assert.NotContains(t, string(whichOut), "no curated capability index")
+	assert.Contains(t, string(whichOut), `"matches"`)
 }
 
 func graphQLBFFCaptureEntry(operationName, variablesJSON, hash string) browsersniff.EnrichedEntry {
@@ -14822,10 +15238,10 @@ func TestGeneratedGraphQLSyncForcesSingleWorkerUnderVerifyEnv(t *testing.T) {
 		"GraphQL sync.go dogfood cap must bound generated syncs to one page")
 	assert.NotContains(t, string(syncGo), `cmd.Flags().IntVar(&maxPages, "max-pages", 10,`,
 		"GraphQL sync.go must not retain the old 10-page default")
-	assert.Contains(t, string(syncGo), "capExitHit := false",
-		"GraphQL sync.go must track whether --max-pages stopped the loop")
-	assert.Contains(t, string(syncGo), "finalCursor = capExitCursor",
-		"GraphQL sync.go must preserve the resume cursor on --max-pages cap exit")
+	assert.Contains(t, string(syncGo), "attemptComplete := false",
+		"GraphQL sync.go must distinguish a proven natural end from a capped walk")
+	assert.Contains(t, string(syncGo), "db.SaveSyncProgress(resource, progressCursor, totalCount)",
+		"GraphQL sync.go must preserve resumable progress without advancing the completion watermark")
 	assert.Contains(t, string(syncGo), "conn.PageInfo.HasNextPage && conn.PageInfo.EndCursor != \"\" && conn.PageInfo.EndCursor != cursor",
 		"GraphQL sync.go must only preserve a cap-exit cursor when another page exists")
 
@@ -14850,6 +15266,7 @@ import (
 type gqlResumeHandler struct {
 	cursors []string
 	stuck   bool
+	failPage bool
 }
 
 func (h *gqlResumeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -14887,6 +15304,9 @@ func (h *gqlResumeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			"id":    page + "-" + strconv.Itoa(i),
 			"title": page + " issue " + strconv.Itoa(i),
 		}
+	}
+	if h.failPage && cursor == "page-2" {
+		delete(nodes[0], "id")
 	}
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"data": map[string]any{
@@ -14952,6 +15372,33 @@ func TestGraphQLSyncResourcePreservesCursorOnMaxPagesCap(t *testing.T) {
 	}
 }
 
+func TestGraphQLSyncResourceRetriesLossyPageBeforeCompletion(t *testing.T) {
+	handler := &gqlResumeHandler{failPage: true}
+	c, db, cleanup := newGraphQLSyncClient(t, handler)
+	defer cleanup()
+	watermark := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+	if err := db.SaveSyncStateAt("issues", "", 0, watermark); err != nil { t.Fatal(err) }
+	res := syncResource(context.Background(), c, db, "issues", "", false, 0, false)
+	if res.Err == nil || !res.IntegrityFailure { t.Fatalf("lossy page result = %+v", res) }
+	cursor, gotTime, _, err := db.GetSyncState("issues")
+	if err != nil || cursor != "page-2" || !gotTime.Equal(watermark) {
+		t.Fatalf("failed checkpoint = %q, %s, %v", cursor, gotTime, err)
+	}
+	var complete int
+	if err := db.DB().QueryRow("SELECT last_attempt_complete FROM sync_state WHERE resource_type = 'issues'").Scan(&complete); err != nil || complete != 0 {
+		t.Fatalf("failed completion marker = %d, %v", complete, err)
+	}
+	handler.failPage = false
+	handler.cursors = nil
+	res = syncResource(context.Background(), c, db, "issues", "", false, 0, false)
+	if res.Err != nil || res.Warn != nil { t.Fatalf("retry result = %+v", res) }
+	if strings.Join(handler.cursors, ",") != "page-2,page-3,page-4,page-5" { t.Fatalf("retry skipped lost page: %v", handler.cursors) }
+	if count, err := db.Count("issues"); err != nil || count != 250 { t.Fatalf("final count = %d, %v; want 250", count, err) }
+	if err := db.DB().QueryRow("SELECT last_attempt_complete FROM sync_state WHERE resource_type = 'issues'").Scan(&complete); err != nil || complete != 1 {
+		t.Fatalf("final completion marker = %d, %v", complete, err)
+	}
+}
+
 func TestGraphQLSyncResourceClearsCursorWhenCapEqualsFinalPage(t *testing.T) {
 	handler := &gqlResumeHandler{}
 	c, db, cleanup := newGraphQLSyncClient(t, handler)
@@ -14976,7 +15423,7 @@ func TestGraphQLSyncResourceClearsCursorWhenCapEqualsFinalPage(t *testing.T) {
 	}
 }
 
-func TestGraphQLSyncResourceClearsSelfReferentialCursorOnMaxPagesCap(t *testing.T) {
+func TestGraphQLSyncResourcePreservesSelfReferentialCursorOnMaxPagesCap(t *testing.T) {
 	handler := &gqlResumeHandler{stuck: true}
 	c, db, cleanup := newGraphQLSyncClient(t, handler)
 	defer cleanup()
@@ -14984,24 +15431,32 @@ func TestGraphQLSyncResourceClearsSelfReferentialCursorOnMaxPagesCap(t *testing.
 	if err := db.SaveSyncState("issues", "stuck", 100); err != nil {
 		t.Fatalf("seed sync state: %v", err)
 	}
+	_, watermark, _, err := db.GetSyncState("issues")
+	if err != nil { t.Fatal(err) }
 	res := syncResource(context.Background(), c, db, "issues", "", false, 1, false)
-	if res.Err != nil {
-		t.Fatalf("syncResource error: %v", res.Err)
+	if res.Err == nil || res.Warn != nil || res.Bounded || strings.Contains(res.Err.Error(), "insufficient access") {
+		t.Fatalf("self-referential continuation must fail as unproven pagination: %+v", res)
 	}
 	if got := strings.Join(handler.cursors, ","); got != "stuck" {
 		t.Fatalf("run cursors = %q, want %q", got, "stuck")
 	}
-	cursor, _, _, err := db.GetSyncState("issues")
+	cursor, stamp, _, err := db.GetSyncState("issues")
 	if err != nil {
 		t.Fatalf("get sync state after self-referential capped run: %v", err)
 	}
-	if cursor != "" {
-		t.Fatalf("cursor after self-referential capped run = %q, want empty", cursor)
+	if cursor != "stuck" {
+		t.Fatalf("cursor after self-referential capped run = %q, want stuck", cursor)
+	}
+	var complete int
+	if err := db.DB().QueryRow("SELECT last_attempt_complete FROM sync_state WHERE resource_type='issues'").Scan(&complete); err != nil { t.Fatal(err) }
+	if complete != 0 || !stamp.Equal(watermark) {
+		t.Fatalf("self-referential continuation changed readiness: complete=%d stamp=%s watermark=%s", complete, stamp, watermark)
 	}
 }
 `
 	require.NoError(t, os.WriteFile(filepath.Join(outputDir, "internal", "cli", "graphql_sync_resume_cursor_test.go"), []byte(behaviorTest), 0o644))
-	runGoCommand(t, outputDir, "test", "./internal/cli", "-run", "^TestGraphQLSyncResource(PreservesCursorOnMaxPagesCap|ClearsCursorWhenCapEqualsFinalPage|ClearsSelfReferentialCursorOnMaxPagesCap)$")
+	runGoCommandRequired(t, outputDir, "test", "./internal/cli", "-run", "^TestGraphQLSyncResource(PreservesCursorOnMaxPagesCap|RetriesLossyPageBeforeCompletion|ClearsCursorWhenCapEqualsFinalPage|PreservesSelfReferentialCursorOnMaxPagesCap)$")
+	requireGeneratedCompiles(t, outputDir)
 
 	runGoCommand(t, outputDir, "mod", "tidy")
 	runGoCommand(t, outputDir, "build", "./...")
@@ -15255,10 +15710,13 @@ func TestGraphQLLatestOnlyCanContinueAfterBackwardPageWins(t *testing.T) {
 	selector := "^TestGraphQLLatestOnly(ChoosesBackwardPageForOldestFirst|KeepsForwardPageForNewestFirst|KeepsForwardPageWithoutTimestampEvidence|IgnoresDateLikeNonTimestampFields|ReadsNestedTimestampFields|CanContinueAfterBackwardPageWins)$"
 	listCmd := exec.Command("go", "test", "-mod=mod", "./internal/cli", "-list", selector)
 	listCmd.Dir = outputDir
-	cacheDir, err := goBuildCacheDir(outputDir)
-	require.NoError(t, err)
-	listCmd.Env = append(os.Environ(), "GOCACHE="+cacheDir)
-	listOut, err := listCmd.CombinedOutput()
+	var listOut []byte
+	err = withGoBuildCache(outputDir, func(cacheDir string) error {
+		listCmd.Env = append(os.Environ(), "GOCACHE="+cacheDir)
+		var runErr error
+		listOut, runErr = listCmd.CombinedOutput()
+		return runErr
+	})
 	require.NoError(t, err, string(listOut))
 	for _, name := range []string{
 		"TestGraphQLLatestOnlyChoosesBackwardPageForOldestFirst",
@@ -19380,7 +19838,9 @@ func TestGeneratePublicParamNamesAcrossCLISurfaces(t *testing.T) {
 	require.NoError(t, New(apiSpec, outputDir).Generate())
 
 	findSource := readGeneratedFile(t, outputDir, "internal", "cli", "stores_find.go")
-	assert.Contains(t, findSource, `public-params-pp-cli stores find --address example-value --city example-value`)
+	assert.NotContains(t, findSource, "example-value")
+	assert.NotContains(t, findSource, "Example:")
+	assert.NotContains(t, findSource, "pp:happy-args")
 	assert.Contains(t, findSource, `StringVar(&flagS, "address", "", "Street address")`)
 	assert.Contains(t, findSource, `StringVar(&flagS, "s", "", "Street address")`)
 	assert.Contains(t, findSource, `_ = cmd.Flags().MarkHidden("s")`)
@@ -19389,7 +19849,9 @@ func TestGeneratePublicParamNamesAcrossCLISurfaces(t *testing.T) {
 	assert.NotContains(t, findSource, `required flag "s" not set`)
 
 	createSource := readGeneratedFile(t, outputDir, "internal", "cli", "stores_create.go")
-	assert.Contains(t, createSource, `public-params-pp-cli stores create --store-code example-value`)
+	assert.NotContains(t, createSource, "example-value")
+	assert.NotContains(t, createSource, "Example:")
+	assert.NotContains(t, createSource, "pp:happy-args")
 	assert.Contains(t, createSource, `StringVar(&bodyStoreCode, "store-code", "", "Store code")`)
 	assert.Contains(t, createSource, `bodyMap["store_code"] = bodyStoreCode`)
 
@@ -19642,7 +20104,9 @@ func TestGeneratePublicParamNamesInPromotedExamples(t *testing.T) {
 	require.NoError(t, New(apiSpec, outputDir).Generate())
 
 	promotedSource := readGeneratedFile(t, outputDir, "internal", "cli", "promoted_checkout.go")
-	assert.Regexp(t, `Example:\s+"  promoted-public-params-pp-cli checkout --store-code example-value"`, promotedSource)
+	assert.NotContains(t, promotedSource, "example-value")
+	assert.NotContains(t, promotedSource, "Example:")
+	assert.NotContains(t, promotedSource, "pp:happy-args")
 }
 
 // TestGenerateMCPCodeOrchKeywordsHasStopwordFilter proves the keyword
@@ -21057,6 +21521,8 @@ func TestSearchTemplateEmitsEmptyJSONEnvelope(t *testing.T) {
 
 	assert.Contains(t, body, `!wantsHumanTable(cmd.OutOrStdout(), flags)`,
 		"search.go.tmpl must route explicit machine formats and default piped output through the envelope path even on no matches")
+	assert.NotContains(t, body, "selectErrorForDryRun",
+		"search is not a dry-run plan path; all-miss --select must still exit 2 even when the persistent --dry-run flag is set")
 
 	// Ordering pin: the machine/piped block must come before the human-mode
 	// "No results" stderr line. Reversing the order would skip the JSON

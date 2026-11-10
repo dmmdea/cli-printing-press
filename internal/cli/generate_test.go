@@ -101,6 +101,88 @@ func staleGeneratedCommand() {}
 	runGoCommandForCLITest(t, outputDir, "build", "./cmd/regenapp-pp-cli")
 }
 
+func TestGenerateCmdForceListsPreservedHookCommands(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	specPath := filepath.Join(dir, "spec.yaml")
+	outputDir := filepath.Join(dir, "hookregen")
+	require.NoError(t, os.WriteFile(specPath, []byte(`name: hookregen
+description: Hook regen API
+version: 0.1.0
+base_url: https://api.example.com
+auth:
+  type: none
+config:
+  format: toml
+  path: ~/.config/hookregen-pp-cli/config.toml
+resources:
+  items:
+    description: Manage items
+    endpoints:
+      list:
+        method: GET
+        path: /items
+        description: List items
+`), 0o644))
+
+	runGenerate := func() {
+		t.Helper()
+		cmd := newGenerateCmd()
+		cmd.SetArgs([]string{
+			"--spec", specPath,
+			"--output", outputDir,
+			"--validate=false",
+			"--force",
+		})
+		require.NoError(t, cmd.Execute())
+	}
+
+	runGenerate()
+
+	hookPath := filepath.Join(outputDir, "internal", "cli", "notes.go")
+	require.NoError(t, os.WriteFile(hookPath, []byte(`package cli
+
+import "github.com/spf13/cobra"
+
+func init() {
+	registerNovelCommand(func(root *cobra.Command, flags *rootFlags) {
+		root.AddCommand(&cobra.Command{Use: "notes", Short: "Operator notes"})
+	})
+}
+`), 0o644))
+
+	readmeBefore, err := os.ReadFile(filepath.Join(outputDir, "README.md"))
+	require.NoError(t, err)
+	assert.NotContains(t, string(readmeBefore), "hookregen-pp-cli notes")
+
+	runGenerate()
+
+	hookGot, err := os.ReadFile(hookPath)
+	require.NoError(t, err)
+	assert.Contains(t, string(hookGot), `Use: "notes"`)
+
+	readme, err := os.ReadFile(filepath.Join(outputDir, "README.md"))
+	require.NoError(t, err)
+	skill, err := os.ReadFile(filepath.Join(outputDir, "SKILL.md"))
+	require.NoError(t, err)
+	assert.Contains(t, string(readme), "hookregen-pp-cli notes")
+	assert.Contains(t, string(readme), "Operator notes")
+	assert.Contains(t, skillCommandReference(string(skill)), "hookregen-pp-cli notes")
+}
+
+func skillCommandReference(skill string) string {
+	const heading = "## Command Reference\n"
+	_, rest, found := strings.Cut(skill, heading)
+	if !found {
+		return ""
+	}
+	if before, _, ok := strings.Cut(rest, "\n## "); ok {
+		return before
+	}
+	return rest
+}
+
 func TestGenerateCmdForcePreservesDocumentedHandAuthoredFiles(t *testing.T) {
 	t.Parallel()
 
@@ -417,7 +499,7 @@ resources:
 
 	const modulePath = "github.com/mvanhorn/printing-press-library/library/sales-and-crm/tenderned"
 	require.NoError(t, os.MkdirAll(outputDir, 0o755))
-	require.NoError(t, os.WriteFile(filepath.Join(outputDir, "go.mod"), []byte("module "+modulePath+"\n\ngo 1.26.6\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(outputDir, "go.mod"), []byte("module "+modulePath+"\n\ngo 1.26.10\n"), 0o644))
 
 	cmd := newGenerateCmd()
 	cmd.SetArgs([]string{
@@ -772,11 +854,29 @@ func TestLoadResearchSourcesReturnsExplicitEmptyManifestNovelFeatures(t *testing
 		Auth: spec.AuthConfig{Type: "none"},
 	}, t.TempDir())
 
-	got := loadResearchSources(gen, researchDir)
+	got := loadResearchSources(gen, researchDir, mustLoadResearch(t, researchDir))
 	require.NotNil(t, got, "empty built list is an explicit fresh result, not unavailable metadata")
 	assert.Empty(t, got)
 	require.Len(t, gen.NovelFeatures, 1)
 	assert.Equal(t, "planned scan", gen.NovelFeatures[0].Command)
+}
+
+func TestLoadResearchSourcesRecordsURLLessAlternatives(t *testing.T) {
+	t.Parallel()
+
+	researchDir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(researchDir, "research.json"), []byte(`{
+  "api_name": "altless",
+  "alternatives": [{"name": "other-tool"}]
+}`), 0o644))
+
+	gen := generator.New(&spec.APISpec{
+		Name: "altless",
+		Auth: spec.AuthConfig{Type: "none"},
+	}, t.TempDir())
+	loadResearchSources(gen, researchDir, mustLoadResearch(t, researchDir))
+	assert.True(t, gen.ListedAlternatives)
+	assert.Empty(t, gen.Sources)
 }
 
 func TestLoadResearchSourcesScaffoldsCurrentNovelFeaturesNotBuilt(t *testing.T) {
@@ -806,7 +906,7 @@ func TestLoadResearchSourcesScaffoldsCurrentNovelFeaturesNotBuilt(t *testing.T) 
 		Auth: spec.AuthConfig{Type: "none"},
 	}, t.TempDir())
 
-	got := loadResearchSources(gen, researchDir)
+	got := loadResearchSources(gen, researchDir, mustLoadResearch(t, researchDir))
 	require.Len(t, gen.NovelFeatures, 1)
 	assert.Equal(t, "markets scan", gen.NovelFeatures[0].Command)
 	assert.Equal(t, "New scanner", gen.NovelFeatures[0].Name)
@@ -835,10 +935,139 @@ func TestLoadResearchSourcesFirstPrintWithoutBuiltList(t *testing.T) {
 		Auth: spec.AuthConfig{Type: "none"},
 	}, t.TempDir())
 
-	got := loadResearchSources(gen, researchDir)
+	got := loadResearchSources(gen, researchDir, mustLoadResearch(t, researchDir))
 	require.Len(t, gen.NovelFeatures, 1)
 	assert.Equal(t, "items insight", gen.NovelFeatures[0].Command)
 	assert.Nil(t, got)
+}
+
+func mustLoadResearch(t *testing.T, researchDir string) *pipeline.ResearchResult {
+	t.Helper()
+	research, err := pipeline.LoadResearch(researchDir)
+	require.NoError(t, err)
+	return research
+}
+
+func TestResearchMatchesSpec(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		researchAPI string
+		specNames   []string
+		want        bool
+	}{
+		{name: "empty api_name is unknown", researchAPI: "  ", specNames: []string{"stripe"}, want: true},
+		{name: "same slug", researchAPI: "stripe", specNames: []string{"stripe"}, want: true},
+		{name: "display name with noise word", researchAPI: "Stripe API", specNames: []string{"stripe"}, want: true},
+		{name: "display name punctuation", researchAPI: "Cal.com", specNames: []string{"cal-com"}, want: true},
+		{name: "unhyphenated slug", researchAPI: "calcom", specNames: []string{"cal-com"}, want: true},
+		{name: "any spec name matches", researchAPI: "Product Hunt", specNames: []string{"ph", "Product Hunt"}, want: true},
+		{name: "binary name", researchAPI: "stripe-pp-cli", specNames: []string{"stripe"}, want: true},
+		{name: "research slug shorter than title slug", researchAPI: "canvas", specNames: []string{"canvas-lms"}, want: true},
+		{name: "different api", researchAPI: "github", specNames: []string{"stripe", "Stripe"}, want: false},
+		{name: "same vendor different product", researchAPI: "google-drive", specNames: []string{"google-calendar"}, want: false},
+		{name: "blank spec names are skipped", researchAPI: "stripe", specNames: []string{"", " "}, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tt.want, researchMatchesSpec(tt.researchAPI, tt.specNames))
+		})
+	}
+}
+
+func TestGenerateCmdIgnoresResearchForDifferentAPI(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		researchAPI string
+		extraArgs   []string
+		applied     bool
+	}{
+		{name: "matching display name applies research", researchAPI: "Home App", applied: true},
+		{name: "--name rename keeps research for the parsed spec", researchAPI: "homeapp", extraArgs: []string{"--name", "payments"}, applied: true},
+		{name: "different api ignores research", researchAPI: "otherapp", applied: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			dir := t.TempDir()
+			specPath := filepath.Join(dir, "spec.yaml")
+			researchDir := filepath.Join(dir, "research")
+			outputDir := filepath.Join(dir, "homeapp")
+			require.NoError(t, os.MkdirAll(researchDir, 0o755))
+			require.NoError(t, os.WriteFile(specPath, []byte(`name: homeapp
+description: Home app API
+version: 0.1.0
+base_url: https://api.homeapp.com
+auth:
+  type: api_key
+  header: X-API-Key
+  env_vars:
+    - HOMEAPP_API_KEY
+config:
+  format: toml
+  path: ~/.config/homeapp-pp-cli/config.toml
+resources:
+  items:
+    description: Manage items
+    endpoints:
+      list:
+        method: GET
+        path: /items
+        description: List items
+`), 0o644))
+			built := []pipeline.NovelFeature{{Name: "Item insight", Command: "items insight", Description: "Summarize item state"}}
+			research, err := json.Marshal(pipeline.ResearchResult{
+				APIName:            tt.researchAPI,
+				Homepage:           "https://www.researched.example",
+				NovelFeatures:      built,
+				NovelFeaturesBuilt: &built,
+				Auth:               &pipeline.ResearchAuth{CanonicalEnvVar: "RESEARCHED_TOKEN"},
+				Narrative:          &pipeline.ReadmeNarrative{Headline: "Researched headline sentinel"},
+			})
+			require.NoError(t, err)
+			require.NoError(t, os.WriteFile(filepath.Join(researchDir, "research.json"), research, 0o644))
+
+			cmd := newGenerateCmd()
+			cmd.SetArgs(append([]string{
+				"--spec", specPath,
+				"--output", outputDir,
+				"--validate=false",
+				"--force",
+				"--research-dir", researchDir,
+			}, tt.extraArgs...))
+			require.NoError(t, cmd.Execute())
+
+			data, err := os.ReadFile(filepath.Join(outputDir, pipeline.CLIManifestFilename))
+			require.NoError(t, err)
+			var manifest pipeline.CLIManifest
+			require.NoError(t, json.Unmarshal(data, &manifest))
+			readme, err := os.ReadFile(filepath.Join(outputDir, "README.md"))
+			require.NoError(t, err)
+			config, err := os.ReadFile(filepath.Join(outputDir, "internal", "config", "config.go"))
+			require.NoError(t, err)
+			_, stubErr := os.Stat(filepath.Join(outputDir, "internal", "cli", "items_insight.go"))
+
+			if tt.applied {
+				assert.Equal(t, "https://www.researched.example", manifest.Homepage)
+				require.Len(t, manifest.NovelFeatures, 1)
+				assert.NoError(t, stubErr)
+				assert.Contains(t, string(readme), "Researched headline sentinel")
+				assert.Contains(t, string(config), "RESEARCHED_TOKEN")
+				return
+			}
+			assert.Empty(t, manifest.Homepage)
+			assert.Empty(t, manifest.NovelFeatures)
+			assert.ErrorIs(t, stubErr, os.ErrNotExist)
+			assert.NotContains(t, string(readme), "Researched headline sentinel")
+			assert.NotContains(t, string(config), "RESEARCHED_TOKEN")
+			assert.Contains(t, string(config), "HOMEAPP_API_KEY")
+		})
+	}
 }
 
 func TestGenerateCmdHelpDescribesForceAsGeneratedOverwrite(t *testing.T) {
@@ -1100,26 +1329,15 @@ func novelHelperFn() string { return "kept" }
 	novelPath := filepath.Join(outputDir, "internal", "cli", "novel_helper.go")
 	require.NoError(t, os.WriteFile(novelPath, novelBody, 0o644))
 
-	_, err = runGenerate(specB)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "pass --yes to confirm")
-	gotNovel, readErr := os.ReadFile(novelPath)
-	require.NoError(t, readErr)
-	assert.Equal(t, string(novelBody), string(gotNovel),
-		"refusing confirmation must restore the pre-force tree")
-	gotConfig, readErr := os.ReadFile(configPath)
-	require.NoError(t, readErr)
-	if replacedBearer {
-		assert.Contains(t, string(gotConfig), `"Token "`,
-			"refusing confirmation must keep the pre-force config edit")
-	}
-
-	stderr, err := runGenerate(specB, "--yes")
+	// Generated files carry the standard marker, so a spec rename is not a
+	// markerless hand-authored delete and does not ask for --yes.
+	// TestGenerateCmdForceConfirmsMarkerlessDelete covers that prompt.
+	stderr, err := runGenerate(specB)
 	require.NoError(t, err)
 
 	// Cross-spec: literal drift NOT preserved (NovelOnly skips
 	// TEMPLATED-VALUE-DRIFT).
-	gotConfig, err = os.ReadFile(configPath)
+	gotConfig, err := os.ReadFile(configPath)
 	require.NoError(t, err)
 	if replacedBearer {
 		assert.NotContains(t, string(gotConfig), `"Token "`,
@@ -1127,7 +1345,7 @@ func novelHelperFn() string { return "kept" }
 	}
 
 	// Novel file still preserved.
-	gotNovel, err = os.ReadFile(novelPath)
+	gotNovel, err := os.ReadFile(novelPath)
 	require.NoError(t, err)
 	assert.Contains(t, string(gotNovel), "novelHelperFn",
 		"novel hand-written file is spec-orthogonal and must survive cross-spec regen")
@@ -1444,6 +1662,69 @@ resources:
 	require.NoError(t, err)
 	assert.Contains(t, string(stub), `Use:         "insight"`)
 	assert.Contains(t, string(stub), `TODO: implement novel feature %q", "items insight"`)
+}
+
+func TestGenerateCmdWritesResearchHomepageToManifest(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		homepage string
+		want     string
+	}{
+		{name: "confirmed homepage is recorded", homepage: "https://www.homeapp.com", want: "https://www.homeapp.com"},
+		{name: "loopback homepage is dropped", homepage: "https://localhost:3000"},
+		{name: "no research homepage ignores spec website_url"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			dir := t.TempDir()
+			specPath := filepath.Join(dir, "spec.yaml")
+			researchDir := filepath.Join(dir, "research")
+			outputDir := filepath.Join(dir, "homeapp")
+			require.NoError(t, os.MkdirAll(researchDir, 0o755))
+			require.NoError(t, os.WriteFile(specPath, []byte(`name: homeapp
+description: Home app API
+version: 0.1.0
+base_url: https://api.homeapp.com
+website_url: https://docs.homeapp.com
+auth:
+  type: none
+config:
+  format: toml
+  path: ~/.config/homeapp-pp-cli/config.toml
+resources:
+  items:
+    description: Manage items
+    endpoints:
+      list:
+        method: GET
+        path: /items
+        description: List items
+`), 0o644))
+			research, err := json.Marshal(pipeline.ResearchResult{APIName: "homeapp", Homepage: tt.homepage})
+			require.NoError(t, err)
+			require.NoError(t, os.WriteFile(filepath.Join(researchDir, "research.json"), research, 0o644))
+
+			cmd := newGenerateCmd()
+			cmd.SetArgs([]string{
+				"--spec", specPath,
+				"--output", outputDir,
+				"--validate=false",
+				"--force",
+				"--research-dir", researchDir,
+			})
+			require.NoError(t, cmd.Execute())
+
+			data, err := os.ReadFile(filepath.Join(outputDir, pipeline.CLIManifestFilename))
+			require.NoError(t, err)
+			var manifest pipeline.CLIManifest
+			require.NoError(t, json.Unmarshal(data, &manifest))
+			assert.Equal(t, tt.want, manifest.Homepage)
+		})
+	}
 }
 
 func TestGenerateCmdForcePreservesImplementedNovelScaffoldAndStandaloneFiles(t *testing.T) {
@@ -1944,7 +2225,7 @@ resources:
 	clientGo, err := os.ReadFile(filepath.Join(outputDir, "internal", "client", "client.go"))
 	require.NoError(t, err)
 	assert.NotContains(t, string(clientGo), `req.Header.Set("User-Agent"`)
-	assert.Contains(t, string(clientGo), "return chromeClient(timeout, jar, skipTLSVerify)")
+	assert.Contains(t, string(clientGo), "return chromeClient(timeout, jar, resolved)")
 	assert.NotContains(t, string(clientGo), "github.com/enetx/")
 	// HAR distribution declares H/2 majority -> the ClientHello offers only
 	// h2 and no HTTP/3 transport is emitted. With an empty distribution the
@@ -2030,7 +2311,7 @@ resources:
 
 	clientGo, err := os.ReadFile(filepath.Join(outputDir, "internal", "client", "client.go"))
 	require.NoError(t, err)
-	assert.Contains(t, string(clientGo), "return chromeClient(timeout, jar, skipTLSVerify)")
+	assert.Contains(t, string(clientGo), "return chromeClient(timeout, jar, resolved)")
 	assert.NotContains(t, string(clientGo), "github.com/enetx/")
 	// HAR distribution declares H/2 majority -> the ClientHello offers only h2.
 	chromeGo, err := os.ReadFile(filepath.Join(outputDir, "internal", "client", "chrome.go"))
@@ -4645,7 +4926,8 @@ func TestGenerateCmdMCPFlagsOverrideOpenAPISurface(t *testing.T) {
 	codeOrchSource, err := os.ReadFile(filepath.Join(outputDir, "internal", "mcp", "code_orch.go"))
 	require.NoError(t, err)
 	assert.Contains(t, string(codeOrchSource), `mcplib.NewTool("mcp-flag_search"`)
-	assert.Contains(t, string(codeOrchSource), `mcplib.NewTool("mcp-flag_execute"`)
+	assert.Contains(t, string(codeOrchSource), `mcplib.NewTool("mcp-flag_read"`)
+	assert.NotContains(t, string(codeOrchSource), `mcplib.NewTool("mcp-flag_execute"`)
 }
 
 func openAPISpecWithEndpointCount(count int) string {
@@ -4942,7 +5224,7 @@ resources:
 	assert.FileExists(t, filepath.Join(outputDir, "README.md"))
 	clientGo, err := os.ReadFile(filepath.Join(outputDir, "internal", "client", "client.go"))
 	require.NoError(t, err)
-	assert.Contains(t, string(clientGo), "return chromeClient(timeout, jar, skipTLSVerify)")
+	assert.Contains(t, string(clientGo), "return chromeClient(timeout, jar, resolved)")
 	assert.NotContains(t, string(clientGo), "github.com/enetx/")
 }
 
@@ -5479,7 +5761,7 @@ func TestApplyResearchAuthMetadataRejectsUnsafeCanonicalEnvVars(t *testing.T) {
 			require.NoError(t, os.WriteFile(filepath.Join(researchDir, "research.json"), researchData, 0o644))
 
 			apiSpec := &spec.APISpec{Name: "test", Auth: tt.auth}
-			applyResearchAuthMetadata(apiSpec, researchDir)
+			applyResearchAuthMetadata(apiSpec, mustLoadResearch(t, researchDir))
 
 			assert.Equal(t, tt.wantEnvVars, apiSpec.Auth.EnvVars)
 			if tt.wantSpecName == "" {

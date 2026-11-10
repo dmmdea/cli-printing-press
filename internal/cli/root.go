@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -206,7 +207,7 @@ func newGenerateCmd() *cobra.Command {
 					return err
 				}
 
-				generateResult, err := runGenerateProject(parsed, absOut, generateProjectOptions{validate: validateBeforeForceMerge(validate, snapshotDir), polish: polish, researchDir: researchDir, trafficAnalysisPath: trafficAnalysisPath})
+				generateResult, err := runGenerateProject(parsed, absOut, generateProjectOptions{validate: validateBeforeForceMerge(validate, snapshotDir), polish: polish, researchDir: researchDir, trafficAnalysisPath: trafficAnalysisPath, preservedCLIDir: snapshotDir})
 				if err != nil {
 					return err
 				}
@@ -235,6 +236,7 @@ func newGenerateCmd() *cobra.Command {
 					RunID:         runID,
 					Spec:          parsed,
 					NovelFeatures: generateResult.NovelFeatures,
+					Homepage:      generateResult.Homepage,
 				}); err != nil {
 					fmt.Fprintf(os.Stderr, "warning: could not write manifest: %v\n", err)
 				}
@@ -438,6 +440,12 @@ func newGenerateCmd() *cobra.Command {
 
 				specs = append(specs, apiSpec)
 			}
+			// --name and the state.json slug rename the spec below; research
+			// written under the spec's own name must still match.
+			var parsedSpecNames []string
+			for _, s := range specs {
+				parsedSpecNames = append(parsedSpecNames, s.Name, s.EffectiveDisplayName())
+			}
 
 			var apiSpec *spec.APISpec
 			if len(specs) == 1 {
@@ -449,11 +457,19 @@ func newGenerateCmd() *cobra.Command {
 				// `canvas`), prefer the state.json slug so the generated
 				// cmd/<slug>-pp-cli matches what manifest/publish-validate look
 				// for. Explicit --name still wins.
+				renamed := false
 				if cliName != "" {
 					specmeta.RebaseAuthEnvPrefix(&apiSpec.Auth, apiSpec.Name, cliName)
 					apiSpec.Name = cliName
+					renamed = true
 				} else if researchName := pipeline.LoadAPINameFromResearchDir(researchDir); researchName != "" {
 					apiSpec.Name = researchName
+					renamed = true
+				}
+				if renamed {
+					// Parse fills a default config path from the spec name.
+					// --name and the research slug replace that name before render.
+					apiSpec.ApplyOmittedConfigDefaults()
 				}
 			} else {
 				if cliName == "" {
@@ -484,7 +500,7 @@ func newGenerateCmd() *cobra.Command {
 				return printDryRun(apiSpec, absOut, specFiles)
 			}
 
-			generateResult, err := runGenerateProject(apiSpec, absOut, generateProjectOptions{validate: validateBeforeForceMerge(validate, snapshotDir), polish: polish, researchDir: researchDir, trafficAnalysisPath: trafficAnalysisPath, specFiles: specFiles, rejectUnshippablePageContextTraffic: true})
+			generateResult, err := runGenerateProject(apiSpec, absOut, generateProjectOptions{validate: validateBeforeForceMerge(validate, snapshotDir), polish: polish, researchDir: researchDir, parsedSpecNames: parsedSpecNames, trafficAnalysisPath: trafficAnalysisPath, specFiles: specFiles, rejectUnshippablePageContextTraffic: true, preservedCLIDir: snapshotDir})
 			if err != nil {
 				return err
 			}
@@ -543,6 +559,7 @@ func newGenerateCmd() *cobra.Command {
 				Spec:            apiSpec,
 				AuthPreference:  openAPIParseAuthPref,
 				NovelFeatures:   generateResult.NovelFeatures,
+				Homepage:        generateResult.Homepage,
 			}); err != nil {
 				fmt.Fprintf(os.Stderr, "warning: could not write manifest: %v\n", err)
 			}
@@ -592,7 +609,7 @@ func newGenerateCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&polish, "polish", false, "Run LLM polish pass on generated CLI (requires claude or codex CLI)")
 	cmd.Flags().BoolVar(&asJSON, "json", false, "Output as JSON")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Parse spec and show what would be generated without writing files (remote specs are still fetched)")
-	cmd.Flags().StringVar(&specSource, "spec-source", "", "Spec provenance: official, community, sniffed/browser-sniffed, docs (affects generated client defaults like rate limiting)")
+	cmd.Flags().StringVar(&specSource, "spec-source", "", "Spec provenance: official, community, sniffed/browser-sniffed, docs (community and sniffed use a Chrome transport with HTTP/1.1 fallback unless --transport is set)")
 	cmd.Flags().StringVar(&category, "category", "", "Public-library category for generated CLI metadata")
 	cmd.Flags().StringVar(&clientPattern, "client-pattern", "", "HTTP client pattern: rest (default), proxy-envelope (wraps requests in POST envelope)")
 	cmd.Flags().StringVar(&httpTransport, "transport", "", "HTTP transport: standard, browser-http, browser-chrome, or browser-chrome-h3 (defaults based on spec provenance and reachability)")
@@ -644,25 +661,28 @@ type generateProjectOptions struct {
 	validate                            bool
 	polish                              bool
 	researchDir                         string
+	parsedSpecNames                     []string
 	trafficAnalysisPath                 string
 	specFiles                           []string
 	rejectUnshippablePageContextTraffic bool
+	preservedCLIDir                     string
 }
 
 type generateProjectResult struct {
 	NovelFeatures       []pipeline.NovelFeatureManifest
 	ManifestDescription string
 	DisplayName         string
+	Homepage            string
 	Polished            bool
 	Validate            func() error
 }
 
 func runGenerateProject(apiSpec *spec.APISpec, absOut string, opts generateProjectOptions) (generateProjectResult, error) {
-	if apiSpec != nil {
-		applyResearchAuthMetadata(apiSpec, opts.researchDir)
-	}
+	research := loadGenerateResearch(opts.researchDir, apiSpec, opts.parsedSpecNames)
+	applyResearchAuthMetadata(apiSpec, research)
 	gen := generator.New(apiSpec, absOut)
-	novelFeatures := loadResearchSources(gen, opts.researchDir)
+	gen.PreservedCLIDir = opts.preservedCLIDir
+	novelFeatures := loadResearchSources(gen, opts.researchDir, research)
 	trafficAnalysis, err := loadTrafficAnalysisForGenerate(opts.trafficAnalysisPath, opts.specFiles, apiSpec.SpecSource)
 	if err != nil {
 		return generateProjectResult{}, &ExitError{Code: ExitInputError, Err: err}
@@ -720,6 +740,7 @@ func runGenerateProject(apiSpec *spec.APISpec, absOut string, opts generateProje
 		NovelFeatures:       novelFeatures,
 		ManifestDescription: manifestDescription,
 		DisplayName:         gen.ManifestDisplayName(),
+		Homepage:            researchHomepage(research),
 		Polished:            runGeneratePolishPass(opts.polish, apiSpec.Name, absOut),
 		Validate:            validateGeneratedProject,
 	}, nil
@@ -3203,20 +3224,65 @@ func printPlanDryRun(planSpec *generator.PlanSpec, absOut, planFile string, comm
 	return enc.Encode(summary)
 }
 
+func loadGenerateResearch(researchDir string, apiSpec *spec.APISpec, parsedSpecNames []string) *pipeline.ResearchResult {
+	if strings.TrimSpace(researchDir) == "" {
+		return nil
+	}
+	research, err := pipeline.LoadResearch(researchDir)
+	if err != nil {
+		return nil
+	}
+	if apiSpec == nil {
+		return research
+	}
+	names := append([]string{apiSpec.Name, apiSpec.EffectiveDisplayName()}, parsedSpecNames...)
+	if !researchMatchesSpec(research.APIName, names) {
+		fmt.Fprintf(os.Stderr, "warning: %s is for api_name %q, not %q; ignoring it for this run\n",
+			filepath.Join(researchDir, "research.json"), research.APIName, apiSpec.Name)
+		return nil
+	}
+	return research
+}
+
+// Matching is deliberately lenient (hyphenation, token prefix): a false
+// mismatch silently drops correct research.
+func researchMatchesSpec(researchAPIName string, specNames []string) bool {
+	if strings.TrimSpace(researchAPIName) == "" {
+		return true
+	}
+	want := apiIdentityTokens(researchAPIName)
+	wantJoined := strings.Join(want, "")
+	for _, candidate := range specNames {
+		if strings.TrimSpace(candidate) == "" {
+			continue
+		}
+		got := apiIdentityTokens(candidate)
+		if wantJoined == strings.Join(got, "") || isTokenPrefix(want, got) || isTokenPrefix(got, want) {
+			return true
+		}
+	}
+	return false
+}
+
+func apiIdentityTokens(name string) []string {
+	return strings.Split(openapi.SpecNameSlug(naming.TrimCLISuffix(strings.TrimSpace(name))), "-")
+}
+
+func isTokenPrefix(prefix, tokens []string) bool {
+	return len(prefix) <= len(tokens) && slices.Equal(prefix, tokens[:len(prefix)])
+}
+
 // loadResearchSources populates the generator's Sources, DiscoveryPages, and
-// NovelFeatures from a pipeline research directory. Scaffolding always uses
-// novel_features: novel_features_built is a post-dogfood verification field,
-// not a generate input. The return value is the verified list in manifest
-// form (when present) so publish validation cannot be satisfied by
-// planned-but-unbuilt absorb ideas. Silently skips if researchDir is empty
-// or data is unavailable.
-func loadResearchSources(gen *generator.Generator, researchDir string) []pipeline.NovelFeatureManifest {
+// NovelFeatures. Scaffolding always uses novel_features: novel_features_built
+// is a post-dogfood verification field, not a generate input. The return
+// value is the verified list in manifest form (when present) so publish
+// validation cannot be satisfied by planned-but-unbuilt absorb ideas.
+func loadResearchSources(gen *generator.Generator, researchDir string, research *pipeline.ResearchResult) []pipeline.NovelFeatureManifest {
 	if researchDir == "" {
 		return nil
 	}
 	var manifestNovel []pipeline.NovelFeatureManifest
-	research, err := pipeline.LoadResearch(researchDir)
-	if err == nil {
+	if research != nil {
 		for _, s := range pipeline.SourcesForREADME(research) {
 			gen.Sources = append(gen.Sources, generator.ReadmeSource{
 				Name:     s.Name,
@@ -3225,6 +3291,9 @@ func loadResearchSources(gen *generator.Generator, researchDir string) []pipelin
 				Stars:    s.Stars,
 			})
 		}
+		// URL-less alternatives never become Sources, but they still falsify
+		// the "no other tool" claim.
+		gen.ListedAlternatives = len(research.Alternatives) > 0
 		// Reused research.json still carries the prior run's novel_features_built.
 		// Scaffold the current planned set so a reprint can drop/add/rename.
 		for _, nf := range research.NovelFeatures {
@@ -3295,12 +3364,19 @@ func translateNarrative(n *pipeline.ReadmeNarrative) *generator.ReadmeNarrative 
 	return out
 }
 
-func applyResearchAuthMetadata(apiSpec *spec.APISpec, researchDir string) {
-	if apiSpec == nil || strings.TrimSpace(researchDir) == "" {
-		return
+func researchHomepage(research *pipeline.ResearchResult) string {
+	if research == nil {
+		return ""
 	}
-	research, err := pipeline.LoadResearch(researchDir)
-	if err != nil {
+	homepage := pipeline.NormalizeHomepage(research.Homepage)
+	if homepage == "" && strings.TrimSpace(research.Homepage) != "" {
+		fmt.Fprintf(os.Stderr, "warning: research homepage %q is not a public https URL; leaving manifest homepage unset\n", research.Homepage)
+	}
+	return homepage
+}
+
+func applyResearchAuthMetadata(apiSpec *spec.APISpec, research *pipeline.ResearchResult) {
+	if apiSpec == nil || research == nil {
 		return
 	}
 	envVar := research.CanonicalAuthEnvVar()

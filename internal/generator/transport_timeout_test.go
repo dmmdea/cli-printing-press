@@ -38,7 +38,7 @@ func TestBrowserTransport_TimeoutReachesTransport(t *testing.T) {
 	require.NoError(t, New(apiSpec, outputDir).Generate())
 
 	clientSrc := readGeneratedFile(t, outputDir, "internal", "client", "client.go")
-	require.Contains(t, clientSrc, "return chromeClient(timeout, jar, skipTLSVerify)",
+	require.Contains(t, clientSrc, "return chromeClient(timeout, jar, resolved)",
 		"test fixture must trigger UsesBrowserHTTPTransport")
 	require.NotContains(t, clientSrc, "github.com/enetx/")
 
@@ -94,7 +94,7 @@ func TestBrowserTransport_DropsChromeImpersonationWhenTrafficAnalysisMarksUnsafe
 	require.NoError(t, gen.Generate())
 
 	src := readGeneratedFile(t, outputDir, "internal", "client", "client.go")
-	require.Contains(t, src, "return chromeClient(timeout, jar, skipTLSVerify)",
+	require.Contains(t, src, "return chromeClient(timeout, jar, resolved)",
 		"sniffed CLIs keep the Chrome TLS transport when impersonation is unsafe")
 	require.NotContains(t, src, "github.com/enetx/")
 	require.Contains(t, src, `req.Header.Set("User-Agent", "transport-content-negotiation-canary-pp-cli/0.1.0")`,
@@ -105,8 +105,8 @@ func TestBrowserTransport_DropsChromeImpersonationWhenTrafficAnalysisMarksUnsafe
 	chromeSrc := readGeneratedFile(t, outputDir, "internal", "client", "chrome.go")
 	require.NotContains(t, chromeSrc, "chromeHeaderTripper",
 		"content-type flip evidence must suppress the Chrome header overlay")
-	require.Contains(t, chromeSrc, `chromeALPN = []string{"h2"}`,
-		"the sniffed browser transport default should still force HTTP/2")
+	require.Contains(t, chromeSrc, `chromeALPN = []string{"h2", "http/1.1"}`,
+		"the sniffed browser transport default must fall back to HTTP/1.1")
 
 	runGoCommand(t, outputDir, "mod", "tidy")
 	runGoCommand(t, outputDir, "test", "./internal/client")

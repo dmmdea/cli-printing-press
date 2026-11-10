@@ -56,6 +56,8 @@ func TestParseStytch(t *testing.T) {
 	assert.Equal(t, "/users", list.Path)
 	assert.NotNil(t, list.Pagination)
 	assert.Equal(t, "cursor", list.Pagination.Type)
+	assert.Equal(t, "cursor", list.Pagination.CursorParam)
+	assert.Equal(t, "cursor", list.Pagination.NextCursorPath)
 
 	// Users create endpoint
 	create := users.Endpoints["create"]
@@ -219,6 +221,7 @@ resources:
 
 	list := s.Resources["contacts"].Endpoints["list"]
 	require.NotNil(t, list.Pagination)
+	assert.Equal(t, "after", list.Pagination.CursorParam)
 	assert.Equal(t, "paging.next.after", list.Pagination.NextCursorPath)
 	assert.Equal(t, "results", list.ResponsePath)
 }
@@ -290,6 +293,76 @@ func TestDispatchParamFalseSurvivesRoundTrip(t *testing.T) {
 	require.NoError(t, json.Unmarshal(jsonData, &jsonParam))
 	assert.False(t, jsonParam.DispatchParam)
 	assert.True(t, jsonParam.DispatchParamSet)
+}
+
+func TestEnumUnsatisfiableSurvivesArchiveRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	original := &APISpec{
+		Name:    "nullable-enum",
+		Version: "0.1.0",
+		BaseURL: "https://api.example.com",
+		Auth:    AuthConfig{Type: TierAuthTypeNone},
+		Resources: map[string]Resource{
+			"voices": {
+				Description: "Voices",
+				Endpoints: map[string]Endpoint{
+					"create": {
+						Method:      "POST",
+						Path:        "/voices",
+						Description: "Create a voice",
+						Body: []Param{
+							{Name: "disjoint", Type: "string", EnumUnsatisfiable: true},
+							{Name: "mode", Type: "string", Enum: []string{"a"}},
+							{
+								Name: "options",
+								Type: "object",
+								Fields: []Param{
+									{Name: "tone", Type: "string", EnumUnsatisfiable: true},
+									{Name: "note", Type: "string"},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	for _, format := range []string{"json", "yaml"} {
+		t.Run(format, func(t *testing.T) {
+			var data []byte
+			var err error
+			if format == "json" {
+				data, err = json.Marshal(original)
+			} else {
+				data, err = yaml.Marshal(original)
+			}
+			require.NoError(t, err)
+			encoded := string(data)
+			assert.Contains(t, encoded, "enum_unsatisfiable")
+			assert.Equal(t, 2, strings.Count(encoded, "enum_unsatisfiable"),
+				"only the disjoint fields should be archived; a false marker must stay omitted")
+
+			parsed, err := ParseBytes(data)
+			require.NoError(t, err)
+			body := map[string]Param{}
+			for _, param := range parsed.Resources["voices"].Endpoints["create"].Body {
+				body[param.Name] = param
+			}
+			assert.True(t, body["disjoint"].EnumUnsatisfiable)
+			assert.Empty(t, body["disjoint"].Enum)
+			assert.False(t, body["mode"].EnumUnsatisfiable)
+			assert.Equal(t, []string{"a"}, body["mode"].Enum)
+
+			fields := map[string]Param{}
+			for _, field := range body["options"].Fields {
+				fields[field.Name] = field
+			}
+			assert.True(t, fields["tone"].EnumUnsatisfiable)
+			assert.False(t, fields["note"].EnumUnsatisfiable)
+		})
+	}
 }
 
 func TestUnannotatedDispatchParamSurvivesRoundTrip(t *testing.T) {
@@ -3802,6 +3875,16 @@ func TestCacheShareValidation(t *testing.T) {
 			wantErr: "appears more than once",
 		},
 		{
+			name:    "share default_repo relative path rejected",
+			share:   ShareConfig{Enabled: true, SnapshotTables: []string{"items"}, DefaultRepo: "./snapshots.git"},
+			wantErr: "share.default_repo \"./snapshots.git\" is a relative path",
+		},
+		{
+			name:    "share default_repo bare relative path rejected",
+			share:   ShareConfig{Enabled: true, SnapshotTables: []string{"items"}, DefaultRepo: "team/snapshots.git"},
+			wantErr: "is a relative path",
+		},
+		{
 			name:    "cache stale_after invalid duration",
 			cache:   CacheConfig{Enabled: true, StaleAfter: "yesterday"},
 			wantErr: "not a valid Go duration",
@@ -3879,6 +3962,22 @@ func TestCacheShareAcceptsValidShapes(t *testing.T) {
 		{
 			name:  "share only, no cache",
 			share: ShareConfig{Enabled: true, SnapshotTables: []string{"items", "teams", "sync_state"}},
+		},
+		{
+			name:  "share default_repo URL",
+			share: ShareConfig{Enabled: true, SnapshotTables: []string{"items"}, DefaultRepo: "https://example.invalid/acme/snapshots.git"},
+		},
+		{
+			name:  "share default_repo scp-style",
+			share: ShareConfig{Enabled: true, SnapshotTables: []string{"items"}, DefaultRepo: "git@github.com:acme/snapshots.git"},
+		},
+		{
+			name:  "share default_repo absolute Unix path",
+			share: ShareConfig{Enabled: true, SnapshotTables: []string{"items"}, DefaultRepo: "/srv/git/snapshots.git"},
+		},
+		{
+			name:  "share default_repo absolute Windows path",
+			share: ShareConfig{Enabled: true, SnapshotTables: []string{"items"}, DefaultRepo: `C:\git\snapshots.git`},
 		},
 		{
 			name:  "cache and share both enabled",
@@ -4764,7 +4863,9 @@ func TestHTTPTransportValidationAndDefaults(t *testing.T) {
 
 	sniffed := base
 	sniffed.SpecSource = "sniffed"
-	assert.Equal(t, HTTPTransportBrowserChromeH2, sniffed.EffectiveHTTPTransport())
+	assert.Equal(t, HTTPTransportBrowserChrome, sniffed.EffectiveHTTPTransport())
+	assert.True(t, sniffed.UsesBrowserHTTPTransport())
+	assert.False(t, sniffed.UsesBrowserHTTP2Transport())
 	require.NoError(t, sniffed.Validate())
 
 	browserHTTP := base
@@ -4777,7 +4878,14 @@ func TestHTTPTransportValidationAndDefaults(t *testing.T) {
 
 	community := base
 	community.SpecSource = "community"
-	assert.Equal(t, HTTPTransportBrowserChromeH2, community.EffectiveHTTPTransport())
+	assert.Equal(t, HTTPTransportBrowserChrome, community.EffectiveHTTPTransport())
+	assert.True(t, community.UsesBrowserHTTPTransport())
+	assert.False(t, community.UsesBrowserHTTP2Transport())
+
+	communityH2 := community
+	communityH2.HTTPTransport = HTTPTransportBrowserChromeH2
+	assert.Equal(t, HTTPTransportBrowserChromeH2, communityH2.EffectiveHTTPTransport())
+	assert.True(t, communityH2.UsesBrowserHTTP2Transport())
 
 	browserChrome := base
 	browserChrome.HTTPTransport = HTTPTransportBrowserChrome

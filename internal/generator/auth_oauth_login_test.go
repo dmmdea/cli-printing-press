@@ -1,11 +1,14 @@
 package generator
 
 import (
+	"context"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mvanhorn/cli-printing-press/v4/internal/spec"
 	"github.com/stretchr/testify/require"
@@ -38,10 +41,11 @@ func TestOAuthLoginTopLevelCommandAndCredentialFallback(t *testing.T) {
 	authSrc, err := os.ReadFile(filepath.Join(outputDir, "internal", "cli", "auth.go"))
 	require.NoError(t, err)
 	auth := string(authSrc)
+	require.Contains(t, auth, "return nil, authTransportErr(err)")
 	require.Contains(t, auth, "func runOAuthLogin(")
 	require.Contains(t, auth, "clientIDFromFlag := clientID != \"\"")
 	require.Contains(t, auth, "clientSecretFromFlag := clientSecret != \"\"")
-	require.Contains(t, auth, "return runOAuthLogin(cmd, flags, clientID, clientSecret, port, clientIDFromFlag, clientSecretFromFlag)")
+	require.Contains(t, auth, "return runOAuthLogin(cmd, flags, clientID, clientSecret, port, scopeOverride, clientIDFromFlag, clientSecretFromFlag)")
 	require.Contains(t, auth, "cfg.MarkCredentialsExplicit(clientIDFromFlag, clientSecretFromFlag)")
 	require.Contains(t, auth, "clientID = cfg.ClientID")
 	require.Contains(t, auth, "clientSecret = cfg.ClientSecret")
@@ -69,13 +73,36 @@ func TestOAuthLoginTopLevelCommandAndCredentialFallback(t *testing.T) {
 	require.Error(t, err, "top-level login --no-input should fail when no credentials are available")
 	require.Contains(t, string(noInputOut), "OAUTH_LOGIN_PROMPTS_CLIENT_ID")
 
-	dryRunOut, err := exec.Command(binPath, "--config", configPath, "--no-input", "--dry-run", "login").CombinedOutput()
-	require.NoError(t, err, "top-level login --dry-run should not require credentials: %s", string(dryRunOut))
-	require.JSONEq(t, `{"status":"dry_run","action":"auth login","would":"start OAuth2 authorization-code flow (PKCE without client secret), open browser, capture loopback callback"}`, string(dryRunOut))
+	dryRunCtx, dryRunCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer dryRunCancel()
+	dryRun := exec.CommandContext(dryRunCtx, binPath, "--config", configPath, "--no-input", "--dry-run", "login")
+	dryRun.Env = harnessFreeEnv()
+	dryRunOut, err := dryRun.CombinedOutput()
+	require.Error(t, err, "top-level login --dry-run should require credentials the same way as a real login: %s", string(dryRunOut))
+	require.Contains(t, string(dryRunOut), "OAUTH_LOGIN_PROMPTS_CLIENT_ID")
+
+	const credentialFreeDryRun = `{"status":"dry_run","action":"auth login","would":"start OAuth2 authorization-code flow (PKCE without client secret), open browser, capture loopback callback"}`
+	for _, harness := range []string{"PRINTING_PRESS_VERIFY=1", "PRINTING_PRESS_DOGFOOD=1"} {
+		probe := exec.Command(binPath, "--config", configPath, "--no-input", "--dry-run", "login")
+		probe.Env = append(harnessFreeEnv(), harness)
+		probeOut, probeErr := probe.CombinedOutput()
+		require.NoError(t, probeErr, "%s login --dry-run should stay credential-free: %s", harness, string(probeOut))
+		require.JSONEq(t, credentialFreeDryRun, string(probeOut))
+	}
 
 	require.NoError(t, os.WriteFile(configPath, []byte("client_id = \"saved-id\"\n"), 0o600))
+	userDryCtx, userDryCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer userDryCancel()
+	userDry := exec.CommandContext(userDryCtx, binPath, "--config", configPath, "--no-input", "--dry-run", "login")
+	userDry.Env = harnessFreeEnv()
+	userDryOut, err := userDry.CombinedOutput()
+	require.NoError(t, err, "login --dry-run with a client ID should print the authorize URL: %s", string(userDryOut))
+	require.Contains(t, string(userDryOut), "would launch: https://accounts.example.com/oauth/authorize?")
+	require.Contains(t, string(userDryOut), "client_id=saved-id")
+	require.NotContains(t, string(userDryOut), "Opening browser")
+
 	configuredProbe := exec.Command(binPath, "--config", configPath, "--no-input", "--dry-run", "login")
-	configuredProbe.Env = append(os.Environ(), "PRINTING_PRESS_VERIFY=1")
+	configuredProbe.Env = append(harnessFreeEnv(), "PRINTING_PRESS_VERIFY=1")
 	configuredProbeOut, err := configuredProbe.CombinedOutput()
 	require.NoError(t, err, "configured OAuth login probe failed: %s", string(configuredProbeOut))
 	require.Contains(t, string(configuredProbeOut), "would launch: https://accounts.example.com/oauth/authorize?")
@@ -352,4 +379,123 @@ func TestOAuthLoginTopLevelCommandForBearerTokenAuthCodeSpec(t *testing.T) {
 	doctorSrc, err := os.ReadFile(filepath.Join(outputDir, "internal", "cli", "doctor.go"))
 	require.NoError(t, err)
 	require.Contains(t, string(doctorSrc), `report["auth_hint"] = "bearer-auth-code-login-pp-cli login"`)
+}
+
+func TestOAuthLoginScopeOverride(t *testing.T) {
+	t.Parallel()
+
+	apiSpec := minimalSpec("oauth-scopes")
+	apiSpec.Auth = spec.AuthConfig{
+		Type:                  "oauth2",
+		Header:                "Authorization",
+		Format:                "Bearer {token}",
+		OAuth2Grant:           spec.OAuth2GrantAuthorizationCode,
+		AuthorizationURL:      "https://accounts.example.com/oauth/authorize",
+		TokenURL:              "https://accounts.example.com/oauth/token",
+		Scopes:                []string{"a:read", "b:write"},
+		RefreshTokenMechanism: "scope:offline_access",
+	}
+
+	outputDir := filepath.Join(t.TempDir(), "oauth-scopes-pp-cli")
+	require.NoError(t, New(apiSpec, outputDir).Generate())
+	binPath := filepath.Join(outputDir, "oauth-scopes-pp-cli")
+	runGoCommand(t, outputDir, "build", "-o", binPath, "./cmd/oauth-scopes-pp-cli")
+	configPath := filepath.Join(t.TempDir(), "config.toml")
+
+	scopeFor := func(env string, args ...string) string {
+		t.Helper()
+		cmd := exec.Command(binPath, append([]string{"--config", configPath, "--no-input", "--dry-run", "login", "--client-id", "x"}, args...)...)
+		// Always set, so a developer's exported value can't leak into the default case.
+		cmd.Env = append(harnessFreeEnv(), "OAUTH_SCOPES_SCOPES="+env)
+		out, err := cmd.CombinedOutput()
+		require.NoError(t, err, string(out))
+		_, rawURL, ok := strings.Cut(strings.TrimSpace(string(out)), "would launch: ")
+		require.True(t, ok, string(out))
+		u, err := url.Parse(rawURL)
+		require.NoError(t, err)
+		return u.Query().Get("scope")
+	}
+
+	require.Equal(t, "a:read b:write offline_access", scopeFor(""))
+	require.Equal(t, "c:read offline_access", scopeFor("", "--scopes", "c:read"))
+	require.Equal(t, "c:read d:read offline_access", scopeFor("c:read, d:read"))
+	require.Equal(t, "e:read offline_access", scopeFor("c:read", "--scopes", "e:read"))
+	require.Equal(t, "offline_access e:read", scopeFor("", "--scopes", "offline_access,e:read"))
+}
+
+func TestDeviceCodeLoginScopeOverride(t *testing.T) {
+	t.Parallel()
+
+	apiSpec := minimalSpec("device-scopes")
+	apiSpec.Auth = spec.AuthConfig{
+		Type:                   "oauth2",
+		Header:                 "Authorization",
+		Format:                 "Bearer {token}",
+		OAuth2Grant:            spec.OAuth2GrantDeviceCode,
+		DeviceAuthorizationURL: "https://login.example.com/device",
+		TokenURL:               "https://login.example.com/token",
+		Scopes:                 []string{"a.read", "b.read"},
+		DefaultClientID:        "public-client-id",
+	}
+
+	outputDir := filepath.Join(t.TempDir(), "device-scopes-pp-cli")
+	require.NoError(t, New(apiSpec, outputDir).Generate())
+
+	const runtimeTest = `package cli
+
+import (
+	"bytes"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+func TestDeviceCodeLoginSendsSelectedScopes(t *testing.T) {
+	t.Setenv("PRINTING_PRESS_VERIFY", "")
+	var gotScope string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			t.Fatalf("ParseForm() error = %v", err)
+		}
+		gotScope = r.Form.Get("scope")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, ` + "`" + `{"device_code":"dc","user_code":"UC","verification_uri":"https://example.com/activate"}` + "`" + `)
+	}))
+	defer server.Close()
+
+	scopeFor := func(env string, args ...string) string {
+		t.Helper()
+		configPath := filepath.Join(t.TempDir(), "config.toml")
+		if err := os.WriteFile(configPath, []byte("device_authorization_url = \""+server.URL+"\"\n"), 0o600); err != nil {
+			t.Fatalf("writing config: %v", err)
+		}
+		t.Setenv("DEVICE_SCOPES_OAUTH_SCOPE", env)
+		gotScope = ""
+		root := RootCmd()
+		var out bytes.Buffer
+		root.SetOut(&out)
+		root.SetErr(&out)
+		root.SetArgs(append([]string{"--config", configPath, "auth", "login", "--poll=false"}, args...))
+		if err := root.Execute(); err != nil {
+			t.Fatalf("auth login error = %v; output:\n%s", err, out.String())
+		}
+		return gotScope
+	}
+
+	if got := scopeFor(""); got != "a.read b.read" {
+		t.Fatalf("default scope = %q", got)
+	}
+	if got := scopeFor("c.read d.read"); got != "c.read d.read" {
+		t.Fatalf("env scope = %q", got)
+	}
+	if got := scopeFor("c.read", "--scopes", "e.read,f.read"); got != "e.read f.read" {
+		t.Fatalf("flag scope = %q", got)
+	}
+}
+`
+	require.NoError(t, os.WriteFile(filepath.Join(outputDir, "internal", "cli", "device_scopes_test.go"), []byte(runtimeTest), 0o644))
+	runGoCommand(t, outputDir, "test", "./internal/cli", "-run", "TestDeviceCodeLoginSendsSelectedScopes")
 }

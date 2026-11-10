@@ -32,7 +32,9 @@ func TestGeneratedClientStreamingTimeoutCarveOut(t *testing.T) {
 		"streaming client must keep a header-stall bound")
 	assert.Contains(t, client, "if binaryResponse && !c.timeoutExplicit {",
 		"doInternal must swap to the streaming client only for unmarked binary transfers")
-	assert.Contains(t, client, "httpClient = StreamingHTTPClient(c.HTTPClient, c.ConfiguredTimeout())",
+	assert.Contains(t, client, "streamIdle = c.ConfiguredTimeout()",
+		"binary transfers must reuse the configured --timeout as the header and body idle bound")
+	assert.Contains(t, client, "httpClient = StreamingHTTPClient(c.HTTPClient, streamIdle)",
 		"binary transfers must reuse the configured --timeout as the header-stall bound")
 	assert.Contains(t, client, "&http.Client{Timeout: timeout, Jar: jar, Transport: tr}",
 		"ordinary JSON clients must keep the whole-call Timeout")
@@ -43,14 +45,14 @@ func TestGeneratedClientStreamingTimeoutCarveOut(t *testing.T) {
 
 	assert.Contains(t, root, `rootCmd.PersistentFlags().DurationVar(&flags.timeout, "timeout", 60*time.Second, "Request timeout")`,
 		"root --timeout default must stay 60s for JSON calls")
-	assert.Contains(t, root, "func timeoutExplicitFrom(cmd *cobra.Command, profile *Profile) bool",
-		"root must treat Flag.Changed and profile-supplied timeout as explicit")
-	assert.Contains(t, root, `if _, ok := profile.Values["timeout"]; ok {`,
-		"profile-supplied timeout must keep whole-call enforcement on binary transfers")
-	assert.Contains(t, root, "flags.timeoutExplicit = timeoutExplicitFrom(cmd, appliedProfile)",
-		"PreRun must honor profile timeout even though ApplyProfileToFlags leaves Flag.Changed false")
-	assert.Contains(t, root, "appliedProfile = profile",
-		"the applied run profile must stay in scope for timeout explicitness")
+	assert.Contains(t, root, "func timeoutExplicitFrom(cmd *cobra.Command) bool",
+		"root must treat Flag.Changed timeout as explicit, including a profile value applied via FlagSet.Set")
+	assert.NotContains(t, root, `profile.Values["timeout"]`,
+		"profile timeout is Changed after FlagSet.Set, so the explicit check must not re-read the profile map")
+	assert.Contains(t, root, "flags.timeoutExplicit = timeoutExplicitFrom(cmd)",
+		"PreRun must honor a Changed timeout, including one applied from a profile")
+	assert.NotContains(t, root, "appliedProfile",
+		"timeout explicitness must not keep a separate profile pointer")
 	assert.Contains(t, root, "c.SetTimeoutExplicit(true)",
 		"newClient must mark an explicit --timeout so binary transfers still honor it")
 	assert.NotContains(t, client, "timeoutExplicit is true when the operator set --timeout",
@@ -113,14 +115,24 @@ func flushThenPause(w http.ResponseWriter, delay time.Duration) {
 }
 
 func TestBinaryResponseIgnoresDefaultClientTimeout(t *testing.T) {
-	const clientTimeout = 150 * time.Millisecond
-	const bodyDelay = 400 * time.Millisecond
+	const clientTimeout = 500 * time.Millisecond
+	const tick = 20 * time.Millisecond
+	const ticks = 30
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/octet-stream")
-		_, _ = w.Write([]byte{0x00})
-		flushThenPause(w, bodyDelay)
-		_, _ = w.Write([]byte{0x01, 0x02, 0x03})
+		flusher, _ := w.(http.Flusher)
+		for i := 0; i < ticks; i++ {
+			if _, err := w.Write([]byte{byte(i)}); err != nil {
+				return
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+			if i+1 < ticks {
+				time.Sleep(tick)
+			}
+		}
 	}))
 	defer server.Close()
 
@@ -131,8 +143,8 @@ func TestBinaryResponseIgnoresDefaultClientTimeout(t *testing.T) {
 	if _, err := c.GetWithHeaders(context.Background(), "/blob", nil, map[string]string{BinaryResponseHeader: "true"}); err != nil {
 		t.Fatalf("binary transfer died under the default whole-client timeout: %v", err)
 	}
-	if elapsed := time.Since(start); elapsed < bodyDelay {
-		t.Fatalf("binary transfer returned too quickly (%s), want at least %s of streamed body", elapsed, bodyDelay)
+	if elapsed := time.Since(start); elapsed < clientTimeout {
+		t.Fatalf("binary transfer returned too quickly (%s), want at least %s of streamed body", elapsed, clientTimeout)
 	}
 }
 
@@ -212,7 +224,7 @@ func TestTimeoutExplicitFromDefaultIsNotExplicit(t *testing.T) {
 	if err := cmd.ParseFlags(nil); err != nil {
 		t.Fatalf("ParseFlags: %v", err)
 	}
-	if timeoutExplicitFrom(cmd, nil) {
+	if timeoutExplicitFrom(cmd) {
 		t.Fatal("default timeout must not count as explicit")
 	}
 }
@@ -224,10 +236,16 @@ func TestTimeoutExplicitFromHonorsProfileTimeout(t *testing.T) {
 	if err := cmd.ParseFlags(nil); err != nil {
 		t.Fatalf("ParseFlags: %v", err)
 	}
-	if cmd.Flags().Changed("timeout") {
-		t.Fatal("sanity: profile overlay must be tested without Flag.Changed")
+	if err := ApplyProfileToFlags(cmd, &Profile{Values: map[string]string{"timeout": "5s"}}); err != nil {
+		t.Fatalf("ApplyProfileToFlags: %v", err)
 	}
-	if !timeoutExplicitFrom(cmd, &Profile{Values: map[string]string{"timeout": "5s"}}) {
+	if !cmd.Flags().Changed("timeout") {
+		t.Fatal("profile timeout must mark the flag changed")
+	}
+	if timeout != 5*time.Second {
+		t.Fatalf("timeout = %s, want 5s", timeout)
+	}
+	if !timeoutExplicitFrom(cmd) {
 		t.Fatal("profile-supplied timeout must keep whole-call enforcement")
 	}
 }
@@ -239,7 +257,7 @@ func TestTimeoutExplicitFromHonorsChangedFlag(t *testing.T) {
 	if err := cmd.ParseFlags([]string{"--timeout", "5s"}); err != nil {
 		t.Fatalf("ParseFlags: %v", err)
 	}
-	if !timeoutExplicitFrom(cmd, nil) {
+	if !timeoutExplicitFrom(cmd) {
 		t.Fatal("Flag.Changed --timeout must keep whole-call enforcement")
 	}
 }

@@ -24,6 +24,7 @@ import (
 	"golang.org/x/net/publicsuffix"
 	"gopkg.in/yaml.v3"
 
+	"github.com/mvanhorn/cli-printing-press/v4/internal/artifacts"
 	"github.com/mvanhorn/cli-printing-press/v4/internal/browsersniff"
 	openapiparser "github.com/mvanhorn/cli-printing-press/v4/internal/openapi"
 	apispec "github.com/mvanhorn/cli-printing-press/v4/internal/spec"
@@ -68,12 +69,18 @@ var (
 )
 
 var bareHostFileExt = map[string]bool{
-	"css": true, "csv": true, "gif": true, "go": true, "html": true, "jpeg": true,
-	"jpg": true, "js": true, "json": true, "lock": true, "m3u8": true, "m4s": true,
-	"md": true, "mod": true, "mp3": true, "mp4": true, "mpd": true, "pdf": true,
-	"png": true, "proto": true, "sum": true, "svg": true, "toml": true, "ts": true,
-	"tsv": true, "txt": true, "wav": true, "webp": true, "xml": true, "yaml": true,
-	"yml": true,
+	"css": true, "csv": true, "db": true, "gif": true, "go": true, "html": true, "jpeg": true,
+	"jpg": true, "js": true, "json": true, "jsonl": true, "lock": true, "log": true,
+	"m3u8": true, "m4s": true, "md": true, "mod": true, "mp3": true, "mp4": true,
+	"mpd": true, "pdf": true, "png": true, "proto": true, "sum": true, "svg": true,
+	"toml": true, "ts": true, "tsv": true, "txt": true, "wav": true, "webp": true,
+	"xml": true, "yaml": true, "yml": true,
+}
+
+// specialUseHostTLD lists registry-reserved labels the public suffix list does
+// not mark as ICANN. Documentation hosts such as api.vendor.example still count.
+var specialUseHostTLD = map[string]bool{
+	"example": true, "invalid": true, "localhost": true, "test": true,
 }
 
 var documentedURLListNames = map[string]bool{
@@ -139,7 +146,7 @@ func unverifiedNovelHosts(in NovelHostInput) []ReimplementationFinding {
 	seen := map[string]bool{}
 	dnsErr := map[string]error{}
 	for _, decl := range declared {
-		if _, ok := observed[decl.host]; !ok {
+		if !novelHostObserved(decl.host, observed) {
 			key := decl.feature + "\x00" + decl.file + "\x00" + strconv.Itoa(decl.line) + "\x00" + decl.host
 			if !seen[key] {
 				seen[key] = true
@@ -245,7 +252,6 @@ func hostsInNovelCommandSources(cliDir string, features []NovelFeature) []novelH
 	}
 	var declared []novelHostDecl
 	contents := make(map[string]string, len(entries))
-	var sources []novelSourceFile
 	for _, entry := range entries {
 		name := entry.Name()
 		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
@@ -255,13 +261,21 @@ func hostsInNovelCommandSources(cliDir string, features []NovelFeature) []novelH
 		if err != nil {
 			continue
 		}
-		content := string(data)
-		contents[name] = content
+		contents[name] = string(data)
+	}
+	names := make([]string, 0, len(contents))
+	for name := range contents {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	var sources []novelSourceFile
+	for _, name := range names {
+		content := contents[name]
 		if !novelCommandSource(content, name, leaves) {
 			continue
 		}
 		label := novelSourceFeature(content, leaves)
-		declared = append(declared, hostsInGoSource(name, content, label)...)
+		declared = append(declared, hostsInGoPackage(name, content, label, contents)...)
 		sources = append(sources, novelSourceFile{name: name, content: content, label: label})
 	}
 	declared = append(declared, hostsFromNovelHelpers(cliDir, cliFilesDir, contents, sources, leaves)...)
@@ -299,30 +313,78 @@ func novelSourceFeature(content string, leaves map[string]string) string {
 }
 
 func hostsInGoSource(filename, content, feature string) []novelHostDecl {
+	return hostsInGoPackage(filename, content, feature, nil)
+}
+
+func hostsInGoPackage(filename, content, feature string, pkg map[string]string) []novelHostDecl {
 	fset := token.NewFileSet()
 	file, err := parser.ParseFile(fset, filename, content, parser.SkipObjectResolution)
 	if err != nil {
 		return nil
 	}
-	return hostsInAST(fset, filename, file, feature)
+	var siblings []*ast.File
+	for name, src := range pkg {
+		if name == filename || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		// Own FileSet: token positions are not unique across files.
+		sib, err := parser.ParseFile(token.NewFileSet(), name, src, parser.SkipObjectResolution)
+		if err != nil {
+			continue
+		}
+		siblings = append(siblings, sib)
+	}
+	return hostsInAST(fset, filename, file, feature, vocabularyAffixLiterals(file, siblings))
 }
 
-func hostsInAST(fset *token.FileSet, filename string, node ast.Node, feature string) []novelHostDecl {
+func hostsInAST(fset *token.FileSet, filename string, node ast.Node, feature string, affixLits map[token.Pos]struct{}) []novelHostDecl {
 	if node == nil {
 		return nil
 	}
+	helpSpans := cobraHelpStringSpans(node)
+	var annotationSpans []tokenSpan
+	ast.Inspect(node, func(n ast.Node) bool {
+		if lit, ok := n.(*ast.CompositeLit); ok && isCobraCommandLiteral(lit) {
+			for _, elt := range lit.Elts {
+				if field, ok := elt.(*ast.KeyValueExpr); ok {
+					if key, ok := field.Key.(*ast.Ident); ok && key.Name == "Annotations" {
+						annotationSpans = append(annotationSpans, annotationStringSpans(field.Value)...)
+					}
+				}
+			}
+		}
+		if assign, ok := n.(*ast.AssignStmt); ok {
+			for i, lhs := range assign.Lhs {
+				if i >= len(assign.Rhs) {
+					continue
+				}
+				_, _, index := annotationIndex(lhs)
+				_, _, wholeMap := annotationMapAssignment(lhs, assign.Rhs[i])
+				if index || wholeMap {
+					annotationSpans = append(annotationSpans, annotationStringSpans(assign.Rhs[i])...)
+				}
+			}
+		}
+		return true
+	})
 	var declared []novelHostDecl
 	ast.Inspect(node, func(n ast.Node) bool {
 		lit, ok := n.(*ast.BasicLit)
-		if !ok || lit.Kind != token.STRING {
+		if !ok || lit.Kind != token.STRING || tokenPosInSpans(lit.Pos(), annotationSpans) {
 			return true
 		}
 		val, unquoteErr := strconv.Unquote(lit.Value)
 		if unquoteErr != nil {
 			return true
 		}
+		if _, ok := affixLits[lit.Pos()]; ok && vocabularyNamespaceLiteral(val) {
+			return true
+		}
 		line := fset.Position(lit.Pos()).Line
 		for _, host := range hostsInLiteral(val) {
+			if tokenPosInSpans(lit.Pos(), helpSpans) && artifacts.IsRFCReservedDomain(host) {
+				continue
+			}
 			declared = append(declared, novelHostDecl{
 				feature: feature,
 				file:    filename,
@@ -333,6 +395,265 @@ func hostsInAST(fset *token.FileSet, filename string, node ast.Node, feature str
 		return true
 	})
 	return declared
+}
+
+func annotationStringSpans(expr ast.Expr) []tokenSpan {
+	switch expr := expr.(type) {
+	case *ast.BasicLit:
+		if expr.Kind == token.STRING {
+			return []tokenSpan{{start: expr.Pos(), end: expr.End()}}
+		}
+	case *ast.ParenExpr:
+		return annotationStringSpans(expr.X)
+	case *ast.BinaryExpr:
+		if expr.Op == token.ADD {
+			return append(annotationStringSpans(expr.X), annotationStringSpans(expr.Y)...)
+		}
+	case *ast.CompositeLit:
+		var spans []tokenSpan
+		for _, elt := range expr.Elts {
+			if field, ok := elt.(*ast.KeyValueExpr); ok {
+				spans = append(spans, annotationStringSpans(field.Key)...)
+				spans = append(spans, annotationStringSpans(field.Value)...)
+			}
+		}
+		return spans
+	}
+	return nil
+}
+
+// schema.org publishes JSON-LD type IRIs. Matching or stripping that
+// namespace is not a request. A fetch of the same host still counts.
+var vocabularyNamespaceHosts = map[string]bool{
+	"schema.org":     true,
+	"www.schema.org": true,
+}
+
+func vocabularyNamespaceLiteral(val string) bool {
+	hosts := hostsInLiteral(val)
+	if len(hosts) == 0 {
+		return false
+	}
+	for _, host := range hosts {
+		if !vocabularyNamespaceHosts[host] {
+			return false
+		}
+	}
+	return true
+}
+
+func stringsAffixExpr(call *ast.CallExpr) (ast.Expr, bool) {
+	sel, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok || sel.Sel == nil {
+		return nil, false
+	}
+	pkg, ok := sel.X.(*ast.Ident)
+	if !ok || pkg.Name != "strings" {
+		return nil, false
+	}
+	switch sel.Sel.Name {
+	case "Contains", "CutPrefix", "CutSuffix", "HasPrefix", "HasSuffix", "Replace", "ReplaceAll", "TrimPrefix", "TrimSuffix":
+		if len(call.Args) < 2 {
+			return nil, false
+		}
+		return call.Args[1], true
+	default:
+		return nil, false
+	}
+}
+
+func collectAffixPieces(expr ast.Expr, lits map[token.Pos]struct{}) {
+	switch e := expr.(type) {
+	case *ast.BasicLit:
+		if e.Kind == token.STRING && lits != nil {
+			lits[e.Pos()] = struct{}{}
+		}
+	case *ast.ParenExpr:
+		collectAffixPieces(e.X, lits)
+	case *ast.BinaryExpr:
+		if e.Op == token.ADD {
+			collectAffixPieces(e.X, lits)
+			collectAffixPieces(e.Y, lits)
+		}
+	}
+}
+
+func novelHostObserved(host string, observed map[string]struct{}) bool {
+	if _, ok := observed[host]; ok {
+		return true
+	}
+	return registrableDomainObserved(host, observed)
+}
+
+// The apex is the same site as an observed subdomain. A lookalike label
+// or a host that only contains the apex as a suffix is a different domain.
+func registrableDomainObserved(host string, observed map[string]struct{}) bool {
+	if !isRegistrableDomain(host) {
+		return false
+	}
+	for candidate := range observed {
+		if candidate == host {
+			continue
+		}
+		reg, err := publicsuffix.EffectiveTLDPlusOne(candidate)
+		if err != nil || reg != host {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func isRegistrableDomain(host string) bool {
+	reg, err := publicsuffix.EffectiveTLDPlusOne(host)
+	return err == nil && reg == host
+}
+
+type tokenSpan struct {
+	start token.Pos
+	end   token.Pos
+}
+
+func cobraHelpStringSpans(node ast.Node) []tokenSpan {
+	var spans []tokenSpan
+	ast.Inspect(node, func(n ast.Node) bool {
+		switch node := n.(type) {
+		case *ast.CompositeLit:
+			if !isCobraCommandLiteral(node) {
+				return true
+			}
+			for _, elt := range node.Elts {
+				field, ok := elt.(*ast.KeyValueExpr)
+				if !ok || !isCobraHelpField(field.Key) {
+					continue
+				}
+				spans = append(spans, displayedStringLiteralSpans(field.Value)...)
+			}
+		case *ast.AssignStmt:
+			for i, lhs := range node.Lhs {
+				if i >= len(node.Rhs) || !isCobraHelpSelector(lhs) {
+					continue
+				}
+				spans = append(spans, displayedStringLiteralSpans(node.Rhs[i])...)
+			}
+		case *ast.CallExpr:
+			if !isCobraFlagDefinition(node) || len(node.Args) == 0 {
+				return true
+			}
+			usage := node.Args[len(node.Args)-1]
+			spans = append(spans, displayedStringLiteralSpans(usage)...)
+		}
+		return true
+	})
+	return spans
+}
+
+func displayedStringLiteralSpans(expr ast.Expr) []tokenSpan {
+	switch expr := expr.(type) {
+	case *ast.BasicLit:
+		if expr.Kind == token.STRING {
+			return []tokenSpan{{start: expr.Pos(), end: expr.End()}}
+		}
+	case *ast.ParenExpr:
+		return displayedStringLiteralSpans(expr.X)
+	case *ast.BinaryExpr:
+		if expr.Op == token.ADD {
+			return append(displayedStringLiteralSpans(expr.X), displayedStringLiteralSpans(expr.Y)...)
+		}
+	case *ast.CallExpr:
+		// fmt's Sprint family only formats text, so its literal arguments are
+		// displayed help. Any other call may do runtime work, so its literals
+		// stay subject to the host gate.
+		if !isFmtSprintCall(expr) {
+			return nil
+		}
+		var spans []tokenSpan
+		for _, arg := range expr.Args {
+			spans = append(spans, displayedStringLiteralSpans(arg)...)
+		}
+		return spans
+	}
+	return nil
+}
+
+func isFmtSprintCall(call *ast.CallExpr) bool {
+	selector, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok {
+		return false
+	}
+	pkg, ok := selector.X.(*ast.Ident)
+	if !ok || pkg.Name != "fmt" {
+		return false
+	}
+	switch selector.Sel.Name {
+	case "Sprintf", "Sprint", "Sprintln":
+		return true
+	default:
+		return false
+	}
+}
+
+func isCobraHelpSelector(expr ast.Expr) bool {
+	selector, ok := expr.(*ast.SelectorExpr)
+	return ok && isCobraHelpField(selector.Sel)
+}
+
+func isCobraFlagDefinition(call *ast.CallExpr) bool {
+	method, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok || !isCobraFlagDefinitionMethod(method.Sel.Name) {
+		return false
+	}
+	flags, ok := method.X.(*ast.CallExpr)
+	if !ok {
+		return false
+	}
+	selector, ok := flags.Fun.(*ast.SelectorExpr)
+	if !ok || len(flags.Args) != 0 {
+		return false
+	}
+	return selector.Sel.Name == "Flags" || selector.Sel.Name == "PersistentFlags"
+}
+
+var cobraFlagDefinitionTypes = map[string]bool{
+	"Bool": true, "BoolSlice": true, "BytesBase64": true, "BytesHex": true,
+	"Count": true, "Duration": true, "DurationSlice": true,
+	"Float32": true, "Float32Slice": true, "Float64": true, "Float64Slice": true,
+	"IP": true, "IPMask": true, "IPNet": true, "IPNetSlice": true, "IPSlice": true,
+	"Int": true, "Int8": true, "Int16": true, "Int32": true, "Int32Slice": true,
+	"Int64": true, "Int64Slice": true, "IntSlice": true,
+	"String": true, "StringArray": true, "StringSlice": true, "StringToInt": true,
+	"StringToInt64": true, "StringToString": true, "Text": true, "Time": true,
+	"Uint": true, "Uint8": true, "Uint16": true, "Uint32": true, "Uint64": true,
+	"UintSlice": true,
+}
+
+func isCobraFlagDefinitionMethod(name string) bool {
+	name = strings.TrimSuffix(name, "PF")
+	name = strings.TrimSuffix(name, "P")
+	name = strings.TrimSuffix(name, "Var")
+	return name == "" || cobraFlagDefinitionTypes[name]
+}
+
+func isCobraHelpField(expr ast.Expr) bool {
+	field, ok := expr.(*ast.Ident)
+	if !ok {
+		return false
+	}
+	switch field.Name {
+	case "Use", "Short", "Long", "Example", "UsageTemplate":
+		return true
+	default:
+		return false
+	}
+}
+
+func tokenPosInSpans(pos token.Pos, spans []tokenSpan) bool {
+	for _, span := range spans {
+		if pos >= span.start && pos <= span.end {
+			return true
+		}
+	}
+	return false
 }
 
 func hostsInLiteral(val string) []string {
@@ -347,7 +668,17 @@ func hostsInLiteral(val string) []string {
 func hostsInProse(text string) []string {
 	// Absolute URLs are host context. Bare dotted identifiers count only when
 	// they are real ICANN hostnames, so prose like settings.production does not.
-	return uniqueHosts(append(urlHosts(text), proseHosts(text)...))
+	return withoutRFCReservedHosts(uniqueHosts(append(urlHosts(text), proseHosts(text)...)))
+}
+
+func withoutRFCReservedHosts(hosts []string) []string {
+	filtered := hosts[:0]
+	for _, host := range hosts {
+		if !artifacts.IsRFCReservedDomain(host) {
+			filtered = append(filtered, host)
+		}
+	}
+	return filtered
 }
 
 func urlHosts(text string) []string {
@@ -400,10 +731,22 @@ func bareHostname(raw string) string {
 		return ""
 	}
 	last := host[strings.LastIndex(host, ".")+1:]
-	if bareHostFileExt[last] {
+	// Extensions win even when the label is also a delegated TLD (md).
+	if bareHostFileExt[last] || !isHostTLD(last) {
 		return ""
 	}
 	return normalizeNovelHost(host)
+}
+
+// The final label is checked on its own so a private-suffix host
+// (www.googleapis.com) still counts while a dotted identifier
+// (tables.create, VM.Audit) does not.
+func isHostTLD(label string) bool {
+	if specialUseHostTLD[label] {
+		return true
+	}
+	suffix, icann := publicsuffix.PublicSuffix(label)
+	return icann && suffix == label
 }
 
 func normalizeNovelHost(host string) string {

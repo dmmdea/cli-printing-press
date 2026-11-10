@@ -1,9 +1,7 @@
 package pipeline
 
 import (
-	"context"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -14,9 +12,9 @@ import (
 	"github.com/mvanhorn/cli-printing-press/v4/internal/canonicalargs"
 )
 
-func discoverCommands(dir string, binaryPath string) []discoveredCommand {
+func discoverCommands(dir string, binaryPath string, env []string) []discoveredCommand {
 	if binaryPath != "" {
-		if cmds := discoverCommandsFromHelp(binaryPath); len(cmds) > 0 {
+		if cmds := discoverCommandsFromHelp(binaryPath, env); len(cmds) > 0 {
 			return enrichCommandAnnotationsFromSource(dir, cmds)
 		}
 	}
@@ -24,13 +22,8 @@ func discoverCommands(dir string, binaryPath string) []discoveredCommand {
 	return enrichCommandAnnotationsFromSource(dir, discoverCommandsFromSource(dir))
 }
 
-func discoverCommandsFromHelp(binaryPath string) []discoveredCommand {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	helpCmd := exec.CommandContext(ctx, binaryPath, "--help")
-	applyDefaultSubprocessEnv(helpCmd)
-	out, err := helpCmd.CombinedOutput()
+func discoverCommandsFromHelp(binaryPath string, env []string) []discoveredCommand {
+	out, err := runCLIWithOutput(binaryPath, []string{"--help"}, env, 10*time.Second)
 	if err != nil {
 		return nil
 	}
@@ -190,11 +183,14 @@ func commandHappyArgs(cmd discoveredCommand) happyArgs {
 	return parseHappyArgsAnnotation(cmd.Annotations[happyArgsAnnotation])
 }
 
-func commandInvocationInputs(binary string, cmd discoveredCommand) ([]string, []string) {
+func commandInvocationInputs(binary string, cmd discoveredCommand, env []string, bareProbe bool) ([]string, []string) {
 	happy := commandHappyArgs(cmd)
 	positionals := mergeHappyPositionals(cmd.Args, happy.positionals)
 
-	flags := inferRequiredFlags(binary, cmd.Name)
+	var flags []string
+	if bareProbe {
+		flags = inferRequiredFlags(binary, cmd.Name, env)
+	}
 	if flags == nil {
 		flags = workflowTestFlags(cmd.Name)
 	}
@@ -372,13 +368,8 @@ func isJSONCompatibleOutputMode(value string) bool {
 // that name, the default wins over canonicalargs and the per-name switch.
 // This lets specs supply realistic, domain-correct values (e.g., a real
 // recipe slug) without modifying the generator.
-func inferPositionalArgs(binary string, cmd *discoveredCommand, paramDefaults map[string]string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	helpCmd := exec.CommandContext(ctx, binary, cmd.Name, "--help")
-	applyDefaultSubprocessEnv(helpCmd)
-	out, err := helpCmd.CombinedOutput()
+func inferPositionalArgs(binary string, cmd *discoveredCommand, paramDefaults map[string]string, env []string) {
+	out, err := runCLIWithOutput(binary, []string{cmd.Name, "--help"}, env, 10*time.Second)
 	if err != nil {
 		return // fall back to no extra args
 	}
@@ -447,20 +438,43 @@ var positionalPlaceholderRe = regexp.MustCompile(`[<\[]([a-zA-Z][\w-]*(?:\|[a-zA
 //
 // Returns lowercase placeholder names in source order.
 func extractPositionalPlaceholders(usageSuffix string) []string {
+	specs := extractPositionalPlaceholderSpecs(usageSuffix)
+	if len(specs) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(specs))
+	for _, spec := range specs {
+		names = append(names, spec.name)
+	}
+	return names
+}
+
+// positionalPlaceholder is one Usage positional. Cobra convention writes
+// required positionals as `<name>` and optional ones as `[name]`.
+type positionalPlaceholder struct {
+	name     string
+	optional bool
+}
+
+func extractPositionalPlaceholderSpecs(usageSuffix string) []positionalPlaceholder {
 	scrubbed := flagDescriptorRe.ReplaceAllString(usageSuffix, "")
-	matches := positionalPlaceholderRe.FindAllStringSubmatch(scrubbed, -1)
+	matches := positionalPlaceholderRe.FindAllStringSubmatchIndex(scrubbed, -1)
 	if len(matches) == 0 {
 		return nil
 	}
-	var names []string
+	var specs []positionalPlaceholder
 	for _, match := range matches {
-		name := chooseUsagePlaceholderName(match[1])
+		name := chooseUsagePlaceholderName(scrubbed[match[2]:match[3]])
 		if name == "flags" || name == "command" {
 			continue
 		}
-		names = append(names, name)
+		start, end := match[0], match[1]
+		// `[<name>]` wraps a required-looking placeholder in optional brackets.
+		wrapped := start > 0 && scrubbed[start-1] == '[' && end < len(scrubbed) && scrubbed[end] == ']'
+		optional := scrubbed[start] == '[' || wrapped
+		specs = append(specs, positionalPlaceholder{name: name, optional: optional})
 	}
-	return names
+	return specs
 }
 
 func chooseUsagePlaceholderName(raw string) string {
@@ -561,8 +575,8 @@ var sideEffectGoImports = []string{
 // descriptive help text; the source-tree scan catches commands whose
 // source obviously shells out. False positives are rare and acceptable —
 // the cost is "skipped in mock-mode Execute test", not a failure.
-func isSideEffectCommand(binary string, cmd *discoveredCommand, sourceDir string) bool {
-	if helpScanIndicatesSideEffect(binary, cmd) {
+func isSideEffectCommand(binary string, cmd *discoveredCommand, sourceDir string, env []string) bool {
+	if helpScanIndicatesSideEffect(binary, cmd, env) {
 		return true
 	}
 	if sourceScanIndicatesSideEffect(cmd, sourceDir) {
@@ -571,13 +585,8 @@ func isSideEffectCommand(binary string, cmd *discoveredCommand, sourceDir string
 	return false
 }
 
-func helpScanIndicatesSideEffect(binary string, cmd *discoveredCommand) bool {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	helpCmd := exec.CommandContext(ctx, binary, cmd.Name, "--help")
-	applyDefaultSubprocessEnv(helpCmd)
-	out, err := helpCmd.CombinedOutput()
+func helpScanIndicatesSideEffect(binary string, cmd *discoveredCommand, env []string) bool {
+	out, err := runCLIWithOutput(binary, []string{cmd.Name, "--help"}, env, 5*time.Second)
 	if err != nil {
 		return false
 	}
@@ -700,13 +709,10 @@ var flagNameRe = regexp.MustCompile(`"([^"]+)"`)
 // "required flag(s) ... not set" error if present, and returns synthetic --flag value
 // pairs the verifier can use to exercise the command. Returns nil when the command
 // has no required flags (or when probing fails — the caller falls back gracefully).
-func inferRequiredFlags(binary, cmdName string) []string {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	probe := exec.CommandContext(ctx, binary, cmdName)
-	applyDefaultSubprocessEnv(probe)
-	out, _ := probe.CombinedOutput() // error expected when flags are missing
+// env is the same subprocess environment as the rest of the verify run. A nil env
+// is only the scoped snapshot, which has no mock base URL.
+func inferRequiredFlags(binary, cmdName string, env []string) []string {
+	out, _ := runCLIWithOutput(binary, []string{cmdName}, env, 5*time.Second) // error expected when flags are missing
 
 	m := requiredFlagsRe.FindSubmatch(out)
 	if m == nil {

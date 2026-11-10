@@ -21,8 +21,11 @@ import (
 // GenerateMCPSurface into tools.go; these snapshots are restored or
 // merged afterward so a description refresh cannot delete poll loops,
 // annotation rules, destination-flag blocklists, or HTTP timeouts.
+// httpAuthTests is keyed by the entrypoint path and restored only when
+// that entrypoint cannot compile the regenerated HTTP auth tests.
 type mcpRuntimeSnapshot struct {
-	files map[string][]byte
+	files         map[string][]byte
+	httpAuthTests map[string][]byte
 }
 
 var (
@@ -50,8 +53,27 @@ func snapshotMCPRuntime(cliDir string) (*mcpRuntimeSnapshot, error) {
 		if err := snapshotExistingFile(cliDir, snap, rel); err != nil {
 			return nil, err
 		}
+		if err := snapshotMCPHTTPAuthTest(cliDir, snap, rel); err != nil {
+			return nil, err
+		}
 	}
 	return snap, nil
+}
+
+func snapshotMCPHTTPAuthTest(cliDir string, snap *mcpRuntimeSnapshot, mainRel string) error {
+	testRel := filepath.Join(filepath.Dir(mainRel), "http_auth_test.go")
+	data, err := os.ReadFile(filepath.Join(cliDir, testRel))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("reading %s: %w", testRel, err)
+	}
+	if snap.httpAuthTests == nil {
+		snap.httpAuthTests = map[string][]byte{}
+	}
+	snap.httpAuthTests[filepath.ToSlash(mainRel)] = data
+	return nil
 }
 
 func snapshotDirGoFiles(cliDir string, snap *mcpRuntimeSnapshot, relDir string) error {
@@ -117,8 +139,74 @@ func restoreMCPRuntime(cliDir string, snap *mcpRuntimeSnapshot) error {
 		if err := writeFileAtomic(abs, before); err != nil {
 			return err
 		}
+		if err := preserveHTTPAuthTests(cliDir, snap, rel, before); err != nil {
+			return err
+		}
 	}
 	return nil
+}
+
+func isMCPEntrypointMain(rel string) bool {
+	rel = filepath.ToSlash(rel)
+	return strings.HasPrefix(rel, "cmd/") && strings.Contains(rel, "-pp-mcp/") && strings.HasSuffix(rel, "/main.go")
+}
+
+// preserveHTTPAuthTests puts the pre-sync HTTP tests back when the restored
+// entrypoint lacks the origin helpers the regenerated tests call. An
+// entrypoint that already defines those helpers keeps the regenerated tests.
+func preserveHTTPAuthTests(cliDir string, snap *mcpRuntimeSnapshot, mainRel string, mainSrc []byte) error {
+	if snap == nil || !isMCPEntrypointMain(mainRel) || mcpEntrypointSupportsHTTPAuthTests(mainSrc) {
+		return nil
+	}
+	testRel := filepath.ToSlash(filepath.Join(filepath.Dir(filepath.FromSlash(mainRel)), "http_auth_test.go"))
+	abs := filepath.Join(cliDir, filepath.FromSlash(testRel))
+	if before, ok := snap.httpAuthTests[filepath.ToSlash(mainRel)]; ok {
+		return writeFileAtomic(abs, before)
+	}
+	if err := os.Remove(abs); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("removing %s: %w", testRel, err)
+	}
+	return nil
+}
+
+// mcpEntrypointSupportsHTTPAuthTests reports whether mainSrc defines the
+// helpers the regenerated HTTP auth tests call. Parameter counts match
+// the declarations, not a particular formatting of the call.
+func mcpEntrypointSupportsHTTPAuthTests(mainSrc []byte) bool {
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "main.go", mainSrc, 0)
+	if err != nil {
+		return false
+	}
+	var origins, limits bool
+	for _, decl := range file.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || fn.Recv != nil || fn.Type == nil {
+			continue
+		}
+		switch fn.Name.Name {
+		case "requireBearerAuthWithOrigins":
+			origins = funcParamCount(fn.Type.Params) == 3
+		case "requireBearerAuthWithLimits":
+			limits = funcParamCount(fn.Type.Params) == 5
+		}
+	}
+	return origins && limits
+}
+
+func funcParamCount(list *ast.FieldList) int {
+	if list == nil {
+		return 0
+	}
+	n := 0
+	for _, field := range list.List {
+		if len(field.Names) == 0 {
+			n++
+			continue
+		}
+		n += len(field.Names)
+	}
+	return n
 }
 
 func isMCPIntentFile(rel string) bool {
@@ -135,10 +223,147 @@ func hasHandAuthoredMCPBehavior(src []byte) bool {
 	if bytes.Contains(src, []byte("localWrite := isMCPLocalWrite")) {
 		return true
 	}
-	if bytes.Contains(src, []byte("ReadHeaderTimeout")) {
+	// Generated HTTP servers set ReadHeaderTimeout and IdleTimeout to fixed
+	// literals and leave server-wide read/write deadlines unset. A different
+	// field value, or any read/write deadline field, is hand-authored.
+	// Missing IdleTimeout is not: older prints should receive the new value.
+	code := mcpCodeWithoutComments(src)
+	if readTimeoutField.Match(code) || writeTimeoutField.Match(code) || timeoutAssignment.Match(code) {
 		return true
 	}
-	return handAuthoredDBFlag.Match(src)
+	if hasNonGeneratedTimeoutValue(code, readHeaderTimeoutField, generatedMCPReadHeaderTimeoutValue) {
+		return true
+	}
+	if hasNonGeneratedTimeoutValue(code, idleTimeoutField, generatedMCPIdleTimeoutValue) {
+		return true
+	}
+	// The db marker is itself a string literal. Timeout scanning drops string
+	// contents; the db scan has to keep them or the generated map entry and a
+	// hand-added one both disappear.
+	return hasHandAuthoredDBFlag(mcpCodeKeepingStrings(src))
+}
+
+const (
+	generatedMCPReadHeaderTimeoutValue = "10 * time.Second"
+	generatedMCPIdleTimeoutValue       = "2 * time.Minute"
+)
+
+var (
+	readHeaderTimeoutField = regexp.MustCompile(`\bReadHeaderTimeout\s*:\s*([^,\n}]+)`)
+	idleTimeoutField       = regexp.MustCompile(`\bIdleTimeout\s*:\s*([^,\n}]+)`)
+	readTimeoutField       = regexp.MustCompile(`\bReadTimeout\s*:`)
+	writeTimeoutField      = regexp.MustCompile(`\bWriteTimeout\s*:`)
+	// Generated servers set timeouts in the struct literal. An assignment
+	// (httpSrv.ReadTimeout = ...) is a hand edit the field-colon check misses.
+	timeoutAssignment = regexp.MustCompile(`\b(?:ReadTimeout|WriteTimeout|IdleTimeout|ReadHeaderTimeout)\s*=`)
+)
+
+func hasNonGeneratedTimeoutValue(code []byte, field *regexp.Regexp, generated string) bool {
+	for _, match := range field.FindAllSubmatch(code, -1) {
+		if strings.TrimSpace(string(match[1])) != generated {
+			return true
+		}
+	}
+	return false
+}
+
+// The generated blockedDestinationFlags map contains one "db" entry. A db
+// entry outside that map is a hand-extended blocklist and must survive reprint.
+func hasHandAuthoredDBFlag(code []byte) bool {
+	for _, match := range handAuthoredDBFlag.FindAllIndex(code, -1) {
+		if !generatedDestinationDB(code, match[0]) {
+			return true
+		}
+	}
+	return false
+}
+
+func generatedDestinationDB(code []byte, idx int) bool {
+	mapIdx := bytes.LastIndex(code[:idx], []byte("var blockedDestinationFlags"))
+	if mapIdx < 0 {
+		return false
+	}
+	between := code[mapIdx:idx]
+	if bytes.Contains(between, []byte("\nvar ")) || bytes.Contains(between, []byte("\nfunc ")) || bytes.Contains(between, []byte("\nconst ")) {
+		return false
+	}
+	return true
+}
+
+// mcpCodeWithoutComments drops comments and string contents so a note that
+// quotes the generated timeout cannot hide a different field value.
+func mcpCodeWithoutComments(src []byte) []byte {
+	return stripMCPComments(src, true)
+}
+
+// mcpCodeKeepingStrings drops comments and leaves string literals intact.
+func mcpCodeKeepingStrings(src []byte) []byte {
+	return stripMCPComments(src, false)
+}
+
+func stripMCPComments(src []byte, dropStrings bool) []byte {
+	var b bytes.Buffer
+	b.Grow(len(src))
+	i := 0
+	for i < len(src) {
+		if src[i] == '"' || src[i] == '\'' || src[i] == '`' {
+			quote := src[i]
+			b.WriteByte(quote)
+			i++
+			if quote == '`' {
+				for i < len(src) && src[i] != '`' {
+					if !dropStrings {
+						b.WriteByte(src[i])
+					}
+					i++
+				}
+			} else {
+				for i < len(src) {
+					if src[i] == '\\' && i+1 < len(src) {
+						if !dropStrings {
+							b.WriteByte(src[i])
+							b.WriteByte(src[i+1])
+						}
+						i += 2
+						continue
+					}
+					if src[i] == quote || src[i] == '\n' {
+						break
+					}
+					if !dropStrings {
+						b.WriteByte(src[i])
+					}
+					i++
+				}
+			}
+			if i < len(src) && src[i] == quote {
+				b.WriteByte(quote)
+				i++
+			}
+			continue
+		}
+		if i+1 < len(src) && src[i] == '/' && src[i+1] == '/' {
+			for i < len(src) && src[i] != '\n' {
+				i++
+			}
+			continue
+		}
+		if i+1 < len(src) && src[i] == '/' && src[i+1] == '*' {
+			i += 2
+			for i+1 < len(src) && (src[i] != '*' || src[i+1] != '/') {
+				i++
+			}
+			if i+1 < len(src) {
+				i += 2
+			} else {
+				i = len(src)
+			}
+			continue
+		}
+		b.WriteByte(src[i])
+		i++
+	}
+	return b.Bytes()
 }
 
 func mergeHandAuthoredIntentFile(before, after []byte) ([]byte, error) {

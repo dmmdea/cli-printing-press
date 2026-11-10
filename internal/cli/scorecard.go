@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -53,7 +54,9 @@ func newScorecardCmd() *cobra.Command {
 			}
 			defer func() { _ = os.RemoveAll(pipelineDir) }()
 
-			verifyReport, err := pipeline.LoadVerifyReportFromManifest(writeManifest)
+			// Verify evidence lives in the tree manifest. --write-manifest only
+			// persists the score computed from that tree.
+			verifyReport, err := pipeline.LoadVerifyReportFromManifest(filepath.Join(dir, pipeline.CLIManifestFilename))
 			if err != nil {
 				return &ExitError{Code: ExitGenerationError, Err: fmt.Errorf("loading verify evidence: %w", err)}
 			}
@@ -92,44 +95,7 @@ func newScorecardCmd() *cobra.Command {
 			renderHumanScorecard(os.Stdout, sc)
 
 			if live != nil {
-				fmt.Printf("\nSample Output Probe (live command sample)\n")
-				if live.BinaryRefresh != nil {
-					fmt.Printf("  Binary refresh: %s", live.BinaryRefresh.Action)
-					if live.BinaryRefresh.Reason != "" {
-						fmt.Printf(" (%s)", live.BinaryRefresh.Reason)
-					}
-					fmt.Println()
-				}
-				if live.Unable {
-					fmt.Printf("  Status: unavailable\n")
-					fmt.Printf("  Unable to run: %s\n", live.Reason)
-				} else {
-					fmt.Printf("  Passed: %d/%d  (%d%% pass rate, %d skipped)\n", live.Passed, live.Evaluated(), int(live.PassRate*100+0.5), live.Skipped)
-					if live.Failed > 0 {
-						fmt.Println("  Failures:")
-						for _, f := range live.Features {
-							if f.Status == "fail" {
-								fmt.Printf("    - %s: %s\n", f.Name, f.Reason)
-							}
-						}
-					}
-					// Wave B output-quality warnings are surfaced here so a
-					// developer running scorecard without --json sees them.
-					// Wave A review flagged the "human sees less than agent"
-					// gap as an agent-native parity concern.
-					warnCount := 0
-					for _, f := range live.Features {
-						warnCount += len(f.Warnings)
-					}
-					if warnCount > 0 {
-						fmt.Printf("  Warnings (%d): not blocking in Wave B — flip to failures in Wave C after calibration\n", warnCount)
-						for _, f := range live.Features {
-							for _, w := range f.Warnings {
-								fmt.Printf("    - %s: %s\n", f.Name, w)
-							}
-						}
-					}
-				}
+				renderSampleOutputProbe(os.Stdout, live)
 			}
 
 			if len(sc.GapReport) > 0 {
@@ -153,10 +119,59 @@ func newScorecardCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&asJSON, "json", false, "Output as JSON")
 	cmd.Flags().BoolVar(&liveCheck, "live-check", false, "Sample novel-feature examples against real targets and cap Insight when flagships return broken output")
 	cmd.Flags().DurationVar(&liveCheckTimeout, "live-check-timeout", 10*time.Second, "Per-feature timeout for live check invocations")
-	cmd.Flags().StringVar(&writeManifest, "write-manifest", "", "Path to .printing-press.json to update with scorecard summary and built novel features")
+	cmd.Flags().StringVar(&writeManifest, "write-manifest", "", "Path to .printing-press.json to update with the scorecard summary and built novel features; does not change the score")
 	cmd.Flags().BoolVar(&allowDestructive, "allow-destructive", false, "Allow live-check to execute mutating generated and research-authored examples (default skips them)")
 
 	return cmd
+}
+
+func renderSampleOutputProbe(w io.Writer, live *pipeline.LiveCheckResult) {
+	if live == nil {
+		return
+	}
+	fmt.Fprintf(w, "\nSample Output Probe (live command sample)\n")
+	if live.BinaryRefresh != nil {
+		fmt.Fprintf(w, "  Binary refresh: %s", live.BinaryRefresh.Action)
+		if live.BinaryRefresh.Reason != "" {
+			fmt.Fprintf(w, " (%s)", live.BinaryRefresh.Reason)
+		}
+		fmt.Fprintln(w)
+	}
+	if live.Unable {
+		fmt.Fprintf(w, "  Status: unavailable\n")
+		fmt.Fprintf(w, "  Unable to run: %s\n", live.Reason)
+		fmt.Fprintf(w, "  Review: skipped\n")
+		return
+	}
+	if live.SampleReviewStatus() == pipeline.SampleReviewSkipped {
+		fmt.Fprintf(w, "  Review: skipped\n")
+		fmt.Fprintf(w, "  Samples: %d passed, %d failed, %d skipped\n", live.Passed, live.Failed, live.Skipped)
+	} else {
+		fmt.Fprintf(w, "  Review: %s\n", live.SampleReviewStatus())
+		fmt.Fprintf(w, "  Passed: %d/%d  (%d%% pass rate, %d skipped)\n", live.Passed, live.Evaluated(), int(live.PassRate*100+0.5), live.Skipped)
+	}
+	if live.Failed > 0 {
+		fmt.Fprintln(w, "  Failures:")
+		for _, f := range live.Features {
+			if f.Status == pipeline.StatusFail {
+				fmt.Fprintf(w, "    - %s: %s\n", f.Name, f.Reason)
+			}
+		}
+	}
+	// Surface Wave B warnings in the human scorecard. Without this, a
+	// developer running without --json sees a narrower report than an agent.
+	warnCount := 0
+	for _, f := range live.Features {
+		warnCount += len(f.Warnings)
+	}
+	if warnCount > 0 {
+		fmt.Fprintf(w, "  Warnings (%d): not blocking in Wave B — flip to failures in Wave C after calibration\n", warnCount)
+		for _, f := range live.Features {
+			for _, warning := range f.Warnings {
+				fmt.Fprintf(w, "    - %s: %s\n", f.Name, warning)
+			}
+		}
+	}
 }
 
 func liveCheckFatalReason(live *pipeline.LiveCheckResult) string {
@@ -213,10 +228,15 @@ func renderHumanScorecard(w io.Writer, sc *pipeline.Scorecard) {
 	fmt.Fprintf(w, "  Type Fidelity           %d/5\n", s.TypeFidelity)
 	fmt.Fprintf(w, "  Dead Code               %d/5\n", s.DeadCode)
 	fmt.Fprintf(w, "\n  Total: %d/100 - Grade %s\n", s.Total, sc.OverallGrade)
+	infraMax, domainMax := pipeline.ScorecardTierDenominators(sc)
+	fmt.Fprintf(w, "  Denominator: infrastructure %d, domain %d\n", infraMax, domainMax)
 	if len(sc.UnscoredDimensions) > 0 {
 		fmt.Fprintf(w, "  Note: omitted from denominator: %s\n", strings.Join(sc.UnscoredDimensions, ", "))
 	}
 	if len(sc.UnverifiedDimensions) > 0 {
 		fmt.Fprintf(w, "  Hold: unverified dimensions: %s\n", strings.Join(sc.UnverifiedDimensions, ", "))
+	}
+	if s.CalibrationNote != "" {
+		fmt.Fprintf(w, "  Calibration: %s\n", s.CalibrationNote)
 	}
 }

@@ -44,18 +44,27 @@ type Phase5AuthContext struct {
 }
 
 type Phase5GateMarker struct {
-	SchemaVersion     int                   `json:"schema_version"`
-	APIName           string                `json:"api_name,omitempty"`
-	RunID             string                `json:"run_id,omitempty"`
-	Status            string                `json:"status"`
-	Level             string                `json:"level,omitempty"`
-	MatrixSize        int                   `json:"matrix_size,omitempty"`
-	TestsPassed       int                   `json:"tests_passed,omitempty"`
-	TestsSkipped      int                   `json:"tests_skipped,omitempty"`
-	TestsUnverified   int                   `json:"tests_unverified,omitempty"`
-	TestsFailed       int                   `json:"tests_failed,omitempty"`
-	CoverageHollow    bool                  `json:"coverage_hollow,omitempty"`
-	HollowFeatures    []string              `json:"hollow_features,omitempty"`
+	SchemaVersion   int               `json:"schema_version"`
+	APIName         string            `json:"api_name,omitempty"`
+	RunID           string            `json:"run_id,omitempty"`
+	Status          string            `json:"status"`
+	Level           string            `json:"level,omitempty"`
+	MatrixSize      int               `json:"matrix_size,omitempty"`
+	TestsPassed     int               `json:"tests_passed,omitempty"`
+	TestsSkipped    int               `json:"tests_skipped,omitempty"`
+	TestsUnverified int               `json:"tests_unverified,omitempty"`
+	TestsFailed     int               `json:"tests_failed,omitempty"`
+	CoverageHollow  bool              `json:"coverage_hollow,omitempty"`
+	HollowFeatures  []string          `json:"hollow_features,omitempty"`
+	HollowReasons   map[string]string `json:"hollow_reasons,omitempty"`
+	// ProofCoveredFeatures lists novel features counted as covered by an
+	// operator proof file in the same proofs directory instead of a live
+	// happy-path pass.
+	ProofCoveredFeatures []ProofCoveredFeature `json:"proof_covered_features,omitempty"`
+	// LiveHappyPathRuns lists pp:live-happy-path commands that really ran and
+	// passed, each bound to the source fingerprint it ran against. A later
+	// run of the same source reuses them instead of running them again.
+	LiveHappyPathRuns []LiveHappyPathRun    `json:"live_happy_path_runs,omitempty"`
 	AuthContext       Phase5AuthContext     `json:"auth_context,omitzero"`
 	SkipReason        string                `json:"skip_reason,omitempty"`
 	FailureSummary    *Phase5FailureSummary `json:"failure_summary,omitempty"`
@@ -175,6 +184,12 @@ func validatePhase5MarkerFile(path string, manifest CLIManifest, skipFile bool, 
 
 	result := validatePhase5Marker(marker, manifest, skipFile, sourceDir)
 	result.MarkerPath = path
+	if result.Passed {
+		if issues := validatePhase5ProofCoverage(marker, filepath.Dir(path)); len(issues) > 0 {
+			result.Passed = false
+			result.Detail = strings.Join(issues, "; ")
+		}
+	}
 	return result, true
 }
 
@@ -304,12 +319,12 @@ func validatePhase5PassMarkerIssues(marker Phase5GateMarker) []string {
 	if marker.TestsPassed <= 0 {
 		issues = append(issues, "phase5 acceptance marker missing tests_passed")
 	}
-	return issues
+	return append(issues, validatePhase5LiveHappyRuns(marker)...)
 }
 
 func phase5AcceptancePassed(marker Phase5GateMarker) (bool, string) {
 	if marker.CoverageHollow {
-		return false, fmt.Sprintf("phase5 acceptance has hollow coverage for: %s", strings.Join(marker.HollowFeatures, ", "))
+		return false, fmt.Sprintf("phase5 acceptance has hollow coverage for: %s. %s", FormatHollowCoverage(marker.HollowFeatures, marker.HollowReasons), HollowCoverageRemedy)
 	}
 	level := phase5Level(marker)
 	switch level {
@@ -348,6 +363,29 @@ func phase5AcceptancePassed(marker Phase5GateMarker) (bool, string) {
 	default:
 		return false, unknownPhase5AcceptanceLevelDetail(marker.Level)
 	}
+}
+
+// HollowCoverageRemedy names the two annotations that can clear hollow
+// coverage, so a hollow verdict points at the fix instead of only the symptom.
+var HollowCoverageRemedy = fmt.Sprintf(
+	"To cover a command that writes files or spends money, annotate it %s and rerun dogfood --live --allow-destructive; for a state-dependent feature that cannot run a real happy path, annotate it %s and add the named proof file",
+	liveHappyPathAnnotation, verifiedByProofAnnotation,
+)
+
+func FormatHollowCoverage(features []string, reasons map[string]string) string {
+	parts := make([]string, 0, len(features))
+	for _, feature := range features {
+		reason := ""
+		if reasons != nil {
+			reason = strings.TrimSpace(reasons[feature])
+		}
+		if reason == "" {
+			parts = append(parts, feature)
+			continue
+		}
+		parts = append(parts, feature+" ("+reason+")")
+	}
+	return strings.Join(parts, ", ")
 }
 
 func phase5Level(marker Phase5GateMarker) string {

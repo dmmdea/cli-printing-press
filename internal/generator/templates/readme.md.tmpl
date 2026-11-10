@@ -54,7 +54,7 @@ npx -y @mvanhorn/printing-press-library install {{.Name}} --agent claude-code --
 {{ if .Category}}
 ### Without Node (Go fallback)
 
-If `npx` isn't available (no Node, offline), install the CLI directly via Go (requires Go 1.26.6 or newer):
+If `npx` isn't available (no Node, offline), install the CLI directly via Go (requires Go 1.26.10 or newer):
 
 ```bash
 go install github.com/mvanhorn/printing-press-library/library/{{.Category}}/{{.Name}}/cmd/{{.Name}}-pp-cli@latest
@@ -127,12 +127,19 @@ export {{(index $deviceEnvVars 0).Name}}=<client-id>
 {{.Name}}-pp-cli auth login --device-code
 {{- end}}
 ```
-{{- else if eq .Auth.Type "oauth2"}}
+{{- else if and (eq .Auth.Type "oauth2") authLoginCommandAvailable}}
 
 The bundle reuses your local OAuth tokens — authenticate first if you haven't:
 
 ```bash
 {{.Name}}-pp-cli auth login
+```
+{{- else if and (eq .Auth.Type "oauth2") authSetupCommandAvailable}}
+
+The bundle needs credentials — set them up first if you haven't:
+
+```bash
+{{.Name}}-pp-cli auth setup
 ```
 {{- else if eq .Auth.Type "oauth2_refresh"}}
 
@@ -175,7 +182,7 @@ go install github.com/mvanhorn/printing-press-library/library/{{.Category}}/{{.N
 Install the MCP binary from this CLI's published public-library entry or pre-built release.
 {{- end}}
 
-Add to your Claude Desktop config (`~/Library/Application Support/Claude/claude_desktop_config.json`):
+Add to your Claude Desktop config (`~/Library/Application Support/Claude/claude_desktop_config.json` on macOS, `%APPDATA%\Claude\claude_desktop_config.json` on Windows):
 
 ```json
 {
@@ -194,6 +201,19 @@ Add to your Claude Desktop config (`~/Library/Application Support/Claude/claude_
 ```
 
 </details>
+{{- if .HasMCPTransport "http"}}
+
+### Remote MCP over HTTP
+
+`{{.Name}}-pp-mcp --transport http` (or `PP_MCP_TRANSPORT=http`) serves streamable HTTP at `http://{{if .MCP.Addr}}{{.MCP.Addr}}{{else}}127.0.0.1:7777{{end}}/mcp`. It refuses to start until `{{envName .Name}}_MCP_HTTP_TOKEN` is set to at least 32 characters, and every request must send `Authorization: Bearer <token>`. The command below prints 64 hex characters and meets that minimum. Plain HTTP is allowed only on a loopback `--addr`; any other bind, including `:7777` (every interface), also needs `--tls-cert` and `--tls-key`. Requests with no `Origin` header are accepted, as are loopback origins (`localhost`, `127.0.0.1`, or `[::1]`, any port). Any other `Origin` is refused unless it is listed in `{{envName .Name}}_MCP_HTTP_ALLOWED_ORIGINS`, a comma-separated list of `scheme://host[:port]` values with no path. That list is not a CORS policy; the server does not emit CORS headers.
+
+```bash
+export {{envName .Name}}_MCP_HTTP_TOKEN="$(openssl rand -hex 32)"
+{{.Name}}-pp-mcp --transport http
+```
+
+Set `{{envName .Name}}_MCP_READ_ONLY=1` (exactly `1`) to drop mirrored commands that are not marked read-only and make the raw execute tool refuse state-changing calls. Commands marked local-write, which write only this CLI's own learn store, stay available.
+{{- end}}
 {{- if and .Narrative .Narrative.AuthNarrative}}
 
 {{if .Auth.Optional}}## Optional: API Key{{else}}## Authentication{{end}}
@@ -267,6 +287,7 @@ Open the verification URL, enter the printed user code, and return to the CLI. Y
 
 ### 2. Authenticate
 
+{{- if authLoginCommandAvailable}}
 Authorize via your browser:
 
 ```bash
@@ -274,6 +295,17 @@ Authorize via your browser:
 ```
 
 This opens a browser window to complete the OAuth2 flow. Your tokens are stored locally and refreshed automatically.
+{{- else if authSetupCommandAvailable}}
+Run `{{.Name}}-pp-cli auth setup` for credential setup steps.
+{{- end}}
+{{- if authCodeSetTokenAvailable .Auth}}
+
+To store a bearer you already hold, pipe it on stdin so it does not land in shell history:
+
+```bash
+echo "$TOKEN" | {{.Name}}-pp-cli auth set-token
+```
+{{- end}}
 {{- else if eq .Auth.Type "oauth2_refresh"}}
 
 ### 2. Set Up OAuth2 Refresh Credentials
@@ -370,13 +402,15 @@ This checks your configuration{{if and (ne .Auth.Type "") (ne .Auth.Type "none")
 
 ## Unique Features
 
-These capabilities aren't available in any other tool for this API.
+{{if not .HasListedAlternatives}}{{novelExclusivityClaim}}{{end}}
 {{- $groups := groupNovelFeatures .NovelFeatures}}
 {{- if $groups}}
-{{- range $groups}}
+{{- range $i, $g := $groups}}
+{{- if or (gt $i 0) (not $.HasListedAlternatives)}}
 
-### {{.Name}}
-{{range .Features}}
+{{end -}}
+### {{$g.Name}}
+{{range $g.Features}}
 - **`{{.Command}}`** — {{.Description}}
 {{- if .WhyItMatters}}
 
@@ -455,6 +489,15 @@ export {{envName .Name}}_HOME=/srv/{{.Name}}
 
 Under `{{envName .Name}}_HOME=/srv/{{.Name}}`, the four dirs resolve to `/srv/{{.Name}}/config`, `/srv/{{.Name}}/data`, `/srv/{{.Name}}/state`, and `/srv/{{.Name}}/cache`.
 
+On Windows, set the same variable in PowerShell:
+
+```powershell
+$env:{{envName .Name}}_HOME = "C:\srv\{{.Name}}"
+{{.Name}}-pp-cli doctor
+```
+
+Under `$env:{{envName .Name}}_HOME = "C:\srv\{{.Name}}"`, the four dirs resolve to `C:\srv\{{.Name}}\config`, `C:\srv\{{.Name}}\data`, `C:\srv\{{.Name}}\state`, and `C:\srv\{{.Name}}\cache`.
+
 MCP servers do not receive CLI flags from the host. Put relocation in the host `env` block:
 
 ```json
@@ -480,6 +523,20 @@ Existing installs keep working because the platform-default rung matches the leg
 Existing installs keep working because the platform-default rung matches the legacy layout. Run `{{.Name}}-pp-cli doctor --fail-on warn` to check path warnings in automation.
 {{- end}}
 
+### Local data
+
+{{if .HasDataLayer -}}
+Reads are saved locally by default: in `--data-source auto` mode every successful read is also written to the SQLite store (`data.db`, or `data-<hash>.db` per credential) in the data directory. {{end -}}
+GET responses are cached for five minutes under `http/` in the cache directory.{{if .HasAuthCommand}} Credentials live in `credentials.toml` in the data directory.{{end}}{{if .Learn.Enabled}} The learn journal lives under `learn/` in the state directory.{{end}} `{{.Name}}-pp-cli doctor` prints the resolved paths, every store file, and the response-cache size.
+
+None of it is encrypted. New files are created owner-only; beyond that the data relies on OS account permissions and full-disk encryption (FileVault, BitLocker, LUKS).
+
+- **Erase it:** `{{.Name}}-pp-cli local-data purge` lists the store files, response cache, and learn journal it would delete; add `--yes` to delete them, or `--only store|cache|journal` to narrow it. Config and credentials are kept.
+- **Run without a local copy:** set `{{envName .Name}}_NO_LOCAL_DATA=1`. Reads go to the API{{if .HasDataLayer}} (`--data-source live`; `--data-source local` still reads an existing store){{end}}, the response cache is off (`--no-cache`), nothing new is written to the store, and `sync`{{if .HasDataLayer}} and `workflow archive`{{end}} refuse to run. Set it in an MCP host's `env` block and every command the server runs inherits it.
+{{- if .HasDataLayer}}
+- **Choose the read source without flags:** `{{envName .Name}}_DATA_SOURCE=auto|live|local` sets the `--data-source` default; an explicit flag wins.
+{{- end}}
+
 ## Commands
 {{range $name, $resource := .Resources}}
 ### {{$name}}
@@ -492,6 +549,15 @@ Existing installs keep working because the platform-default rung matches the leg
 - **`{{$.Name}}-pp-cli {{kebab $name}} {{kebab $eName}}`** - {{$endpoint.Description}}
 {{- end}}
 {{- end}}
+{{end}}
+{{- if .AdditionalCommandGroups}}
+{{range .AdditionalCommandGroups}}
+### {{.Heading}}
+
+{{range .Commands}}
+- **`{{$.Name}}-pp-cli {{.Invocation}}`** - {{.Description}}
+{{end}}
+{{end}}
 {{end}}
 {{- if .Learn.Enabled}}
 
@@ -551,6 +617,8 @@ Every command supports these output flags:
 - `--agent` — JSON + compact + non-interactive in one flag
 {{- end}}
 
+`--csv` prefixes a leading `'` on cells and header keys that start with `=`, `+`, `-`, `@`, a tab, or a line break (including fullwidth `＝＋－＠`) so a spreadsheet does not run them as formulas. Plain signed numbers such as `-5` and `+2.5e3` are left unchanged.
+
 ## Agent Usage
 
 This CLI is designed for AI agent consumption:
@@ -573,7 +641,7 @@ This CLI is designed for AI agent consumption:
 {{- end}}
 - **Agent-safe by default** - no colors or formatting unless `--human-friendly` is set
 
-Exit codes: `0` success, `2` usage error, `3` not found{{if .HasAuth}}, `4` auth error{{end}}, `5` API error{{if .HasPartialFailureErr}}, `6` partial failure{{end}}, `7` rate limited, `10` config error.
+Exit codes: `0` success, `2` usage error, `3` not found{{if .HasAuth}}, `4` auth error{{end}}, `5` API error{{if .HasPartialFailureErr}}, `6` partial failure{{end}}, `7` rate limited{{if not .HasAuth}} or blocked{{end}}{{if .HasAsyncJobs}}, `8` async job submitted but not finished (rerun the printed recovery command; do not resubmit){{end}}, `10` config error.
 {{- if and .HasDataLayer .HasAutoRefresh}}
 
 ## Freshness
@@ -619,9 +687,12 @@ Verifies configuration{{if and (ne .Auth.Type "") (ne .Auth.Type "none")}}, cred
 
 ## Configuration
 
-Run `{{.Name}}-pp-cli doctor` to see the resolved config, data, state, and cache directories. The platform-default config path is `{{.Config.Path}}`; `--home`, `{{envName .Name}}_HOME`, and per-kind env vars can relocate it.
+{{/* Windows form matches cliutil defaultBase: os.UserHomeDir (USERPROFILE) joined with .config\<name>-pp-cli, not %APPDATA%. */ -}}
+Run `{{.Name}}-pp-cli doctor` to see the resolved config, data, state, and cache directories. The platform-default config path is `{{.Config.Path}}` on macOS/Linux and `%USERPROFILE%\.config\{{.Name}}-pp-cli\config.{{or .Config.Format "json"}}` on Windows; `--home`, `{{envName .Name}}_HOME`, and per-kind env vars can relocate it.
 
 Static request headers can be configured under `headers`; per-command header overrides take precedence.
+
+`--ca-cert`, `{{envPrefix .Name}}_CA_CERT`, or `ca_cert` adds a PEM CA bundle to the system trust roots. `--tls-server-name`, `{{envPrefix .Name}}_TLS_SERVER_NAME`, or `tls_server_name` is the name checked against the certificate when the dialed address does not match it. Precedence is flag, then environment, then the config file. A config file other users can change does not supply these settings. Certificate verification failures are not retried.
 {{- if or .Auth.EnvVarSpecs .Auth.EnvVars}}
 
 Environment variables:
@@ -682,7 +753,7 @@ This CLI uses standard HTTP transport with HTTP/2 disabled for browser-facing en
 
 This CLI uses Chrome-compatible HTTP transport{{if .UsesBrowserHTTP3Transport}} over HTTP/3{{end}} for browser-facing endpoints. It does not require a resident browser process for normal API calls.
 
-TLS certificates are verified by default. For a trusted development or self-signed endpoint only, pass `--insecure` for one invocation, set `{{envPrefix .Name}}_SKIP_TLS_VERIFY=true` for the current environment, or set `skip_tls_verify = true` in the config file for a persistent override.
+TLS certificates are verified by default. For a trusted development or self-signed endpoint only, pass `--insecure` for one invocation, set `{{envPrefix .Name}}_SKIP_TLS_VERIFY=true` for the current environment, or set `skip_tls_verify = true` in the config file for a persistent override. `--insecure` overrides `--ca-cert` and `--tls-server-name`.
 {{- end}}
 {{- if .TrafficAnalysis}}
 

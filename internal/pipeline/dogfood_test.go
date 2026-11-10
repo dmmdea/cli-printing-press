@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 
@@ -1092,7 +1093,7 @@ func newRootCmd() *cobra.Command {
 		},
 	}, researchDir))
 
-	got := checkDescriptionDrift(dir, researchDir)
+	got := checkDescriptionDrift(dir, researchDir, "")
 	require.Len(t, got.Findings, 2)
 	assert.Equal(t, "Fresh headline from research", got.Expected)
 	assert.Contains(t, got.Findings[0].Actual, "Old stale headline")
@@ -1100,6 +1101,193 @@ func newRootCmd() *cobra.Command {
 		PipelineCheck:         PipelineResult{SyncCallsDomain: true, SyncResourcesPresent: true},
 		DescriptionDriftCheck: &got,
 	}, false))
+}
+
+func writeRootGo(t *testing.T, dir, short string) {
+	t.Helper()
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "internal", "cli"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "internal", "cli", "root.go"), []byte(`package cli
+
+import "github.com/spf13/cobra"
+
+func newRootCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "example",
+		Short: `+"`"+short+"`"+`,
+	}
+}
+`), 0o644))
+}
+
+func writeManifestDescription(t *testing.T, dir, desc string) {
+	t.Helper()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, CLIManifestFilename), []byte(`{"schema_version":1,"description":"`+desc+`"}`+"\n"), 0o644))
+}
+
+// TestCheckDescriptionDriftCLIDescriptionVariants verifies that a root.Short
+// rendered from spec's cli_description is accepted as long as the generated
+// code is untouched, even when cli_description and narrative.headline differ.
+func TestCheckDescriptionDriftCLIDescriptionVariants(t *testing.T) {
+	const headline = "Headline from research"
+
+	tests := []struct {
+		name           string
+		cliDescription string // spec's cli_description
+		rootShort      string // Short in root.go (what the template emits)
+		wantFindings   int
+	}{
+		{
+			name:           "cli_description empty, root.Short equals headline",
+			cliDescription: "",
+			rootShort:      headline,
+			wantFindings:   0,
+		},
+		{
+			name:           "cli_description equals headline, root.Short equals headline",
+			cliDescription: headline,
+			rootShort:      headline,
+			wantFindings:   0,
+		},
+		{
+			name:           "cli_description distinct from headline, root.Short is rendered cli_description",
+			cliDescription: "Distinct one-liner from the spec",
+			rootShort:      "Distinct one-liner from the spec",
+			wantFindings:   0,
+		},
+		{
+			name:           "cli_description with backtick, root.Short has apostrophe (goRawSafe)",
+			cliDescription: "The `--agent` flag CLI",
+			rootShort:      "The '--agent' flag CLI",
+			wantFindings:   0,
+		},
+		{
+			name:           "cli_description distinct, root.Short hand-edited to unrelated text",
+			cliDescription: "Distinct one-liner from the spec",
+			rootShort:      "Completely unrelated hand-edited text",
+			wantFindings:   1,
+		},
+		{
+			name:           "cli_description empty, root.Short unrelated to headline",
+			cliDescription: "",
+			rootShort:      "Completely unrelated hand-edited text",
+			wantFindings:   1,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeRootGo(t, dir, tc.rootShort)
+			writeManifestDescription(t, dir, headline)
+			researchDir := t.TempDir()
+			require.NoError(t, writeResearchJSON(&ResearchResult{
+				Narrative: &ReadmeNarrative{Headline: headline},
+			}, researchDir))
+
+			got := checkDescriptionDrift(dir, researchDir, tc.cliDescription)
+			rootFindings := 0
+			for _, f := range got.Findings {
+				if f.Surface == "root.Short" {
+					rootFindings++
+				}
+			}
+			assert.Equal(t, tc.wantFindings, rootFindings, "root.Short findings mismatch")
+		})
+	}
+}
+
+// TestRenderRootShortFromCLIDescription verifies the helper matches the
+// truncateWords+goRawSafe logic in root.go.tmpl.
+func TestRenderRootShortFromCLIDescription(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{"empty", "", ""},
+		{"short no backtick", "Short string", "Short string"},
+		{"backtick replaced", "The `--flag` option", "The '--flag' option"},
+		{"exactly 200 runes", strings.Repeat("b", 200), strings.Repeat("b", 200)},
+		{"over 200 runes clips at word", "word " + strings.Repeat("x", 300), "word…"},
+		{"multibyte runes counted by rune not byte", "α " + strings.Repeat("β", 300), "α…"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := renderRootShortFromCLIDescription(tc.input)
+			assert.Equal(t, tc.want, got)
+		})
+	}
+}
+
+func TestDogfoodExampleCoverageUnderivableInputs(t *testing.T) {
+	exampleless := []string{"comments create", "items get", "videos get"}
+	for _, tc := range []struct {
+		name    string
+		spec    string
+		tested  int
+		missing []string
+		omitted []string
+	}{
+		{
+			name: "omitted underivable inputs excluded",
+			spec: examplelessLiveDogfoodSpec, tested: 1, omitted: exampleless,
+		},
+		{
+			name:   "derivable inputs without examples still missing",
+			spec:   strings.ReplaceAll(examplelessLiveDogfoodSpec, "required: true", "required: true\n            example: concrete-value"),
+			tested: 4, missing: exampleless,
+		},
+		{
+			name:   "no spec preserves coverage",
+			tested: 4, missing: exampleless,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			require.NoError(t, os.MkdirAll(filepath.Join(dir, "cmd", "fixture-pp-cli"), 0o755))
+			writeTestFile(t, filepath.Join(dir, "go.mod"), "module example.com/fixture\n\ngo 1.24.0\n")
+			writeTestFile(t, filepath.Join(dir, "cmd", "fixture-pp-cli", "main.go"), `package main
+import (
+    "fmt"
+    "os"
+    "strings"
+)
+func main() {
+    args := strings.Join(os.Args[1:], " ")
+    if args == "agent-context" {
+        fmt.Println(`+"`"+`{"commands":[
+            {"name":"comments","subcommands":[{"name":"create","annotations":{"pp:endpoint":"comments.create"}}]},
+            {"name":"items","subcommands":[
+                {"name":"get","annotations":{"pp:endpoint":"items.get"}},
+                {"name":"list","annotations":{"pp:endpoint":"items.list"}}
+            ]},
+            {"name":"videos","subcommands":[{"name":"get","annotations":{"pp:endpoint":"videos.get"}}]}
+        ]}`+"`"+`)
+        return
+    }
+    fmt.Println("Usage:\n  fixture-pp-cli " + args)
+    if args == "items list --help" {
+        fmt.Println("\nExamples:\n  fixture-pp-cli items list\n\nFlags:\n  --help   help")
+    }
+}
+`)
+			var specPath string
+			if tc.spec != "" {
+				specPath = filepath.Join(dir, "spec.yaml")
+				writeTestFile(t, specPath, tc.spec)
+			}
+			report, err := RunDogfood(dir, specPath)
+			require.NoError(t, err)
+			result := report.ExampleCheck
+			require.False(t, result.Skipped, result.Detail)
+			assert.Equal(t, tc.tested, result.Tested)
+			assert.Equal(t, 1, result.WithExamples)
+			assert.Equal(t, 1, result.ValidExamples)
+			assert.Equal(t, tc.missing, result.Missing)
+			assert.Equal(t, tc.omitted, result.OmittedUnderivable)
+			assert.Equal(t, len(tc.missing) > 0, slices.Contains(report.Issues, "25% example coverage"))
+		})
+	}
 }
 
 func TestExtractExamplesSection(t *testing.T) {
@@ -1860,6 +2048,7 @@ paths:
 
 	preferred, err := loadDogfoodOpenAPISpec(specPath, "ApiKeyAuth")
 	require.NoError(t, err)
+	require.NotNil(t, preferred.Parsed)
 	assert.Equal(t, "api_key", preferred.Auth.Type)
 	assert.Equal(t, "ApiKeyAuth", preferred.Auth.Scheme)
 	assert.Equal(t, "x-api-key", preferred.Auth.Header)
@@ -2787,7 +2976,7 @@ func context() map[string]any {
 		Command:     "fresh scan",
 		Description: "Fresh copy from research",
 		Rationale:   "Requires current research",
-	}}, true)
+	}}, true, false)
 	require.NoError(t, err)
 	assert.Contains(t, artifacts, syncedArtifact{Path: filepath.Join("internal", "mcp", "tools.go"), Detail: "command_mirror_capabilities"})
 
@@ -3367,6 +3556,35 @@ func runCmd() {
 
 	result := checkDeadFunctions(dir)
 	assert.Equal(t, 3, result.Total)
+	assert.Equal(t, 0, result.Dead)
+	assert.Empty(t, result.Items)
+}
+
+func TestDeadFunctions_CalledFromMCPPackage(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "internal", "cli"), 0o755))
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "internal", "mcp"), 0o755))
+
+	writeTestFile(t, filepath.Join(dir, "internal", "cli", "helpers.go"), `package cli
+
+func MCPStorePath() (string, error) {
+	return "data.db", nil
+}
+`)
+	writeTestFile(t, filepath.Join(dir, "internal", "cli", "cmd.go"), `package cli
+
+func runCmd() {
+}
+`)
+	writeTestFile(t, filepath.Join(dir, "internal", "mcp", "tools.go"), `package mcp
+
+func mcpDBPath() (string, error) {
+	return cli.MCPStorePath()
+}
+`)
+
+	result := checkDeadFunctions(dir)
+	assert.Equal(t, 1, result.Total)
 	assert.Equal(t, 0, result.Dead)
 	assert.Empty(t, result.Items)
 }
@@ -4183,7 +4401,7 @@ EOF
 	require.NoError(t, err, "stderr noise must not break JSON parsing")
 	// auth/login is filtered out because "auth" is in the framework
 	// skip set; only the posts subtree should survive.
-	assert.Equal(t, [][]string{{"posts", "list"}}, paths)
+	assert.Equal(t, []dogfoodAgentCommandPath{{Path: []string{"posts", "list"}}}, paths)
 }
 
 // TestDiscoverExampleCheckCommandsSurfacesStderrOnFailure — when the

@@ -116,7 +116,7 @@ if ! command -v go >/dev/null 2>&1; then
   echo "[setup-error] Go toolchain not found."
   echo ""
   echo "This Printing Press flow runs Go-based build or validation commands."
-  echo "Install Go 1.26.6 or newer from https://go.dev/dl/, then verify with:"
+  echo "Install Go 1.26.10 or newer from https://go.dev/dl/, then verify with:"
   echo "  go version"
   echo "Then re-run this skill."
   echo ""
@@ -466,23 +466,46 @@ fi
 # CLI lives under $PRESS_RUNSTATE/runs/<id>/working/<cli> (mid-pipeline
 # polish). Without it, scorecard looks adjacent to the binary, doesn't
 # find research.json, and reports `unable: true`.
+# A bare scorecard and scorecard --write-manifest report the same total.
+# A verify summary already in .printing-press.json is included either way;
+# a Calibration line means that summary raised the total. --spec changes
+# the domain denominator, which human output prints beside the total —
+# compare runs that passed the same spec.
 "$PRINTING_PRESS_BIN" scorecard --dir "$CLI_DIR" $SPEC_FLAG "${RESEARCH_ARGS[@]}" --live-check --json > /tmp/polish-scorecard.json 2>&1 || true
 "$PRINTING_PRESS_BIN" scorecard --dir "$CLI_DIR" $SPEC_FLAG 2>&1
 "$PRINTING_PRESS_BIN" tools-audit "$CLI_DIR" --json > /tmp/polish-tools-audit-before.json 2>&1 || true
 "$PRINTING_PRESS_BIN" pii-audit "$CLI_DIR" "${PII_ARGS[@]}" --json > /tmp/polish-pii-audit-before.json 2>&1 || true
 go vet ./... 2>&1
-if command -v gosec >/dev/null 2>&1; then
-  gosec -fmt=json -out=/tmp/polish-gosec-before.json ./... 2>&1 || true
-else
-  go run github.com/securego/gosec/v2/cmd/gosec@v2.26.1 -fmt=json -out=/tmp/polish-gosec-before.json ./... 2>&1 || true
-fi
+# Released gosec bundles a golang.org/x/tools that cannot read newer Go export
+# data, so on a newer toolchain it silently skips packages. polish_gosec uses an
+# installed gosec only when it loads every package; otherwise it builds the
+# pinned gosec against a current x/tools in a private temp dir. Each block runs
+# in its own shell, so the after-fix scan repeats this definition verbatim.
+polish_gosec() {
+  local out="$*" built
+  if command -v gosec >/dev/null 2>&1; then
+    gosec -fmt=json -out="$out" ./... 2>&1 || true
+    [ "$(jq '(."Golang errors" // {}) | length' "$out" 2>/dev/null || echo 1)" = 0 ] && return 0
+    echo "polish_gosec: installed gosec could not load every package; building the pinned fallback" >&2
+  fi
+  built=$(mktemp -d) || return 1
+  if ! (cd "$built" && export GOWORK=off && go mod init polish-gosec && go get github.com/securego/gosec/v2/cmd/gosec@v2.29.0 golang.org/x/tools@v0.52.0 && go build -o gosec github.com/securego/gosec/v2/cmd/gosec) >"$built/build.log" 2>&1; then
+    echo "polish_gosec: could not build the gosec fallback:" >&2
+    tail -n 20 "$built/build.log" >&2
+    rm -rf "$built"
+    return 1
+  fi
+  "$built/gosec" -fmt=json -out="$out" ./... 2>&1 || true
+  rm -rf "$built"
+}
+polish_gosec /tmp/polish-gosec-before.json
 ```
 
 verify-skill and workflow-verify run alongside dogfood/verify/scorecard so polish catches the same class of failures the public-library CI catches. `publish-validate` runs only when `STANDALONE_MODE=true` (slash-command or `--standalone` Skill-tool invocation). The publish-validate leg is a hard ship-gate **for standalone polish**: in that mode polish cannot recommend `ship` or `ship-with-gaps` while `"$PRINTING_PRESS_BIN" publish validate` reports `passed: false`. Mid-pipeline polish (`STANDALONE_MODE=false`) skips publish-validate entirely — its prerequisites (manifest.printer from `git config github.user`, packaged `tools-manifest.json`, phase5 acceptance proof relocated under `$CLI_DIR/.manuscripts/<run>/proofs/`) are parent-pipeline-owned and not yet satisfied at this point; the main SKILL's Phase 6 publish flow gates on publish-validate at the correct time. See "Ship logic" below for how this affects ship_recommendation.
 
 **Live matrix qualifier.** After each `scorecard --live-check --json` run, read `/tmp/polish-scorecard.json` and record whether `live_check` actually exercised live samples. Treat it as `exercised` only when `live_check.unable` is false and at least one feature was evaluated (`passed + failed > 0`, or equivalent feature statuses). Treat `live_check.unable: true`, no `live_check`, no evaluated features, or missing credentials/token as `not_exercised`. A clean mock dogfood/verify run is still useful, but it is **not** a live matrix pass.
 
-`gosec` runs as the off-the-shelf security static-analysis leg for hand-written Go. Prefer an installed `gosec` binary when present; otherwise use the pinned `go run github.com/securego/gosec/v2/cmd/gosec@v2.26.1` fallback so a clean machine still gets a reproducible check without a separate setup step. Read `/tmp/polish-gosec-before.json` for the baseline finding count and issue details. If the command fails before writing JSON, treat the missing scan as a polish failure: add it to `remaining_issues`, set `ship_recommendation: hold`, and include the stderr summary so the next run can distinguish network/tooling failure from CLI defects. Prioritize findings in hand-authored files: whole files under `internal/cli/`, `internal/syncer/`, and `internal/store/` whose first 20 lines lack the `Generated by CLI Printing Press` header are polish-owned novel-feature code. Findings in generator-emitted files are Printing Press retro candidates unless they can be fixed durably by changing the spec and regenerating; do not hand-edit generated files just to silence gosec.
+`gosec` runs as the off-the-shelf security static-analysis leg for hand-written Go. Prefer an installed `gosec` binary when present; `polish_gosec` (defined verbatim in both the baseline and after-fix blocks) falls back to building the pinned `github.com/securego/gosec/v2/cmd/gosec@v2.29.0` against `golang.org/x/tools@v0.52.0` when no binary is installed or the installed one cannot load every package, so a clean machine on a current Go toolchain still gets a full, reproducible check without a separate setup step. Read `/tmp/polish-gosec-before.json` for the baseline finding count and issue details. If the command fails before writing JSON (including a fallback build failure, which `polish_gosec` reports on stderr with a non-zero return), or the JSON still has a non-empty `"Golang errors"` map (packages gosec could not type-check, so their findings are missing), treat the scan as a polish failure: add it to `remaining_issues`, set `ship_recommendation: hold`, and include the stderr or error summary so the next run can distinguish network/tooling failure from CLI defects. Prioritize findings in hand-authored files: whole files under `internal/cli/`, `internal/syncer/`, and `internal/store/` whose first 20 lines lack the `Generated by CLI Printing Press` header are polish-owned novel-feature code. Findings in generator-emitted files are Printing Press retro candidates unless they can be fixed durably by changing the spec and regenerating; do not hand-edit generated files just to silence gosec.
 
 **If Phase 1 baseline reveals the underlying CLI needs re-discovery** — broken HTML/SSR extraction, sparse capture (fewer than 5 unique endpoints in the source manuscript), wrong endpoint shapes, missing GraphQL operation hashes, or any signal that the CLI was generated from incomplete capture — polish does not normally do browser capture itself. When re-discovery is required, use the capture backends the runtime already exposes (Claude chrome-MCP `mcp__claude-in-chrome__*` and computer-use `mcp__computer-use__*`) rather than inventing a new capture flow. Re-discovery from polish is rare but real.
 
@@ -504,7 +527,7 @@ Parse findings into categories:
 | Output entity warnings | scorecard JSON | `live_check.features[].warnings` — raw HTML entities in human output |
 | Output plausibility | Phase 4.85 | Findings from the agentic output review |
 | MCP tool quality | tools-audit | Empty Short, thin Short, missing read-only annotations, thin MCP descriptions |
-| Customer PII | pii-audit | Card last-4, email, phone, ZIP+4, postal-address shapes in high-risk files (manuscripts, fixtures, README) |
+| Customer PII | pii-audit | Card last-4, email, phone, ZIP+4, postal-address, and account-identifier shapes in high-risk files (manuscripts, fixtures, README) |
 
 **Environmental failures vs. CLI defects.** Some Phase 1 outputs surface failures that aren't real CLI bugs and should not block ship:
 
@@ -525,7 +548,7 @@ Skill(
 )
 ```
 
-Parse the returned `---OUTPUT-REVIEW-RESULT---` block. `status: WARN` findings flow into the diagnostic categories above so Phase 2 fixes address both rule-based and plausibility issues. `status: SKIP` is informational — record but don't block.
+Parse the returned `---OUTPUT-REVIEW-RESULT---` block. `status: WARN` findings flow into the diagnostic categories above so Phase 2 fixes address both rule-based and plausibility issues. `status: SKIP` means the review did not run: record it as skipped, do not count it as a pass, and do not block on it.
 
 Wave B gating applies: all findings are warnings, never blockers. Fix if obvious and cheap; document with a short comment if deferred.
 
@@ -687,6 +710,7 @@ only to inspect the current output.
 | README Quick Start | `research.json::narrative.quickstart[]` | Edit the command/comment in `research.json`, then regenerate or re-run the dogfood/rendering step. |
 | SKILL Recipes | `research.json::narrative.recipes[]` | Edit the recipe title, command, or explanation in `research.json`, then regenerate or re-run the dogfood/rendering step. |
 | README/SKILL Troubleshooting | `research.json::narrative.troubleshoots[]` | Edit the symptom/fix pair in `research.json`, then regenerate or re-run the dogfood/rendering step. |
+| `.printing-press.json` `homepage` | `research.json::homepage` | Fix it in `research.json`, then correct or remove `homepage` in the working CLI's `.printing-press.json` before regenerating: an existing manifest value wins over research on regenerate. A value already in the library manifest also wins on promote and publish, so correct a published homepage in the library copy too. |
 | `.printing-press.json` `display_name`, `description`, `mcp_*` | `WriteManifestForGenerate`; for description/display-name overrides, edit the spec (`info.title`, `info.x-display-name`, `info.description`) | Edit the spec or rerun the manifest writer. Do not hand-edit generated manifest metadata unless you are doing temporary diagnosis. |
 
 Recommended loop for these rendered sections: edit the source field, re-run
@@ -792,7 +816,7 @@ Proceed to "After all fixes" only when the audit's summary line reads `no pendin
 
 ### Priority 8: Customer-PII gate
 
-**Your goal now is to clear the PII ledger so promote and publish gates pass.** The PII gate is the deterministic floor that prevents real customer values from reaching published library content. It catches card-last-4, email, US phone, ZIP+4, and postal-address shapes in high-risk files.
+**Your goal now is to clear the PII ledger so promote and publish gates pass.** The PII gate is the deterministic floor that prevents real customer values from reaching published library content. It catches card-last-4, email, US phone, ZIP+4, postal-address, and account-identifier shapes in high-risk files.
 
 Stop and:
 
@@ -829,14 +853,27 @@ fi
 "$PRINTING_PRESS_BIN" tools-audit "$CLI_DIR" 2>&1
 "$PRINTING_PRESS_BIN" pii-audit "$CLI_DIR" "${PII_ARGS[@]}" 2>&1
 go vet ./... 2>&1
-if command -v gosec >/dev/null 2>&1; then
-  gosec -fmt=json -out=/tmp/polish-gosec-after.json ./... 2>&1 || true
-else
-  go run github.com/securego/gosec/v2/cmd/gosec@v2.26.1 -fmt=json -out=/tmp/polish-gosec-after.json ./... 2>&1 || true
-fi
+polish_gosec() {
+  local out="$*" built
+  if command -v gosec >/dev/null 2>&1; then
+    gosec -fmt=json -out="$out" ./... 2>&1 || true
+    [ "$(jq '(."Golang errors" // {}) | length' "$out" 2>/dev/null || echo 1)" = 0 ] && return 0
+    echo "polish_gosec: installed gosec could not load every package; building the pinned fallback" >&2
+  fi
+  built=$(mktemp -d) || return 1
+  if ! (cd "$built" && export GOWORK=off && go mod init polish-gosec && go get github.com/securego/gosec/v2/cmd/gosec@v2.29.0 golang.org/x/tools@v0.52.0 && go build -o gosec github.com/securego/gosec/v2/cmd/gosec) >"$built/build.log" 2>&1; then
+    echo "polish_gosec: could not build the gosec fallback:" >&2
+    tail -n 20 "$built/build.log" >&2
+    rm -rf "$built"
+    return 1
+  fi
+  "$built/gosec" -fmt=json -out="$out" ./... 2>&1 || true
+  rm -rf "$built"
+}
+polish_gosec /tmp/polish-gosec-after.json
 ```
 
-Record the after scores, including the live matrix qualifier from the final `scorecard --live-check --json` output. If the gosec command fails before writing `/tmp/polish-gosec-after.json`, treat the missing post-fix scan as a polish failure: add it to `remaining_issues`, set `ship_recommendation: hold`, and include the stderr summary. If verify-skill still has any `severity=error` findings, workflow-verify still reports `workflow-fail`, publish-validate still reports `passed: false` (standalone mode only — mid-pipeline polish doesn't run this check), gosec still reports unresolved findings in hand-authored novel-feature Go, pii-audit still has pending findings or gate failures, or the final live matrix qualifier is `not_exercised`, ship cannot fire (see ship logic below). For a non-exercised live matrix, add a `remaining_issues` item such as `live matrix not exercised (mock-only/no live token); run the live gate before publish`.
+Record the after scores, including the live matrix qualifier from the final `scorecard --live-check --json` output. If the gosec command fails before writing `/tmp/polish-gosec-after.json`, or that report still has a non-empty `"Golang errors"` map, treat the missing or partial post-fix scan as a polish failure: add it to `remaining_issues`, set `ship_recommendation: hold`, and include the stderr summary. If verify-skill still has any `severity=error` findings, workflow-verify still reports `workflow-fail`, publish-validate still reports `passed: false` (standalone mode only — mid-pipeline polish doesn't run this check), gosec still reports unresolved findings in hand-authored novel-feature Go, pii-audit still has pending findings or gate failures, or the final live matrix qualifier is `not_exercised`, ship cannot fire (see ship logic below). For a non-exercised live matrix, add a `remaining_issues` item such as `live matrix not exercised (mock-only/no live token); run the live gate before publish`.
 
 ## Ship logic
 
@@ -878,7 +915,7 @@ When `mcp_token_efficiency`, `mcp_tool_design`, `mcp_remote_transport`, or `mcp_
 | Weak dim | Spec field that fixes it | What to add to `spec.yaml`'s `mcp:` block |
 |---|---|---|
 | `mcp_remote_transport` | `mcp.transport` | `transport: [stdio, http]` (small APIs at or under `spec.DefaultRemoteTransportEndpointThreshold` typed endpoints already get this by default; the override is only needed when the spec opted into a narrower list or the API is above the threshold and still wants remote reach) |
-| `mcp_token_efficiency`, `mcp_surface_strategy` | `mcp.endpoint_tools`, `mcp.orchestration` | `endpoint_tools: hidden` + `orchestration: code` (Cloudflare pattern: ~70 raw endpoint tools collapse to `<api>_search` + `<api>_execute`; all endpoints still reachable via execute) |
+| `mcp_token_efficiency`, `mcp_surface_strategy` | `mcp.endpoint_tools`, `mcp.orchestration` | `endpoint_tools: hidden` + `orchestration: code` (Cloudflare pattern: ~70 raw endpoint tools collapse to `<api>_search` + `<api>_read` + `<api>_execute`; reads use `_read`, and `_execute` previews state-changing calls until `confirm` is boolean `true`) |
 | `mcp_tool_design` | `mcp.intents` | Define multi-step intent compositions for the workflows the API supports |
 | `mcp_description_quality` | `mcp-descriptions.json` (override file at the CLI root) | Per-tool description overrides; thin spec-derived descriptions get richer text without spec edits |
 

@@ -499,7 +499,9 @@ it captures cookies once via a controlled Chrome window and serves them to
 generated CLIs on demand, avoiding the on-disk session-cookie blind spot
 that breaks `auth login --chrome` against a daily Chrome profile. See
 [references/auth-companion.md](../references/auth-companion.md) for the
-recommendation flow, install command, and debug playbook.
+recommendation flow, install command, and debug playbook. That reference
+covers host-only cookies set on a subdomain of the apex; leave the default
+capture scope unchanged.
 
 ### Pre-Generation MCP Enrichment
 
@@ -546,7 +548,11 @@ predicts more than 50 endpoint tools, expect `generate` to print an informationa
 line beginning `info: applied Cloudflare MCP pattern`. This is the intended
 default and does not require a blocking question. Before verification, polish,
 dogfood, or publish, confirm the generated MCP surface is the thin
-`<api>_search` + `<api>_execute` pair plus any cobratree-walked command tools.
+`<api>_search`, `<api>_read`, and `<api>_execute` set plus any cobratree-walked
+command tools. `<api>_read` calls GET reads and codegen-marked read-only POSTs.
+`<api>_execute` previews DELETE and other state-changing calls, including
+mutating GETs, and performs no HTTP until `confirm` is boolean `true`. Specs
+with no state-changing endpoints omit `<api>_execute`.
 If the user explicitly wants raw endpoint tools past the threshold, set
 `mcp.orchestration: endpoint-mirror` (internal YAML) or
 `x-mcp.orchestration: endpoint-mirror` (OpenAPI) before regenerating.
@@ -559,7 +565,7 @@ older generator versions:
 ```yaml
 mcp:
   transport: [stdio, http]    # remote-capable; reaches hosted agents
-  orchestration: code         # thin <api>_search + <api>_execute pair
+  orchestration: code         # <api>_search + <api>_read + confirming <api>_execute
   endpoint_tools: hidden      # suppress raw per-endpoint mirrors
   intents:                    # optional; named multi-step intents
     - name: fetch_and_summarize
@@ -583,8 +589,8 @@ mcp:
 
 `mcp.transport: [stdio, http]` adds HTTP streamable transport so cloud-hosted
 agents (Managed Agents, web clients) can connect. `mcp.orchestration: code`
-emits the thin search+execute pair that covers the typed-endpoint surface in
-~1K tokens.
+emits the thin search, read, and execute tools and covers the typed-endpoint surface
+in ~1K tokens. Execute previews state-changing calls until `confirm` is boolean `true`.
 `mcp.endpoint_tools: hidden` removes the raw per-endpoint tools that would
 otherwise still show up alongside the orchestration pair.
 

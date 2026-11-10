@@ -101,7 +101,7 @@ If you can't use the MCPB bundle (older Claude Desktop, unsupported platform), i
 
 Install the MCP binary from this CLI's published public-library entry or pre-built release.
 
-Add to your Claude Desktop config (`~/Library/Application Support/Claude/claude_desktop_config.json`):
+Add to your Claude Desktop config (`~/Library/Application Support/Claude/claude_desktop_config.json` on macOS, `%APPDATA%\Claude\claude_desktop_config.json` on Windows):
 
 ```json
 {
@@ -117,6 +117,17 @@ Add to your Claude Desktop config (`~/Library/Application Support/Claude/claude_
 ```
 
 </details>
+
+### Remote MCP over HTTP
+
+`learn-disabled-example-pp-mcp --transport http` (or `PP_MCP_TRANSPORT=http`) serves streamable HTTP at `http://127.0.0.1:7777/mcp`. It refuses to start until `LEARN_DISABLED_EXAMPLE_MCP_HTTP_TOKEN` is set to at least 32 characters, and every request must send `Authorization: Bearer <token>`. The command below prints 64 hex characters and meets that minimum. Plain HTTP is allowed only on a loopback `--addr`; any other bind, including `:7777` (every interface), also needs `--tls-cert` and `--tls-key`. Requests with no `Origin` header are accepted, as are loopback origins (`localhost`, `127.0.0.1`, or `[::1]`, any port). Any other `Origin` is refused unless it is listed in `LEARN_DISABLED_EXAMPLE_MCP_HTTP_ALLOWED_ORIGINS`, a comma-separated list of `scheme://host[:port]` values with no path. That list is not a CORS policy; the server does not emit CORS headers.
+
+```bash
+export LEARN_DISABLED_EXAMPLE_MCP_HTTP_TOKEN="$(openssl rand -hex 32)"
+learn-disabled-example-pp-mcp --transport http
+```
+
+Set `LEARN_DISABLED_EXAMPLE_MCP_READ_ONLY=1` (exactly `1`) to drop mirrored commands that are not marked read-only and make the raw execute tool refuse state-changing calls. Commands marked local-write, which write only this CLI's own learn store, stay available.
 
 ## Quick Start
 
@@ -184,6 +195,15 @@ learn-disabled-example-pp-cli doctor
 
 Under `LEARN_DISABLED_EXAMPLE_HOME=/srv/learn-disabled-example`, the four dirs resolve to `/srv/learn-disabled-example/config`, `/srv/learn-disabled-example/data`, `/srv/learn-disabled-example/state`, and `/srv/learn-disabled-example/cache`.
 
+On Windows, set the same variable in PowerShell:
+
+```powershell
+$env:LEARN_DISABLED_EXAMPLE_HOME = "C:\srv\learn-disabled-example"
+learn-disabled-example-pp-cli doctor
+```
+
+Under `$env:LEARN_DISABLED_EXAMPLE_HOME = "C:\srv\learn-disabled-example"`, the four dirs resolve to `C:\srv\learn-disabled-example\config`, `C:\srv\learn-disabled-example\data`, `C:\srv\learn-disabled-example\state`, and `C:\srv\learn-disabled-example\cache`.
+
 MCP servers do not receive CLI flags from the host. Put relocation in the host `env` block:
 
 ```json
@@ -204,6 +224,16 @@ Precedence matters in fleets: an ambient per-kind variable such as `LEARN_DISABL
 Relocation is one-way. Unsetting `LEARN_DISABLED_EXAMPLE_HOME` does not move files back to platform defaults, and `doctor` cannot find credentials left under a former root. Move the files manually before unsetting relocation variables.
 
 Existing installs keep working because the platform-default rung matches the legacy layout. On the first auth write, stored secrets leave `config.toml` and are consolidated into `credentials.toml` under the data directory. Run `learn-disabled-example-pp-cli doctor --fail-on warn` to check path and credential-location warnings in automation.
+
+### Local data
+
+Reads are saved locally by default: in `--data-source auto` mode every successful read is also written to the SQLite store (`data.db`, or `data-<hash>.db` per credential) in the data directory. GET responses are cached for five minutes under `http/` in the cache directory. Credentials live in `credentials.toml` in the data directory. `learn-disabled-example-pp-cli doctor` prints the resolved paths, every store file, and the response-cache size.
+
+None of it is encrypted. New files are created owner-only; beyond that the data relies on OS account permissions and full-disk encryption (FileVault, BitLocker, LUKS).
+
+- **Erase it:** `learn-disabled-example-pp-cli local-data purge` lists the store files, response cache, and learn journal it would delete; add `--yes` to delete them, or `--only store|cache|journal` to narrow it. Config and credentials are kept.
+- **Run without a local copy:** set `LEARN_DISABLED_EXAMPLE_NO_LOCAL_DATA=1`. Reads go to the API (`--data-source live`; `--data-source local` still reads an existing store), the response cache is off (`--no-cache`), nothing new is written to the store, and `sync` and `workflow archive` refuse to run. Set it in an MCP host's `env` block and every command the server runs inherits it.
+- **Choose the read source without flags:** `LEARN_DISABLED_EXAMPLE_DATA_SOURCE=auto|live|local` sets the `--data-source` default; an explicit flag wins.
 
 ## Commands
 
@@ -232,6 +262,8 @@ learn-disabled-example-pp-cli games --dry-run
 learn-disabled-example-pp-cli games --agent
 ```
 
+`--csv` prefixes a leading `'` on cells and header keys that start with `=`, `+`, `-`, `@`, a tab, or a line break (including fullwidth `＝＋－＠`) so a spreadsheet does not run them as formulas. Plain signed numbers such as `-5` and `+2.5e3` are left unchanged.
+
 ## Agent Usage
 
 This CLI is designed for AI agent consumption:
@@ -256,9 +288,11 @@ Verifies configuration, credentials, and connectivity to the API.
 
 ## Configuration
 
-Run `learn-disabled-example-pp-cli doctor` to see the resolved config, data, state, and cache directories. The platform-default config path is ``; `--home`, `LEARN_DISABLED_EXAMPLE_HOME`, and per-kind env vars can relocate it.
+Run `learn-disabled-example-pp-cli doctor` to see the resolved config, data, state, and cache directories. The platform-default config path is `~/.config/learn-disabled-example-pp-cli/config.toml` on macOS/Linux and `%USERPROFILE%\.config\learn-disabled-example-pp-cli\config.toml` on Windows; `--home`, `LEARN_DISABLED_EXAMPLE_HOME`, and per-kind env vars can relocate it.
 
 Static request headers can be configured under `headers`; per-command header overrides take precedence.
+
+`--ca-cert`, `LEARN_DISABLED_EXAMPLE_CA_CERT`, or `ca_cert` adds a PEM CA bundle to the system trust roots. `--tls-server-name`, `LEARN_DISABLED_EXAMPLE_TLS_SERVER_NAME`, or `tls_server_name` is the name checked against the certificate when the dialed address does not match it. Precedence is flag, then environment, then the config file. A config file other users can change does not supply these settings. Certificate verification failures are not retried.
 
 Environment variables:
 

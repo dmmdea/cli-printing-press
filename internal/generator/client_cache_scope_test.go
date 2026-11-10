@@ -29,10 +29,13 @@ func TestClientCacheKeyScopesByBaseURLAndAuthIdentity(t *testing.T) {
 	body := clientCacheKeyForBody(t, client)
 
 	require.Contains(t, body, `"|base_url=" + c.BaseURL`, "cache keys must isolate staging/prod or per-tenant base URLs")
-	require.Contains(t, body, `"|auth_source=" + c.Config.AuthSource`, "cache keys should distinguish env/config/profile auth sources")
-	require.Contains(t, body, `authHeader := c.Config.AuthHeader()`, "cache keys should capture AuthHeader() once")
+	require.Contains(t, body, `authSource, authHeader := c.cachedAuthIdentity()`, "cache keys should read auth source and header together")
+	require.Contains(t, body, `"|auth_source=" + authSource`, "cache keys should distinguish env/config/profile auth sources")
+	identity := clientFuncBody(t, client, "func (c *Client) cachedAuthIdentity(")
+	require.Contains(t, identity, `c.Config.CurrentAuthSource()`, "cache identity should read the stamped auth source")
+	require.Equal(t, 1, strings.Count(identity, `c.Config.AuthHeader()`), "cache identity should capture AuthHeader() once")
 	require.Contains(t, body, `sha256.Sum256([]byte(authHeader))`, "cache keys should include an auth fingerprint without storing the raw token")
-	require.NotContains(t, body, `sha256.Sum256([]byte(c.Config.AuthHeader()))`, "cache keys should reuse the captured authHeader, not call AuthHeader() twice")
+	require.NotContains(t, body, `c.Config.AuthHeader()`, "cache keys should reuse the captured authHeader, not call AuthHeader() directly")
 	require.Contains(t, body, `query := url.Values{}`, "cache keys should encode query params with structured delimiters")
 	require.Contains(t, body, `key += "|query=" + query.Encode()`, "cache keys should use url.Values.Encode for deterministic query boundaries")
 	require.Contains(t, body, `key += "|tenant=" + canonicalTenantSelectingHeaders(c.Config, headers)`,
@@ -270,6 +273,104 @@ func TestReadCacheWithHeadersRechmodsFreshLegacyFile(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(outputDir, "internal", "client", "cache_chmod_runtime_test.go"), []byte(runtimeTest), 0o600))
 	requireGeneratedCompiles(t, outputDir)
 	runGoCommand(t, outputDir, "test", "./internal/client", "-run", "^Test(WriteCacheWithHeadersRechmodsExistingFile|WriteCacheWithHeadersReplacesOpenInode|ReadCacheWithHeadersRechmodsFreshLegacyFile)$", "-count=1")
+}
+
+func TestGeneratedClientSweepsExpiredCacheEntries(t *testing.T) {
+	t.Parallel()
+
+	apiSpec := minimalSpec("cache-sweep")
+	outputDir := filepath.Join(t.TempDir(), "cache-sweep-pp-cli")
+	require.NoError(t, New(apiSpec, outputDir).Generate())
+
+	const runtimeTest = `package client
+
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"cache-sweep-pp-cli/internal/cliutil"
+	"cache-sweep-pp-cli/internal/config"
+)
+
+func writeAgedCacheFile(t *testing.T, path string, age time.Duration) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(path, []byte("{}"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	stamp := time.Now().Add(-age)
+	if err := os.Chtimes(path, stamp, stamp); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+}
+
+func requireCacheFileGone(t *testing.T, path string) {
+	t.Helper()
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("%s survived the sweep (stat err=%v)", path, err)
+	}
+}
+
+func requireCacheFileKept(t *testing.T, path string) {
+	t.Helper()
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("%s was swept but is still inside the TTL: %v", path, err)
+	}
+}
+
+func TestNewSweepsExpiredCacheEntries(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	cacheRoot, err := cliutil.CacheDir()
+	if err != nil {
+		t.Fatalf("resolve cache dir: %v", err)
+	}
+	resources := filepath.Join(cacheRoot, "http", "resources")
+	stale := filepath.Join(resources, "items", "stale.json")
+	staleMeta := stale + ".meta.json"
+	otherStale := filepath.Join(resources, "orders", "stale.json")
+	fresh := filepath.Join(resources, "orders", "fresh.json")
+	writeAgedCacheFile(t, stale, 2*responseCacheTTL)
+	writeAgedCacheFile(t, staleMeta, 2*responseCacheTTL)
+	writeAgedCacheFile(t, otherStale, responseCacheTTL+time.Second)
+	writeAgedCacheFile(t, fresh, time.Second)
+
+	New(&config.Config{BaseURL: "https://api.example.invalid"}, time.Second, 0)
+
+	requireCacheFileGone(t, stale)
+	requireCacheFileGone(t, staleMeta)
+	requireCacheFileGone(t, otherStale)
+	requireCacheFileKept(t, fresh)
+}
+
+func TestWriteCacheSweepsExpiredEntriesInNamespace(t *testing.T) {
+	c := New(&config.Config{BaseURL: "https://api.example.invalid"}, time.Second, 0)
+	c.cacheDir = t.TempDir()
+	stale := filepath.Join(c.cacheResourceDir("/items"), "stale.json")
+	writeAgedCacheFile(t, stale, 2*responseCacheTTL)
+
+	c.writeCacheWithHeaders("/items", nil, nil, json.RawMessage(` + "`" + `{"ok":true}` + "`" + `))
+
+	requireCacheFileGone(t, stale)
+	got, ok := c.readCacheWithHeaders("/items", nil, nil)
+	if !ok || string(got) != ` + "`" + `{"ok":true}` + "`" + ` {
+		t.Fatalf("fresh write not readable after sweep: ok=%v body=%s", ok, got)
+	}
+
+	// A second write inside the TTL must not list the namespace again.
+	again := filepath.Join(c.cacheResourceDir("/items"), "again.json")
+	writeAgedCacheFile(t, again, 2*responseCacheTTL)
+	c.writeCacheWithHeaders("/items", map[string]string{"page": "2"}, nil, json.RawMessage(` + "`" + `{"ok":true}` + "`" + `))
+	requireCacheFileKept(t, again)
+}
+`
+	require.NoError(t, os.WriteFile(filepath.Join(outputDir, "internal", "client", "cache_sweep_runtime_test.go"), []byte(runtimeTest), 0o600))
+	requireGeneratedCompiles(t, outputDir)
+	runGoCommandRequired(t, outputDir, "test", "./internal/client", "-run", "^Test(NewSweepsExpiredCacheEntries|WriteCacheSweepsExpiredEntriesInNamespace)$", "-count=1")
 }
 
 func TestGeneratedClientQueryParamContractsPass(t *testing.T) {

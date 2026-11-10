@@ -627,7 +627,7 @@ func TestBodyRequiredChecks_OptionalNestedObject(t *testing.T) {
 		}},
 	}, "\t\t\t")
 	require.Contains(t, got, `if (cmd.Flags().Changed("start-date-time") || bodyStartDateTime != "") || (cmd.Flags().Changed("start-time-zone") || bodyStartTimeZone != "") {`)
-	require.Contains(t, got, `if !cmd.Flags().Changed("start-date-time") && bodyStartDateTime == "" && !flags.dryRun {`)
+	require.Contains(t, got, `if !cmd.Flags().Changed("start-date-time") && bodyStartDateTime == "" && !requiredInputWaived() {`)
 	require.Contains(t, got, `"required flag \"%s\" not set", "start-date-time"`)
 }
 
@@ -644,7 +644,7 @@ func TestBodyRequiredChecks_OptionalNestedObjectDefaultActivatesParent(t *testin
 		}},
 	}, "\t\t\t")
 	require.Contains(t, got, `if (cmd.Flags().Changed("start-date-time") || bodyStartDateTime != "") || (cmd.Flags().Changed("start-time-zone") || bodyStartTimeZone != "") {`)
-	require.Contains(t, got, `if !cmd.Flags().Changed("start-date-time") && bodyStartDateTime == "" && !flags.dryRun {`)
+	require.Contains(t, got, `if !cmd.Flags().Changed("start-date-time") && bodyStartDateTime == "" && !requiredInputWaived() {`)
 }
 
 func TestBodyRequiredChecks_RecursiveOptionalObjects(t *testing.T) {
@@ -668,7 +668,7 @@ func TestBodyRequiredChecks_RecursiveOptionalObjects(t *testing.T) {
 	}, "\t\t\t")
 	require.Contains(t, got, `if (cmd.Flags().Changed("outer-label") || bodyOuterLabel != "") || (cmd.Flags().Changed("outer-config-mode") || bodyOuterConfigMode != "") || (cmd.Flags().Changed("outer-config-note") || bodyOuterConfigNote != "") {`)
 	require.Contains(t, got, `if (cmd.Flags().Changed("outer-config-mode") || bodyOuterConfigMode != "") || (cmd.Flags().Changed("outer-config-note") || bodyOuterConfigNote != "") {`)
-	require.Contains(t, got, `if !cmd.Flags().Changed("outer-config-mode") && bodyOuterConfigMode == "" && !flags.dryRun {`)
+	require.Contains(t, got, `if !cmd.Flags().Changed("outer-config-mode") && bodyOuterConfigMode == "" && !requiredInputWaived() {`)
 }
 
 func TestBodyRequiredChecks_RequiredNestedObjectRemainsUnconditional(t *testing.T) {
@@ -685,7 +685,7 @@ func TestBodyRequiredChecks_RequiredNestedObjectRemainsUnconditional(t *testing.
 		}},
 	}, "\t\t\t")
 	require.NotContains(t, got, `cmd.Flags().Changed("start-time-zone")`)
-	require.Contains(t, got, `if !cmd.Flags().Changed("start-date-time") && bodyStartDateTime == "" && !flags.dryRun {`)
+	require.Contains(t, got, `if !cmd.Flags().Changed("start-date-time") && bodyStartDateTime == "" && !requiredInputWaived() {`)
 }
 
 func TestMCPBodyInputParams_NestedRequiredFollowsParent(t *testing.T) {
@@ -727,7 +727,7 @@ func TestBodyRequiredChecks_TopLevelKeepsAliasOR(t *testing.T) {
 			{Name: "name", Type: "string", Required: true, Aliases: []string{"n"}},
 		},
 	}, "\t\t\t")
-	if !strings.Contains(got, `!(cmd.Flags().Changed("name") || cmd.Flags().Changed("n")) && bodyName == "" && !flags.dryRun`) {
+	if !strings.Contains(got, `!(cmd.Flags().Changed("name") || cmd.Flags().Changed("n")) && bodyName == "" && !requiredInputWaived() {`) {
 		t.Errorf("expected alias-OR plus resolved-value check, got:\n%s", got)
 	}
 }
@@ -1039,7 +1039,7 @@ func TestMCPParamBindings_BodyJSONFallback(t *testing.T) {
 func TestBodyJSONFallback_RequiredChecks_RequiredBody(t *testing.T) {
 	t.Parallel()
 	got := bodyRequiredChecks(spec.Endpoint{BodyJSONFallback: true, BodyRequired: true}, "\t\t\t")
-	if !strings.Contains(got, `!cmd.Flags().Changed("body-json") && flagBodyJSON == "" && !flags.dryRun`) {
+	if !strings.Contains(got, `!cmd.Flags().Changed("body-json") && flagBodyJSON == "" && !requiredInputWaived() {`) {
 		t.Errorf("expected value-aware body-json required check, got:%q", got)
 	}
 	if !strings.Contains(got, `"required flag \"%s\" not set", "body-json"`) {
@@ -1208,6 +1208,32 @@ func TestBodyMap_DepthCap_Boundary(t *testing.T) {
 	}
 }
 
+func TestBodyRequiredChecks_UnsatisfiableEnumIsNotRequiredInput(t *testing.T) {
+	t.Parallel()
+
+	ep := spec.Endpoint{
+		Method: "POST",
+		Body: []spec.Param{
+			{Name: "note", Type: "string"},
+			{Name: "disjoint", Type: "string", EnumUnsatisfiable: true},
+			{
+				Name: "options",
+				Type: "object",
+				Fields: []spec.Param{
+					{Name: "tone", Type: "string", EnumUnsatisfiable: true},
+				},
+			},
+		},
+	}
+	got := bodyRequiredChecks(ep, "\t")
+	require.Contains(t, got, `cmd.Flags().Changed("disjoint")`)
+	require.Contains(t, got, `cmd.Flags().Changed("options-tone")`)
+	require.Contains(t, got, "schema permits no value")
+	require.NotContains(t, got, "required flag")
+	require.Empty(t, strings.TrimSpace(bodyRequiredPresenceChecks(ep, "\t")))
+	require.False(t, endpointHasRequiredInput(ep))
+}
+
 // TestBodyRequiredChecks_DepthCap requires an object at the depth boundary
 // as one unit instead of losing requirements inside an omitted subtree.
 func TestBodyRequiredChecks_DepthCap(t *testing.T) {
@@ -1223,4 +1249,223 @@ func TestBodyRequiredChecks_DepthCap(t *testing.T) {
 	if strings.Contains(got, "sibling2") {
 		t.Errorf("children inside the boundary JSON object must not emit checks, got:\n%s", got)
 	}
+}
+
+func TestBodyMap_SuppliedOptionalObjectDecodesJSONStringDefault(t *testing.T) {
+	t.Parallel()
+	got := bodyMap([]spec.Param{{
+		Name: "settings",
+		Type: "object",
+		Fields: []spec.Param{
+			{Name: "mode", Type: "string"},
+			{Name: "layout", Type: "string", Format: "json", Required: true, Default: `{"kind":"box"}`},
+		},
+	}}, "\t")
+	require.Contains(t, got, "var parsedSettingsLayout any\n")
+	require.Contains(t, got, `json.Unmarshal([]byte(bodySettingsLayout), &parsedSettingsLayout)`)
+	require.Contains(t, got, `nestedSettings["layout"] = parsedSettingsLayout`)
+	require.NotContains(t, got, `nestedSettings["layout"] = bodySettingsLayout`)
+	require.Contains(t, got, `cmd.Flags().Changed("settings-layout")`)
+	require.NotContains(t, got, `bodySettingsLayout != ""`)
+}
+
+func TestBodyMap_SuppliedOptionalObjectDecodesJSONOrScalarDefault(t *testing.T) {
+	t.Parallel()
+	got := bodyMap([]spec.Param{{
+		Name: "settings",
+		Type: "object",
+		Fields: []spec.Param{
+			{Name: "mode", Type: "string"},
+			{Name: "layout", Type: "string", Format: "json_or_scalar", Required: true, Default: `{"kind":"box"}`},
+		},
+	}}, "\t")
+	require.Contains(t, got, "if looksLikeJSONComposite(bodySettingsLayout) {")
+	require.Contains(t, got, `nestedSettings["layout"] = parsedSettingsLayout`)
+	require.Contains(t, got, `nestedSettings["layout"] = bodySettingsLayout`)
+	require.NotRegexp(t, `(?m)^[ \t]*if \(cmd\.Flags\(\)\.Changed\("settings-layout"\) \|\| bodySettingsLayout != ""\) \{`, got)
+}
+
+func TestBodyMap_SuppliedOptionalObjectKeepsEncodedJSONString(t *testing.T) {
+	t.Parallel()
+	got := bodyMap([]spec.Param{{
+		Name: "settings",
+		Type: "object",
+		Fields: []spec.Param{
+			{Name: "mode", Type: "string"},
+			{Name: "payload", Type: "string", Format: "json-string", Required: true, Default: `{"kind":"box"}`},
+		},
+	}}, "\t")
+	require.Contains(t, got, `nestedSettings["payload"] = bodySettingsPayload`)
+	require.NotContains(t, got, "parsedSettingsPayload")
+}
+
+func TestBodyMap_OptionalObjectOmitsRequiredChildDefaultUntilSupplied(t *testing.T) {
+	t.Parallel()
+	got := bodyMap([]spec.Param{{
+		Name: "settings",
+		Type: "object",
+		Fields: []spec.Param{
+			{Name: "mode", Type: "string", Default: "compact", ServerDefault: true},
+			{Name: "kind", Type: "string", Required: true, Default: "box"},
+		},
+	}}, "\t")
+	want := "\t{\n" +
+		"\t\tif (cmd.Flags().Changed(\"settings-mode\") || bodySettingsMode != \"\") || cmd.Flags().Changed(\"settings-kind\") {\n" +
+		"\t\t\tnestedSettings := map[string]any{}\n" +
+		"\t\t\tif (cmd.Flags().Changed(\"settings-mode\") || bodySettingsMode != \"\") {\n" +
+		"\t\t\t\tnestedSettings[\"mode\"] = bodySettingsMode\n" +
+		"\t\t\t}\n" +
+		"\t\t\tnestedSettings[\"kind\"] = bodySettingsKind\n" +
+		"\t\t\tbody[\"settings\"] = nestedSettings\n" +
+		"\t\t}\n" +
+		"\t}\n"
+	require.Equal(t, want, got)
+}
+
+func TestBodyMap_RequiredObjectStillSendsRequiredChildDefault(t *testing.T) {
+	t.Parallel()
+	got := bodyMap([]spec.Param{{
+		Name:     "settings",
+		Type:     "object",
+		Required: true,
+		Fields: []spec.Param{
+			{Name: "kind", Type: "string", Required: true, Default: "box"},
+		},
+	}}, "\t")
+	require.Contains(t, got, `bodySettingsKind != ""`)
+	require.Contains(t, got, `if len(nestedSettings) > 0 {`)
+	require.NotContains(t, got, `cmd.Flags().Changed("settings-kind") {`)
+}
+
+func TestBodyMap_RequiredNestedObjectDefaultFollowsOptionalAncestor(t *testing.T) {
+	t.Parallel()
+	got := bodyMap([]spec.Param{{
+		Name: "settings",
+		Type: "object",
+		Fields: []spec.Param{
+			{Name: "mode", Type: "string"},
+			{
+				Name:     "config",
+				Type:     "object",
+				Required: true,
+				Fields: []spec.Param{
+					{Name: "kind", Type: "string", Required: true, Default: "box"},
+				},
+			},
+		},
+	}}, "\t")
+	require.Contains(t, got, `cmd.Flags().Changed("settings-config-kind")`)
+	require.NotContains(t, got, `bodySettingsConfigKind != ""`)
+	require.Contains(t, got, `nestedSettingsConfig["kind"] = bodySettingsConfigKind`)
+	require.Contains(t, got, `nestedSettings["config"] = nestedSettingsConfig`)
+}
+
+func TestBodyRequiredChecks_RequiredDefaultDoesNotForceOptionalObject(t *testing.T) {
+	t.Parallel()
+	got := bodyRequiredChecks(spec.Endpoint{Body: []spec.Param{{
+		Name: "settings",
+		Type: "object",
+		Fields: []spec.Param{
+			{Name: "name", Type: "string", Required: true},
+			{Name: "kind", Type: "string", Required: true, Default: "box"},
+		},
+	}}}, "\t\t\t")
+	require.Contains(t, got, `if (cmd.Flags().Changed("settings-name") || bodySettingsName != "") || cmd.Flags().Changed("settings-kind") {`)
+	require.NotContains(t, got, `bodySettingsKind != ""`)
+	require.Contains(t, got, `bodySettingsName == ""`)
+}
+
+func TestMCPBodyBindings_JSONStringDefaultStaysDecodedObject(t *testing.T) {
+	t.Parallel()
+	bindings := mcpParamBindings(spec.Endpoint{Body: []spec.Param{{
+		Name: "settings",
+		Type: "object",
+		Fields: []spec.Param{
+			{Name: "mode", Type: "string"},
+			{Name: "layout", Type: "string", Format: "json", Required: true, Default: `{"kind":"box"}`},
+			{Name: "engine", Type: "string", Format: "json_or_scalar", Required: true, Default: `{"kind":"box"}`},
+			{Name: "label", Type: "string", Format: "json_or_scalar", Required: true, Default: "box"},
+			{Name: "payload", Type: "string", Format: "json-string", Required: true, Default: `{"kind":"box"}`},
+		},
+	}}}, "/items")
+	byName := map[string]mcpParamBinding{}
+	for _, binding := range bindings {
+		byName[binding.PublicName] = binding
+	}
+	require.Equal(t, `{"kind":"box"}`, byName["settings-layout"].Default)
+	require.Equal(t, `{"kind":"box"}`, byName["settings-engine"].Default)
+	require.Equal(t, `"box"`, byName["settings-label"].Default)
+	require.Equal(t, `"{\"kind\":\"box\"}"`, byName["settings-payload"].Default)
+}
+
+func TestMCPBodyBindings_RequiredChildDefaultFollowsOptionalParent(t *testing.T) {
+	t.Parallel()
+	bindings := mcpParamBindings(spec.Endpoint{Body: []spec.Param{{
+		Name: "settings",
+		Type: "object",
+		Fields: []spec.Param{
+			{Name: "mode", Type: "string", Default: "compact", ServerDefault: true},
+			{Name: "kind", Type: "string", Required: true, Default: "box"},
+			{Name: "count", Type: "integer", Required: true, Default: 0},
+		},
+	}}}, "/items")
+	byName := map[string]mcpParamBinding{}
+	for _, binding := range bindings {
+		byName[binding.PublicName] = binding
+	}
+	require.Empty(t, byName["settings-mode"].Default)
+	require.Empty(t, byName["settings-mode"].DefaultScope)
+	require.Equal(t, `"box"`, byName["settings-kind"].Default)
+	require.Equal(t, []string{"settings"}, byName["settings-kind"].DefaultScope)
+	require.Equal(t, []string{"settings", "kind"}, byName["settings-kind"].BodyPath)
+	require.Equal(t, "0", byName["settings-count"].Default)
+	require.Equal(t, []string{"settings"}, byName["settings-count"].DefaultScope)
+}
+
+func TestMCPBodyBindings_RequiredGrandchildUsesNearestOptionalAncestor(t *testing.T) {
+	t.Parallel()
+	bindings := mcpParamBindings(spec.Endpoint{Body: []spec.Param{{
+		Name: "settings",
+		Type: "object",
+		Fields: []spec.Param{
+			{
+				Name:     "config",
+				Type:     "object",
+				Required: true,
+				Fields: []spec.Param{
+					{Name: "kind", Type: "string", Required: true, Default: "box"},
+				},
+			},
+			{
+				Name: "meta",
+				Type: "object",
+				Fields: []spec.Param{
+					{Name: "tag", Type: "string", Required: true, Default: "t"},
+				},
+			},
+		},
+	}}}, "/items")
+	byName := map[string]mcpParamBinding{}
+	for _, binding := range bindings {
+		byName[binding.PublicName] = binding
+	}
+	require.Equal(t, []string{"settings"}, byName["settings-config-kind"].DefaultScope)
+	require.Equal(t, []string{"settings", "config", "kind"}, byName["settings-config-kind"].BodyPath)
+	require.Equal(t, []string{"settings", "meta"}, byName["settings-meta-tag"].DefaultScope)
+	require.Equal(t, []string{"settings", "meta", "tag"}, byName["settings-meta-tag"].BodyPath)
+}
+
+func TestMCPBodyBindings_RequiredParentDoesNotScopeChildDefault(t *testing.T) {
+	t.Parallel()
+	bindings := mcpParamBindings(spec.Endpoint{Body: []spec.Param{{
+		Name:     "settings",
+		Type:     "object",
+		Required: true,
+		Fields: []spec.Param{
+			{Name: "kind", Type: "string", Required: true, Default: "box"},
+		},
+	}}}, "/items")
+	require.Len(t, bindings, 1)
+	require.Empty(t, bindings[0].Default)
+	require.Empty(t, bindings[0].DefaultScope)
 }

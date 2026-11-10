@@ -36,8 +36,14 @@ func TestGeneratedInfraSecuritySuppressionsAreExplicit(t *testing.T) {
 	require.NoError(t, New(apiSpec, outputDir).Generate())
 
 	credentialsGo := readGenerated(t, outputDir, "internal", "cliutil", "credentials.go")
-	assert.Contains(t, credentialsGo, `os.ReadFile(filepath.Clean(path)) // #nosec G304 -- app-owned credentials path from cliutil.DataDir.`)
 	assert.Contains(t, credentialsGo, `toml.Marshal(credentialsFileFrom(creds)) // #nosec G117 -- credentials are intentionally persisted to a 0600 private file.`)
+
+	unixPerms := readGenerated(t, outputDir, "internal", "cliutil", "creds_perms_unix.go")
+	assert.Contains(t, unixPerms, `os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0) // #nosec G304 -- app-owned credentials path; O_NOFOLLOW refuses a swapped-in symlink.`)
+	assert.Contains(t, unixPerms, `os.Open(path) // #nosec G304 -- app-derived config path; verdict and bytes share this descriptor.`)
+
+	winPerms := readGenerated(t, outputDir, "internal", "cliutil", "creds_perms_windows.go")
+	assert.Contains(t, winPerms, `os.Open(path) // #nosec G304 -- app-derived config path; verdict and bytes share this handle.`)
 
 	pathsGo := readGenerated(t, outputDir, "internal", "cliutil", "paths.go")
 	assert.Contains(t, pathsGo, `os.ReadFile(filepath.Clean(primary)) // #nosec G304 -- app-derived config/data path.`)
@@ -49,7 +55,7 @@ func TestGeneratedInfraSecuritySuppressionsAreExplicit(t *testing.T) {
 	assert.Contains(t, clientGo, `_ = os.MkdirAll(resourceDir, 0o700)`)
 	assert.Contains(t, clientGo, `_ = os.WriteFile(cacheFile, []byte(data), 0o600)`)
 	assert.Contains(t, clientGo, `_ = os.Chmod(cacheFile, 0o600)`)
-	assert.Contains(t, clientGo, `_ = resp.Body.Close()`)
+	assert.Contains(t, clientGo, `defer func() { _ = body.Close() }()`)
 
 	cacheGo := readGenerated(t, outputDir, "internal", "cache", "cache.go")
 	assert.Contains(t, cacheGo, `os.ReadFile(filepath.Clean(path)) // #nosec G304 -- app-derived cache path from sha256 cache key.`)

@@ -212,6 +212,11 @@ type APISpec struct {
 	// PlaceholderBaseURL fallback because the source declared no real host.
 	// The generate command refuses to ship in that state — see internal/cli/root.go.
 	BaseURLIsPlaceholder bool `yaml:"-" json:"-"`
+	// omittedConfigPath is the path synthesized from Name. generate --name
+	// and other post-parse renames run after that fill; a later
+	// ApplyOmittedConfigDefaults refreshes a path only while it still
+	// equals this value. Author-supplied paths are not recorded here.
+	omittedConfigPath string
 	// Description describes the API itself ("REST API for ordering pizza").
 	// It flows into generated docs and SKILL.md but is intentionally NOT used
 	// as the printed CLI's --help text; that's CLIDescription's job.
@@ -731,6 +736,38 @@ func sortedStringKeys[V any](m map[string]V) []string {
 	return keys
 }
 
+// Spec-level auth sends one credential on every operation. Generation has
+// to branch when operations name different sole schemes, or a credential
+// is attached to calls that reject it.
+func (s *APISpec) HasPerOperationAuth() bool {
+	if s == nil {
+		return false
+	}
+	var found bool
+	var walk func(resources map[string]Resource)
+	walk = func(resources map[string]Resource) {
+		if found {
+			return
+		}
+		for _, resource := range resources {
+			for _, endpoint := range resource.Endpoints {
+				if endpoint.AuthScheme != "" {
+					found = true
+					return
+				}
+			}
+			if len(resource.SubResources) > 0 {
+				walk(resource.SubResources)
+			}
+			if found {
+				return
+			}
+		}
+	}
+	walk(s.Resources)
+	return found
+}
+
 func (s *APISpec) EffectiveTier(resource Resource, endpoint Endpoint) string {
 	name, _, ok := s.EffectiveTierConfig(resource, endpoint)
 	if !ok {
@@ -980,19 +1017,18 @@ func (s *APISpec) EffectiveHTTPTransport() string {
 	case HTTPTransportStandard, HTTPTransportBrowserHTTP, HTTPTransportBrowserChrome, HTTPTransportBrowserChromeH2, HTTPTransportBrowserChromeH3:
 		return s.HTTPTransport
 	}
-	// Defaults map to the explicit -h2 variant. The bare "browser-chrome"
-	// enum means "no version force"; default-sniffed and
-	// browser-auth-for-HTML specs surface their H/2 force through the
-	// explicit "-h2" enum so the spec field always names the wire
-	// protocol the runtime will pick. browser-sniff overrides this with
-	// HAR-driven mapping in ApplyReachabilityDefaults before
-	// EffectiveHTTPTransport runs.
+	// browser-chrome negotiates h2 and falls back to HTTP/1.1.
+	// browser-chrome-h2 is h2-only and stays opt-in: an explicit field
+	// wins above, cookie/composed HTML auth keeps it, and browser-sniff
+	// writes it from HAR in ApplyReachabilityDefaults before this runs.
+	// Community and sniffed specs with an empty field must still reach
+	// HTTP/1.1-only origins.
 	if s.usesBrowserAuthForHTML() {
 		return HTTPTransportBrowserChromeH2
 	}
 	switch s.SpecSource {
 	case "community", "sniffed":
-		return HTTPTransportBrowserChromeH2
+		return HTTPTransportBrowserChrome
 	default:
 		return HTTPTransportStandard
 	}
@@ -1102,6 +1138,18 @@ func (s *APISpec) HasTextResponse() bool {
 	return false
 }
 
+func (s *APISpec) HasBinaryResponse() bool {
+	if s == nil {
+		return false
+	}
+	for _, resource := range s.Resources {
+		if resourceHasBinaryResponse(resource) {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *APISpec) HasRawRequest() bool {
 	if s == nil {
 		return false
@@ -1136,6 +1184,20 @@ func resourceHasTextResponse(resource Resource) bool {
 	}
 	for _, sub := range resource.SubResources {
 		if resourceHasTextResponse(sub) {
+			return true
+		}
+	}
+	return false
+}
+
+func resourceHasBinaryResponse(resource Resource) bool {
+	for _, endpoint := range resource.Endpoints {
+		if endpoint.UsesBinaryResponse() {
+			return true
+		}
+	}
+	for _, sub := range resource.SubResources {
+		if resourceHasBinaryResponse(sub) {
 			return true
 		}
 	}
@@ -1340,14 +1402,9 @@ type AuthConfig struct {
 	// Used by the authorization_code flow only; ignored for other grants.
 	RefreshTokenMechanism string `yaml:"refresh_token_mechanism,omitempty" json:"refresh_token_mechanism,omitempty"`
 
-	// AdditionalHeaders carries per-call credentials from non-winning sibling
-	// security schemes. Composed apiKey + OAuth (or apiKey + bearer) shapes
-	// declare both schemes in components.securitySchemes; selectSecurityScheme
-	// picks one as the primary (Authorization-bearer half) and the parser then
-	// scans the rest for apiKey schemes carrying x-auth-vars[*].kind: per_call,
-	// so the apiKey credential gets sent alongside the primary auth. Generator
-	// emits a Config field + os.Getenv loader per entry, then applies the
-	// credential according to In on every request.
+	// Credentials from security schemes other than the primary. An AND-group
+	// sibling has to ride with the primary credential; a per-operation
+	// credential must not, or an operation that names one scheme rejects the other.
 	AdditionalHeaders []AdditionalAuthHeader `yaml:"additional_headers,omitempty" json:"additional_headers,omitempty"`
 }
 
@@ -1355,10 +1412,14 @@ type AuthConfig struct {
 // per-call env var that supplies its value. Header stores the OpenAPI apiKey
 // scheme's name field; In distinguishes header and query placements.
 type AdditionalAuthHeader struct {
-	Header string     `yaml:"header" json:"header"`
-	In     string     `yaml:"in,omitempty" json:"in,omitempty"`
-	Scheme string     `yaml:"scheme,omitempty" json:"scheme,omitempty"`
-	EnvVar AuthEnvVar `yaml:"env_var" json:"env_var"`
+	Header string `yaml:"header" json:"header"`
+	In     string `yaml:"in,omitempty" json:"in,omitempty"`
+	Scheme string `yaml:"scheme,omitempty" json:"scheme,omitempty"`
+	// AND-group siblings leave this false and ride with the primary credential.
+	// Set when the credential has to be omitted from operations that name a
+	// different scheme.
+	PerOperation bool       `yaml:"per_operation,omitempty" json:"per_operation,omitempty"`
+	EnvVar       AuthEnvVar `yaml:"env_var" json:"env_var"`
 }
 
 const (
@@ -1455,12 +1516,17 @@ func (v AuthEnvVar) IsRequestCredential() bool {
 	return v.EffectiveKind() == AuthEnvVarKindPerCall
 }
 
-func isOAuthClientIDEnvVar(name string) bool {
+// IsOAuthClientIDEnvVar reports whether name is a public OAuth client id
+// (CLIENT_ID or *_CLIENT_ID). It identifies the app during auth setup and
+// is not a usable request credential on its own.
+func IsOAuthClientIDEnvVar(name string) bool {
 	placeholder := naming.EnvVarPlaceholder(name)
 	return placeholder == "client_id" || strings.HasSuffix(placeholder, "_client_id")
 }
 
-func isOAuthClientSecretEnvVar(name string) bool {
+// IsOAuthClientSecretEnvVar reports whether name is an OAuth client secret
+// (CLIENT_SECRET or *_CLIENT_SECRET).
+func IsOAuthClientSecretEnvVar(name string) bool {
 	placeholder := naming.EnvVarPlaceholder(name)
 	return placeholder == "client_secret" || strings.HasSuffix(placeholder, "_client_secret")
 }
@@ -1628,8 +1694,8 @@ func (c *AuthConfig) NormalizeEnvVarSpecs(context string) {
 				sensitive := true
 				if c.Type == AuthTypeOAuth2Refresh {
 					kind = AuthEnvVarKindAuthFlowInput
-					required = !isOAuthClientSecretEnvVar(name)
-					sensitive = !isOAuthClientIDEnvVar(name)
+					required = !IsOAuthClientSecretEnvVar(name)
+					sensitive = !IsOAuthClientIDEnvVar(name)
 				}
 				c.EnvVarSpecs = append(c.EnvVarSpecs, AuthEnvVar{
 					Name:      name,
@@ -2148,9 +2214,43 @@ func validateSessionHandshake(c AuthConfig) error {
 	}
 }
 
+// ConfigFormatTOML is filled in when a spec omits config.format.
+// Templates treat a zero Format as JSON, so the omission has to be filled
+// before render.
+const ConfigFormatTOML = "toml"
+
 type ConfigSpec struct {
-	Format string `yaml:"format" json:"format"` // toml, yaml
+	Format string `yaml:"format" json:"format"` // toml, yaml, or json; empty selects ConfigFormatTOML
 	Path   string `yaml:"path" json:"path"`
+}
+
+// ApplyOmittedConfigDefaults fills a missing config format and path.
+// Any format other than toml is rendered with encoding/json, so a zero
+// Format would emit config.json. A path this function synthesized is
+// refreshed when Name changes; an author-supplied path is kept.
+func (s *APISpec) ApplyOmittedConfigDefaults() {
+	if s == nil {
+		return
+	}
+	format := strings.TrimSpace(s.Config.Format)
+	if format == "" {
+		format = ConfigFormatTOML
+	}
+	s.Config.Format = format
+	path := strings.TrimSpace(s.Config.Path)
+	if path != "" && path != s.omittedConfigPath {
+		s.Config.Path = path
+		s.omittedConfigPath = ""
+		return
+	}
+	name := strings.TrimSpace(s.Name)
+	if name == "" {
+		s.Config.Path = ""
+		s.omittedConfigPath = ""
+		return
+	}
+	s.Config.Path = fmt.Sprintf("~/.config/%s-pp-cli/config.%s", name, format)
+	s.omittedConfigPath = s.Config.Path
 }
 
 // CacheConfig gates the auto-refresh machinery emitted into a printed CLI.
@@ -2186,7 +2286,7 @@ type CacheCommand struct {
 type ShareConfig struct {
 	Enabled        bool     `yaml:"enabled,omitempty" json:"enabled,omitempty"`                 // master switch; when false, the share package and command are not emitted
 	SnapshotTables []string `yaml:"snapshot_tables,omitempty" json:"snapshot_tables,omitempty"` // explicit allowlist of SQLite tables included in the snapshot. Required when Enabled. Names matching denylisted patterns (*_cache, *_secrets, auth_*) are rejected at parse time.
-	DefaultRepo    string   `yaml:"default_repo,omitempty" json:"default_repo,omitempty"`       // optional default git remote (e.g., "git@github.com:acme/linear-snapshots.git"); command-line --repo flag always wins
+	DefaultRepo    string   `yaml:"default_repo,omitempty" json:"default_repo,omitempty"`       // optional git remote (e.g., "git@github.com:acme/linear-snapshots.git"); share publish and subscribe always use it and take no remote flag. Must be a URL or an absolute path; blank means local-only publish and no subscribe
 	DefaultBranch  string   `yaml:"default_branch,omitempty" json:"default_branch,omitempty"`   // optional default branch for push/pull; blank means "main"
 }
 
@@ -2294,7 +2394,7 @@ type MCPConfig struct {
 	Addr                   string   `yaml:"addr,omitempty" json:"addr,omitempty"`                                       // default bind address for the http transport (e.g., "127.0.0.1:7777"). Blank means runtime default ("127.0.0.1:7777"). Empty-host forms like ":7777" bind every interface and require TLS. Ignored unless http is in Transport.
 	Intents                []Intent `yaml:"intents,omitempty" json:"intents,omitempty"`                                 // higher-level MCP tools that compose multiple endpoint calls. The agent sees one intent tool; the generator emits a handler that fans out to the declared endpoints sequentially. Anti-pattern to fight: one-tool-per-endpoint mirrors that force agents to stitch primitives.
 	EndpointTools          string   `yaml:"endpoint_tools,omitempty" json:"endpoint_tools,omitempty"`                   // "visible" (default) keeps the per-endpoint MCP tools; "hidden" suppresses them so only intents + generator-emitted tools appear. Use "hidden" when intents fully cover the surface and raw endpoints would be noise.
-	Orchestration          string   `yaml:"orchestration,omitempty" json:"orchestration,omitempty"`                     // "endpoint-mirror" (default), "intent", or "code". Code-orchestration emits a thin <api>_search + <api>_execute pair covering the full surface in ~1K tokens; used for very large APIs where even intent-grouped tools would overflow context. Mutually exclusive with endpoint-mirror at emission time.
+	Orchestration          string   `yaml:"orchestration,omitempty" json:"orchestration,omitempty"`                     // "endpoint-mirror" (default), "intent", or "code". Code-orchestration emits <api>_search, <api>_get, <api>_read for reads, and <api>_execute for state-changing calls (preview until confirm is boolean true; omitted when the spec has none). Mutually exclusive with endpoint-mirror at emission time.
 	OrchestrationThreshold int      `yaml:"orchestration_threshold,omitempty" json:"orchestration_threshold,omitempty"` // endpoint count above which the generator auto-applies code orchestration when Orchestration is unset. Zero means use the built-in default (50).
 }
 
@@ -2474,7 +2574,20 @@ type Endpoint struct {
 	// unset (classify from verb, operation name, and body shape). true
 	// marks a GET action as state-changing; false marks a POST (or other
 	// non-GET) endpoint as a read so generated commands print the body.
-	Mutation    *bool  `yaml:"mutation,omitempty" json:"mutation,omitempty"`
+	Mutation *bool `yaml:"mutation,omitempty" json:"mutation,omitempty"`
+	// Destructive is the optional MCP destructiveHint for a write that
+	// stays a write. nil means DELETE advertises destructive and every
+	// other write leaves the hint unset, so hosts treat it as possibly
+	// destructive. false marks an additive write without making the
+	// command read-only. Reads ignore this field.
+	Destructive *bool `yaml:"destructive,omitempty" json:"destructive,omitempty"`
+	// ReplaySafe is the optional explicit replay override for a mutating
+	// request. nil means unset (the generator treats file-upload endpoints
+	// as replay-safe and every other POST/PATCH as unsafe). true lets the
+	// generated client retry the request after a transport error or 5xx;
+	// false forbids it even for an upload. Set false for any endpoint that
+	// starts billable work, even when it carries a file.
+	ReplaySafe  *bool  `yaml:"replay_safe,omitempty" json:"replay_safe,omitempty"`
 	BaseURL     string `yaml:"base_url,omitempty" json:"base_url,omitempty"`
 	Description string `yaml:"description" json:"description"`
 	// Deprecated is OpenAPI `deprecated: true`. Keep the command visible;
@@ -2551,6 +2664,10 @@ type Endpoint struct {
 	Meta                      map[string]string          `yaml:"meta,omitempty" json:"meta,omitempty"`                         // per-endpoint metadata (e.g., source_tier, source_count from crowd-sniff)
 	HeaderOverrides           []RequiredHeader           `yaml:"header_overrides,omitempty" json:"header_overrides,omitempty"` // per-endpoint header overrides (e.g., different api-version)
 	NoAuth                    bool                       `yaml:"no_auth,omitempty" json:"no_auth,omitempty"`                   // true when the endpoint does not require authentication
+	// Empty keeps the primary credential plus AND-group siblings. A sole
+	// scheme name selects that credential and suppresses the others, which
+	// is required when the operation rejects every other scheme.
+	AuthScheme string `yaml:"auth_scheme,omitempty" json:"auth_scheme,omitempty"`
 	// ObservedAuth lists the lowercased request header names observed on this
 	// endpoint during browser-sniff capture that match common auth surfaces
 	// (Authorization, Cookie, X-API-Key, etc.). Observation-only — header
@@ -2751,6 +2868,16 @@ func (e Endpoint) MutationOverride() (value, set bool) {
 	return *e.Mutation, true
 }
 
+// An omitted flag must stay distinguishable from false: unset lets the
+// generator infer replay safety for free uploads, while an explicit false
+// is the spec author's guarantee that a file-carrying request is billed.
+func (e Endpoint) ReplaySafeOverride() (value, set bool) {
+	if e.ReplaySafe == nil {
+		return false, false
+	}
+	return *e.ReplaySafe, true
+}
+
 func (e Endpoint) EffectiveResponseFormat() string {
 	if strings.TrimSpace(e.ResponseFormat) == "" {
 		return ResponseFormatJSON
@@ -2860,25 +2987,34 @@ func (h *HTMLExtract) EffectiveScriptSelector() string {
 }
 
 type Param struct {
-	Name         string   `yaml:"name" json:"name"`
-	In           string   `yaml:"in,omitempty" json:"in,omitempty"` // parameter location: path, query, or header
-	FlagName     string   `yaml:"flag_name,omitempty" json:"flag_name,omitempty"`
-	URLName      string   `yaml:"url_name,omitempty" json:"url_name,omitempty"`   // optional override for URL query-key emission (e.g., "$limit" for Socrata while keeping --limit flag)
-	BodyName     string   `yaml:"body_name,omitempty" json:"body_name,omitempty"` // optional override for request-body field emission while keeping the public name
-	Aliases      []string `yaml:"aliases,omitempty" json:"aliases,omitempty"`
-	Type         string   `yaml:"type" json:"type"`
-	Required     bool     `yaml:"required" json:"required"`
-	Positional   bool     `yaml:"positional" json:"positional"`
-	PathParam    bool     `yaml:"path_param,omitempty" json:"path_param,omitempty"` // true for path params rendered as flags (e.g., pagination)
-	GlobalScope  bool     `yaml:"global_scope,omitempty" json:"global_scope,omitempty"`
-	Default      any      `yaml:"default" json:"default"`
-	Example      any      `yaml:"example,omitempty" json:"example,omitempty"`
-	Description  string   `yaml:"description" json:"description"`
-	Fields       []Param  `yaml:"fields" json:"fields"`                     // for nested objects
-	Enum         []string `yaml:"enum,omitempty" json:"enum,omitempty"`     // enum constraints for the parameter
-	Format       string   `yaml:"format,omitempty" json:"format,omitempty"` // OpenAPI format hints (date-time, email, uri, etc.)
-	QueryStyle   string   `yaml:"query_style,omitempty" json:"query_style,omitempty"`
-	QueryExplode *bool    `yaml:"query_explode,omitempty" json:"query_explode,omitempty"`
+	Name        string   `yaml:"name" json:"name"`
+	In          string   `yaml:"in,omitempty" json:"in,omitempty"` // parameter location: path, query, or header
+	FlagName    string   `yaml:"flag_name,omitempty" json:"flag_name,omitempty"`
+	URLName     string   `yaml:"url_name,omitempty" json:"url_name,omitempty"`   // optional override for URL query-key emission (e.g., "$limit" for Socrata while keeping --limit flag)
+	BodyName    string   `yaml:"body_name,omitempty" json:"body_name,omitempty"` // optional override for request-body field emission while keeping the public name
+	Aliases     []string `yaml:"aliases,omitempty" json:"aliases,omitempty"`
+	Type        string   `yaml:"type" json:"type"`
+	Required    bool     `yaml:"required" json:"required"`
+	Positional  bool     `yaml:"positional" json:"positional"`
+	PathParam   bool     `yaml:"path_param,omitempty" json:"path_param,omitempty"` // true for path params rendered as flags (e.g., pagination)
+	GlobalScope bool     `yaml:"global_scope,omitempty" json:"global_scope,omitempty"`
+	Default     any      `yaml:"default" json:"default"`
+	// ServerDefault marks an OpenAPI schema default on an optional non-path
+	// parameter: the server assumes that value when the parameter is absent.
+	// Help text still shows it. CLI flags and MCP bindings do not send it
+	// unless the caller sets the value. Native spec defaults leave this false
+	// and are still sent.
+	ServerDefault bool     `yaml:"server_default,omitempty" json:"server_default,omitempty"`
+	Example       any      `yaml:"example,omitempty" json:"example,omitempty"`
+	Description   string   `yaml:"description" json:"description"`
+	Fields        []Param  `yaml:"fields" json:"fields"`                     // for nested objects
+	Enum          []string `yaml:"enum,omitempty" json:"enum,omitempty"`     // enum constraints for the parameter
+	Format        string   `yaml:"format,omitempty" json:"format,omitempty"` // OpenAPI format hints (date-time, email, uri, etc.)
+	QueryStyle    string   `yaml:"query_style,omitempty" json:"query_style,omitempty"`
+	QueryExplode  *bool    `yaml:"query_explode,omitempty" json:"query_explode,omitempty"`
+	// An empty Enum skips the generated allowed-value check. Persist the marker
+	// so a merged-spec JSON or YAML archive still rejects every value after reload.
+	EnumUnsatisfiable bool `yaml:"enum_unsatisfiable,omitempty" json:"enum_unsatisfiable,omitempty"`
 	// Maximum captures an inclusive numeric `maximum` schema constraint on the
 	// parameter. Sync uses it to clamp the page size it requests so a generated
 	// CLI never sends a page size the API rejects (e.g. a page_size param with
@@ -2891,6 +3027,10 @@ type Param struct {
 	// 3.1 `maximum` and `exclusiveMaximum` are independent assertions, so both
 	// this and Maximum can be set; consumers take the most restrictive.
 	ExclusiveMaximum *float64 `yaml:"exclusive_maximum,omitempty" json:"exclusive_maximum,omitempty"`
+	// Minimum is the inclusive lower bound after integer exclusiveMinimum
+	// normalization. Sync uses it as the first offset or page when that
+	// parameter is required and the spec declares no default.
+	Minimum *float64 `yaml:"minimum,omitempty" json:"minimum,omitempty"`
 	// DispatchParam marks a fixed discriminator such as type=domain_rank.
 	// Generated runnable examples keep its default instead of substituting
 	// synthetic dogfood values that would address a different upstream route.
@@ -2933,6 +3073,17 @@ func (p Param) WireName() string {
 		return p.URLName
 	}
 	return p.Name
+}
+
+// HasDateFormat reports whether this param is a calendar value. Cursor
+// inference skips those so a date window is not reused as a page token.
+func (p Param) HasDateFormat() bool {
+	switch strings.ToLower(strings.TrimSpace(p.Format)) {
+	case "date", "date-time":
+		return true
+	default:
+		return false
+	}
 }
 
 // BodyWireName returns the request-body key for this param when emitted in a
@@ -3516,6 +3667,7 @@ func ParseBytes(data []byte) (*APISpec, error) {
 	if err := s.Validate(); err != nil {
 		return nil, fmt.Errorf("validation: %w", err)
 	}
+	s.ApplyOmittedConfigDefaults()
 	return &s, nil
 }
 
@@ -3776,6 +3928,7 @@ var ReservedCLIResourceNames = map[string]struct{}{
 	"helpers":          {},
 	"html_extract":     {},
 	"import":           {},
+	"local_data":       {},
 	"profile":          {},
 	"refresh_bearer":   {},
 	"root":             {},
@@ -3811,6 +3964,7 @@ var ReservedCobraUseNames = map[string]struct{}{
 	"jobs":           {},
 	"learnings":      {},
 	"live":           {},
+	"local-data":     {},
 	"login":          {},
 	"load":           {},
 	"orphans":        {},
@@ -4390,6 +4544,8 @@ var reservedRootFlagNames = map[string]struct{}{
 	"no-cache":              {},
 	"no-input":              {},
 	"insecure":              {},
+	"ca-cert":               {},
+	"tls-server-name":       {},
 	"idempotent":            {},
 	"ignore-missing":        {},
 	"yes":                   {},
@@ -4424,6 +4580,8 @@ var reservedRootFlagFieldNames = map[string]struct{}{
 	"noCache":                 {},
 	"noInput":                 {},
 	"insecure":                {},
+	"caCert":                  {},
+	"tlsServerName":           {},
 	"idempotent":              {},
 	"ignoreMissing":           {},
 	"yes":                     {},
@@ -4899,6 +5057,11 @@ func (s *APISpec) Validate() error {
 				}
 			}
 		}
+	}
+	// Cursor request parameters are resolved last so a missing method or path
+	// is reported before a pagination error on the same spec.
+	if err := s.ResolveCursorRequestParams(); err != nil {
+		return err
 	}
 	return nil
 }
@@ -5789,7 +5952,35 @@ func validateCacheShare(cache CacheConfig, share ShareConfig, resources map[stri
 		}
 		seen[t] = struct{}{}
 	}
+	if shareRepoIsRelativePath(strings.TrimSpace(share.DefaultRepo)) {
+		return fmt.Errorf("share.default_repo %q is a relative path; the share remote is fixed at generation time, so use a URL or an absolute path", share.DefaultRepo)
+	}
 	return nil
+}
+
+// shareRepoIsRelativePath reports whether git would read repo as a local path
+// that is not absolute. A relative path would resolve against each operator's
+// working directory, so it cannot pin the share remote. URLs ("scheme://"),
+// scp-style "host:path" remotes, and absolute Unix or Windows paths pass.
+func shareRepoIsRelativePath(repo string) bool {
+	if repo == "" || strings.Contains(repo, "://") {
+		return false
+	}
+	if strings.HasPrefix(repo, "/") || strings.HasPrefix(repo, `\\`) {
+		return false
+	}
+	if len(repo) >= 3 && repo[1] == ':' && (repo[2] == '/' || repo[2] == '\\') {
+		c := repo[0] | 0x20
+		if c >= 'a' && c <= 'z' {
+			return false // Windows drive path, e.g. C:\snapshots.git
+		}
+	}
+	if colon := strings.Index(repo, ":"); colon > 0 {
+		if slash := strings.Index(repo, "/"); slash < 0 || colon < slash {
+			return false // scp-style host:path
+		}
+	}
+	return true
 }
 
 // learnSeedKindRe enforces the seed kind naming rules described on
@@ -6024,15 +6215,16 @@ func (s *APISpec) ApplyLearnLoopDefault(w io.Writer) {
 }
 
 // IsCodeOrchestration reports whether this MCP config opts into the
-// code-orchestration thin surface. Templates branch on this to emit only
-// <api>_search + <api>_execute instead of the endpoint-mirror.
+// code-orchestration thin surface. Templates branch on this to emit
+// <api>_search, <api>_get, <api>_read, and <api>_execute instead of the
+// endpoint-mirror.
 func (m MCPConfig) IsCodeOrchestration() bool {
 	return m.Orchestration == "code"
 }
 
 // EndpointMirrorsVisible reports whether per-endpoint MCP tools are registered
 // directly. Code orchestration always suppresses endpoint mirrors because
-// <api>_search + <api>_execute cover the endpoint catalog.
+// <api>_search, <api>_read, and <api>_execute cover the endpoint catalog.
 func (m MCPConfig) EndpointMirrorsVisible() bool {
 	if m.IsCodeOrchestration() {
 		return false

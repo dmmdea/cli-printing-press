@@ -316,6 +316,25 @@ func runMessages() {
 
 		assert.Equal(t, 5, scoreDeadCode(dir))
 	})
+
+	t.Run("counts a helper called only from the MCP package", func(t *testing.T) {
+		dir := t.TempDir()
+		writeScorecardFixture(t, dir, "internal/cli/helpers.go", `
+package cli
+
+func MCPStorePath() (string, error) {
+	return "data.db", nil
+}
+`)
+		writeScorecardFixture(t, dir, "internal/mcp/tools.go", `
+package mcp
+
+func mcpDBPath() (string, error) {
+	return cli.MCPStorePath()
+}
+`)
+		assert.Equal(t, 5, scoreDeadCode(dir))
+	})
 }
 
 func TestScoreDataPipelineIntegrity(t *testing.T) {
@@ -587,6 +606,10 @@ func TestScorePathValidity(t *testing.T) {
 		writeScorecardFixture(t, dir, "internal/cli/links.go", `
 package cli
 
+import "github.com/spf13/cobra"
+
+var linksCmd = &cobra.Command{Use: "links"}
+
 func runLinks() string {
 	path := "/links"
 	return path
@@ -613,6 +636,10 @@ func TestScoreSpecDimensionsPrefersEmbeddedMergedSpecJSON(t *testing.T) {
 	dir := t.TempDir()
 	writeScorecardFixture(t, dir, "internal/cli/merged.go", `
 package cli
+
+import "github.com/spf13/cobra"
+
+var mergedCmd = &cobra.Command{Use: "merged"}
 
 func runMerged() string {
 	path := "/merged"
@@ -643,9 +670,14 @@ func TestScoreTypeFidelity(t *testing.T) {
 		writeScorecardFixture(t, dir, "internal/cli/messages.go", `
 package cli
 
-import "strings"
+import (
+	"strings"
+
+	"github.com/spf13/cobra"
+)
 
 var _ = strings.ReplaceAll
+var messagesCmd = &cobra.Command{Use: "messages"}
 
 func init() {
 	cmd := messagesCmd
@@ -661,6 +693,10 @@ func init() {
 
 		writeScorecardFixture(t, dir, "internal/cli/messages.go", `
 package cli
+
+import "github.com/spf13/cobra"
+
+var messagesCmd = &cobra.Command{Use: "messages"}
 
 func init() {
 	cmd := messagesCmd
@@ -680,6 +716,10 @@ func init() {
 
 		writeScorecardFixture(t, dir, "internal/cli/messages.go", `
 package cli
+
+import "github.com/spf13/cobra"
+
+var messagesCmd = &cobra.Command{Use: "messages"}
 
 func init() {
 	cmd := messagesCmd
@@ -822,6 +862,10 @@ func TestParseGraphEvent(t *testing.T) {
 		writeScorecardFixture(t, dir, "internal/cli/events_get.go", `
 package cli
 
+import "github.com/spf13/cobra"
+
+var eventsCmd = &cobra.Command{Use: "events"}
+
 func init() {
 	cmd := eventsCmd
 	cmd.Flags().StringVar(&flagQuery, "query", "", "Text query")
@@ -899,6 +943,10 @@ func TestSomethingElse(t *testing.T) {}
 		writeScorecardFixture(t, dir, "internal/cli/messages.go", `
 package cli
 
+import "github.com/spf13/cobra"
+
+var messagesCmd = &cobra.Command{Use: "messages"}
+
 func init() {
 	cmd := messagesCmd
 	cmd.Flags().StringVar(&flagQuery, "query", "", "Text query used to filter the list of messages")
@@ -945,6 +993,10 @@ func TestScoreTypeFidelity_FlagDeclRegexBoundedToOneLine(t *testing.T) {
 	writeScorecardFixture(t, dir, "internal/cli/messages.go", `
 package cli
 
+import "github.com/spf13/cobra"
+
+var messagesCmd = &cobra.Command{Use: "messages"}
+
 func init() {
 	cmd := messagesCmd
 	cmd.Flags().StringVar(&flagAlphaID, "alpha-id", "", "Alpha identifier")
@@ -966,6 +1018,10 @@ func TestScoreTypeFidelity_DoesNotRewardMarkFlagRequired(t *testing.T) {
 	writeScorecardFixture(t, withRequired, "internal/cli/messages.go", `
 package cli
 
+import "github.com/spf13/cobra"
+
+var messagesCmd = &cobra.Command{Use: "messages"}
+
 func init() {
 	cmd := messagesCmd
 	cmd.Flags().StringVar(&flagAlpha, "alpha", "", "Alpha description with at least seven words here")
@@ -980,6 +1036,10 @@ func init() {
 	withoutRequired := t.TempDir()
 	writeScorecardFixture(t, withoutRequired, "internal/cli/messages.go", `
 package cli
+
+import "github.com/spf13/cobra"
+
+var messagesCmd = &cobra.Command{Use: "messages"}
 
 func init() {
 	cmd := messagesCmd
@@ -1337,7 +1397,6 @@ func paginationCursorToken() {}
 func replacePathParam() {}
 func resolvePlatformWindow() {}
 func responsePayloadParentAtPath() {}
-func writeNoop() {}
 `)
 
 		assert.Equal(t, 5, scoreDeadCode(dir))
@@ -3692,13 +3751,24 @@ func (c *Client) do() {
 func TestEvaluateAuthProtocol_InternalCookieAuth(t *testing.T) {
 	t.Run("scores generated Cookie header for internal YAML cookie auth", func(t *testing.T) {
 		sc := scoreInternalCookieAuthProtocol(t, `package client
-func (c *Client) do() {
+
+import (
+	"context"
+	"net/http"
+)
+
+func (c *Client) do(ctx context.Context, authHeader string, httpClient *http.Client) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://example.test/users", nil)
+	if err != nil {
+		return
+	}
 	req.Header.Set("Cookie", authHeader)
+	_, _ = httpClient.Do(req)
 }
 `)
 
 		assert.NotContains(t, sc.UnscoredDimensions, "auth_protocol")
-		assert.GreaterOrEqual(t, sc.Steinberger.AuthProtocol, 8)
+		assert.Equal(t, 10, sc.Steinberger.AuthProtocol)
 	})
 
 	t.Run("does not score Cookie mentions without header assignment", func(t *testing.T) {
@@ -3710,7 +3780,7 @@ func (c *Client) do() {
 `)
 
 		assert.NotContains(t, sc.UnscoredDimensions, "auth_protocol")
-		assert.Less(t, sc.Steinberger.AuthProtocol, 8)
+		assert.Equal(t, 2, sc.Steinberger.AuthProtocol)
 	})
 }
 

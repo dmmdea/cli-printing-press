@@ -110,18 +110,22 @@ type CLIManifest struct {
 	// Printer is the original printer's GitHub handle, preserved across regens.
 	Printer string `json:"printer,omitempty"` // legacy: derived from Creator.Handle
 	// PrinterName is the optional display name rendered beside the printer handle.
-	PrinterName        string            `json:"printer_name,omitempty"` // legacy: derived from Creator.Name
-	SpecURL            string            `json:"spec_url,omitempty"`
-	SpecPath           string            `json:"spec_path,omitempty"`
-	SpecFormat         string            `json:"spec_format,omitempty"`
-	SpecKind           string            `json:"spec_kind,omitempty"`
-	SpecSource         string            `json:"spec_source,omitempty"`
-	SpecChecksum       string            `json:"spec_checksum,omitempty"`
-	RunID              string            `json:"run_id,omitempty"`
-	Category           string            `json:"category,omitempty"`
-	Regions            []string          `json:"regions,omitempty"`
-	APILanguage        string            `json:"api_language,omitempty"`
-	Description        string            `json:"description,omitempty"`
+	PrinterName  string   `json:"printer_name,omitempty"` // legacy: derived from Creator.Name
+	SpecURL      string   `json:"spec_url,omitempty"`
+	SpecPath     string   `json:"spec_path,omitempty"`
+	SpecFormat   string   `json:"spec_format,omitempty"`
+	SpecKind     string   `json:"spec_kind,omitempty"`
+	SpecSource   string   `json:"spec_source,omitempty"`
+	SpecChecksum string   `json:"spec_checksum,omitempty"`
+	RunID        string   `json:"run_id,omitempty"`
+	Category     string   `json:"category,omitempty"`
+	Regions      []string `json:"regions,omitempty"`
+	APILanguage  string   `json:"api_language,omitempty"`
+	Description  string   `json:"description,omitempty"`
+	// Homepage is the product's public website, recorded only when research
+	// confirmed it. It is never derived from spec URLs, which usually point
+	// at API hosts or docs rather than the brand's site.
+	Homepage           string            `json:"homepage,omitempty"`
 	MCPBinary          string            `json:"mcp_binary,omitempty"`
 	MCPToolCount       int               `json:"mcp_tool_count,omitempty"`
 	MCPPublicToolCount int               `json:"mcp_public_tool_count,omitempty"`
@@ -167,6 +171,13 @@ type CLIManifest struct {
 	NovelFeaturesBuilt []NovelFeatureManifest `json:"novel_features_built,omitempty"`
 	Scorecard          *CLIManifestScorecard  `json:"scorecard,omitempty"`
 	Verify             *CLIManifestVerify     `json:"verify,omitempty"`
+	// VerifySyncResource names the only resource verify's data-pipeline
+	// probe may sync. It must also be one of the CLI's declared sync
+	// resources. Empty lets the probe choose from that declared list.
+	VerifySyncResource string `json:"verify_sync_resource,omitempty"`
+	// VerifySyncExclude drops declared resources from the probe choice.
+	// The probe refuses to sync when the hint and the list leave no safe name.
+	VerifySyncExclude []string `json:"verify_sync_exclude,omitempty"`
 	// generatedEnvReads is a write-scoped scan of os.Getenv names already
 	// emitted into the printed CLI. It is not serialized; WriteMCPBManifest
 	// and reconcile attach it so a kept colliding override can bind the
@@ -299,7 +310,7 @@ func readCLIManifestFile(path string) (CLIManifest, error) {
 // Generate-time fields (spec_url, spec_path, spec_checksum,
 // generated_at, printing_press_version, schema_version, novel_features,
 // novel_features_built, category, cli_name, api_name, api_version,
-// description) are preserved as-is. Research-originated keys that the
+// description, homepage) are preserved as-is. Research-originated keys that the
 // typed struct does not model are kept via the raw merge so a refresh
 // without --research-dir cannot zero the publish transcendence gate.
 // Only the spec-driven MCP/auth/display fields are refreshed.
@@ -706,9 +717,9 @@ func PersistVerifyToManifest(manifestPath string, report *VerifyReport) (bool, e
 	})
 }
 
-// LoadVerifyReportFromManifest restores the verification evidence that a
-// preceding shipcheck verify leg persisted. Older manifests simply return no
-// report, preserving standalone scorecard behavior.
+// LoadVerifyReportFromManifest restores verification evidence persisted in a
+// CLI manifest. A missing file or a manifest with no verify section returns
+// a nil report.
 func LoadVerifyReportFromManifest(manifestPath string) (*VerifyReport, error) {
 	if strings.TrimSpace(manifestPath) == "" {
 		return nil, nil
@@ -847,6 +858,7 @@ func orderedCLIManifestKeys(raw map[string]json.RawMessage) []string {
 		"regions",
 		"api_language",
 		"description",
+		"homepage",
 		"mcp_binary",
 		"mcp_tool_count",
 		"mcp_public_tool_count",
@@ -1126,6 +1138,7 @@ type GenerateManifestParams struct {
 	Spec            *spec.APISpec          // parsed spec for MCP metadata (nil if unavailable)
 	AuthPreference  string                 // resolved OpenAPI securityScheme preference selected for this generate
 	NovelFeatures   []NovelFeatureManifest // transcendence features from research (nil if unavailable)
+	Homepage        string                 // validated research homepage; "" when research had none
 }
 
 // runIDPattern matches legacy and skill-allocated pipeline run_id basenames.
@@ -1390,6 +1403,11 @@ func WriteManifestForGenerate(p GenerateManifestParams) error {
 	// prose to become canonical on a later generate run.
 	if preserveExisting && preserveExistingDescription(existing.Description) {
 		m.Description = existing.Description
+	}
+	// A hand-checked or backfilled homepage outranks a later research guess.
+	m.Homepage = p.Homepage
+	if preserveExisting && strings.TrimSpace(existing.Homepage) != "" {
+		m.Homepage = existing.Homepage
 	}
 	if len(p.NovelFeatures) > 0 {
 		m.NovelFeatures = p.NovelFeatures

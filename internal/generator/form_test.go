@@ -84,8 +84,8 @@ func TestGenerateFormRequestBodyUsesFormClient(t *testing.T) {
 	assert.NotContains(t, endpointSrc, `var stdinBody bool`)
 	assert.NotContains(t, endpointSrc, `c.Post(path, body)`)
 	// Required-flag check should fire at top-level, not inside `if !stdinBody`.
-	assert.Contains(t, endpointSrc, `return fmt.Errorf("required flag \"%s\" not set", "grant-type")`)
-	assert.Contains(t, endpointSrc, `return fmt.Errorf("required flag \"%s\" not set", "client-id")`)
+	assert.Contains(t, endpointSrc, `dryRunValidationErr(cmd, flags, fmt.Errorf("required flag \"%s\" not set", "grant-type"))`)
+	assert.Contains(t, endpointSrc, `dryRunValidationErr(cmd, flags, fmt.Errorf("required flag \"%s\" not set", "client-id"))`)
 
 	// JSON-string body field validates as JSON before sending. Single-endpoint
 	// resource collapses to the promoted form rather than a per-endpoint file.
@@ -175,7 +175,7 @@ func TestGenerateReadOnlyFormHTMLTableEndpoint(t *testing.T) {
 	binaryPath := filepath.Join(outputDir, "formhtml-pp-cli")
 	runGoCommand(t, outputDir, "build", "-o", binaryPath, "./cmd/formhtml-pp-cli")
 
-	cmd := exec.Command(binaryPath, "contracts", "list", "--json")
+	cmd := exec.Command(binaryPath, "contracts", "--json")
 	cmd.Env = append(os.Environ(), "PRINTING_PRESS_VERIFY=1", "FORMHTML_BASE_URL="+httpServer.URL)
 	out, err := cmd.CombinedOutput()
 	require.NoError(t, err, string(out))

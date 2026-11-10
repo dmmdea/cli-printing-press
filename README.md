@@ -28,7 +28,7 @@ You need both the **binary** and the **Printing Press skills**. The skills (`/pr
 
 The binary alone works (research, generation, verification, scoring) but skips the curated agent loop. The skills alone have nothing to call. Install both.
 
-**Prerequisites:** [Go 1.26.6 or newer](https://go.dev/dl/), [Claude Code](https://claude.ai/code) or another `skills`-supported agent, and Node/npm for `npx`. The skills are tested with Claude Code; install for Codex with `--agent codex` when you want to try the same slash-command workflow there. **Use Claude Code for the best-tested experience.**
+**Prerequisites:** [Go 1.26.10 or newer](https://go.dev/dl/), [Claude Code](https://claude.ai/code) or another `skills`-supported agent, and Node/npm for `npx`. The skills are tested with Claude Code; install for Codex with `--agent codex` when you want to try the same slash-command workflow there. **Use Claude Code for the best-tested experience.**
 
 ### 1. Install
 
@@ -54,7 +54,7 @@ npx -y skills@latest list -g -a codex --json
 
 See [docs/CODEX.md](docs/CODEX.md) for the Codex-specific notes.
 
-Verify with `cli-printing-press --version`. If install fails, confirm Go 1.26.6 or newer is installed, Node/npm is installed for `npx`, and `$GOPATH/bin` is on your `PATH`.
+Verify with `cli-printing-press --version`. If install fails, confirm Go 1.26.10 or newer is installed, Node/npm is installed for `npx`, and `$GOPATH/bin` is on your `PATH`.
 
 Older releases installed a generator binary named `printing-press`. That legacy
 entrypoint still works for compatibility, but the canonical generator command is
@@ -341,7 +341,7 @@ The generator ships three opt-in knobs on the spec's `mcp:` block, aligned with 
 ```yaml
 mcp:
   transport: [stdio, http]        # remote-capable for cloud-hosted agents; default [stdio]
-  addr: ":7777"                   # default bind for the http transport
+  addr: "127.0.0.1:7777"          # loopback bind; ":7777" listens on every interface and requires TLS
   orchestration: code             # "endpoint-mirror" (default), "intent", or "code"
   endpoint_tools: hidden          # suppress raw endpoint tools when intents cover the surface
   intents:                        # compose multi-step tools declaratively
@@ -531,7 +531,7 @@ Each newly published CLI ships a root `AGENTS.md` operating guide, a research ma
 ## Limitations
 
 - **Technical capability is not legal permission.** Before generating a CLI for any service, review its Terms of Service. Many services explicitly prohibit automated access. Using this tool against such services may violate their terms or applicable law. You are responsible for ensuring your use is authorized.
-- **Requires Go 1.26.6 or newer and an agent that can load open-agent-skills.** Claude Code is the tested path; Codex installation is documented but may lag Claude Code behavior. No standalone distribution today; the slash command is the supported entry point for Claude Code.
+- **Requires Go 1.26.10 or newer and an agent that can load open-agent-skills.** Claude Code is the tested path; Codex installation is documented but may lag Claude Code behavior. No standalone distribution today; the slash command is the supported entry point for Claude Code.
 - **Generated CLIs are domain-shaped, not vendor-replacements.** A `<api>-pp-cli` covers the agent power-user surface, not every back-office knob a vendor's official CLI ships.
 - **Browser-sniff requires manual capture.** You point a browser at the site (or import a HAR); the press doesn't crawl autonomously.
 - **Live verify is read-only.** Phase 5 runs GET only and never mutates. Real write-path coverage lives in unit tests and the dogfood structural checks.
@@ -554,7 +554,7 @@ Each newly published CLI ships a root `AGENTS.md` operating guide, a research ma
 
 ## Contributing
 
-Bug reports, feature requests, and PRs are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a PR; it explains the PR template, AI / automation disclosure, and the repo boundary between the Printing Press and printed CLIs. [AGENTS.md](AGENTS.md) carries the full developer conventions, glossary, commit style, and verification rules.
+Bug reports, feature requests, and PRs are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a PR; it explains the PR template, AI / automation disclosure, and the repo boundary between the Printing Press and printed CLIs. [AGENTS.md](AGENTS.md) carries the full developer conventions, glossary, commit style, and verification rules. Report a vulnerability privately; see [SECURITY.md](SECURITY.md).
 
 ## Development
 

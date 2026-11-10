@@ -1,8 +1,8 @@
 module printing-press-golden-pp-cli
 
-go 1.26.6
+go 1.26.10
 
-toolchain go1.26.6
+toolchain go1.26.10
 
 require (
 	github.com/spf13/cobra v1.9.1
@@ -12,13 +12,14 @@ require (
 require modernc.org/sqlite v1.37.0
 require github.com/mark3labs/mcp-go v0.57.0
 
-// x/sys is a DIRECT dependency for token-bearing bundles: the read-time
-// credentials-perms guard's Windows surface (internal/cliutil/creds_perms_windows.go)
-// imports golang.org/x/sys/windows. Emitted as a direct require (no // indirect)
-// so a freshly generated bundle's go.mod is correct out of the box, WITHOUT a
+// x/sys is a DIRECT dependency for token-bearing bundles. The read-time
+// credentials guard imports golang.org/x/sys/unix on non-Windows
+// (creds_perms_unix.go; darwin's syscall package has no Openat) and
+// golang.org/x/sys/windows on Windows. darwin_acl_darwin.go also imports
+// golang.org/x/sys/unix. Emitted as a direct require (no // indirect) so a
+// freshly generated bundle's go.mod is correct out of the box, WITHOUT a
 // manual `go mod tidy`. The version matches the transitive floor below so a
-// single x/sys version is pinned. NOTE (go mod tidy GOOS caveat): the import is
-// behind `//go:build windows`, so running `go mod tidy` under GOOS=linux/darwin
-// re-marks this // indirect (that GOOS compiles no file that imports it); under
-// GOOS=windows it stays direct. That is tolerated churn, NOT a bug to "fix".
+// single x/sys version is pinned. `go mod tidy` on linux/darwin keeps the
+// require direct because a unix import is compiled there; tidy on Windows
+// keeps it direct because of the windows import.
 require golang.org/x/sys v0.46.0

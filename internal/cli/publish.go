@@ -433,6 +433,10 @@ func newPublishPackageCmd() *cobra.Command {
 					cleanupOnFailure()
 					return &ExitError{Code: ExitPublishError, Err: fmt.Errorf("preserving runtime version layout: %w", err)}
 				}
+				if err := pipeline.RestoreLibraryHomepage(outCLIDir, resolvedBase, sourceManifest.APIName); err != nil {
+					cleanupOnFailure()
+					return &ExitError{Code: ExitPublishError, Err: fmt.Errorf("preserving library homepage: %w", err)}
+				}
 			}
 			if err := pipeline.EnsureMCPBManifest(outCLIDir); err != nil {
 				cleanupOnFailure()
@@ -545,6 +549,11 @@ func newPublishPackageCmd() *cobra.Command {
 				fmt.Fprintln(os.Stderr, "warning: no manuscripts found, packaging without them")
 			}
 
+			if err := pipeline.RemoveUnshippablePackageFiles(outCLIDir); err != nil {
+				cleanupOnFailure()
+				return &ExitError{Code: ExitPublishError, Err: fmt.Errorf("removing live-check leftovers and stray executables: %w", err)}
+			}
+
 			cookieNames, err := stagedPackageCookieNames(outCLIDir)
 			if err != nil {
 				cleanupOnFailure()
@@ -597,7 +606,7 @@ func newPublishPackageCmd() *cobra.Command {
 	cmd.Flags().StringVar(&baseDir, "base-dir", "", "Existing library entry whose runtime version declaration layout is preserved into the package")
 	cmd.Flags().StringVar(&modulePath, "module-path", "", "Go module path to set (e.g., github.com/org/repo/library/category/cli-name)")
 	cmd.Flags().BoolVar(&allowMirrorDeletions, "allow-mirror-deletions", false, "Allow the overlay to delete mirror files that have no source counterpart (use only after manual reconciliation)")
-	cmd.Flags().BoolVar(&includeRawCaptures, "include-raw-captures", false, "Include raw browser-sniff captures in bundled manuscripts (private use only)")
+	cmd.Flags().BoolVar(&includeRawCaptures, "include-raw-captures", false, "Include raw discovery captures in bundled manuscripts (private use only)")
 	cmd.Flags().BoolVar(&asJSON, "json", false, "Output as JSON")
 
 	return cmd
@@ -1639,7 +1648,13 @@ func isBareModuleName(declared string) bool {
 }
 
 func buildValidationBinary(dir, cliName string) (path string, cleanup func(), err error) {
-	tempDir, err := os.MkdirTemp(dir, ".publish-validate-*")
+	// go build resolves a relative -o against cmd.Dir. A relative MkdirTemp
+	// parent would put the binary in a duplicated tree cleanup does not remove.
+	absDir, err := filepath.Abs(dir)
+	if err != nil {
+		return "", nil, err
+	}
+	tempDir, err := os.MkdirTemp(absDir, ".publish-validate-*")
 	if err != nil {
 		return "", nil, err
 	}
@@ -1649,23 +1664,34 @@ func buildValidationBinary(dir, cliName string) (path string, cleanup func(), er
 	}
 
 	outPath := platform.ExecutablePath(filepath.Join(tempDir, cliName))
-	if err := buildBinaryAtPath(dir, outPath, "./cmd/"+cliName); err == nil {
-		return outPath, cleanup, nil
+	if built, buildErr := buildBinaryAtPath(absDir, outPath, "./cmd/"+cliName); buildErr == nil {
+		return built, cleanup, nil
 	}
-	if err := buildBinaryAtPath(dir, outPath, "."); err == nil {
-		return outPath, cleanup, nil
+	if built, buildErr := buildBinaryAtPath(absDir, outPath, "."); buildErr == nil {
+		return built, cleanup, nil
 	}
 
 	cleanup()
 	return "", nil, fmt.Errorf("building validation binary")
 }
 
-func buildBinaryAtPath(dir, outPath, pkg string) error {
+func buildBinaryAtPath(dir, outPath, pkg string) (string, error) {
+	absDir, err := filepath.Abs(dir)
+	if err != nil {
+		return "", err
+	}
+	absOut, err := filepath.Abs(outPath)
+	if err != nil {
+		return "", err
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), goCommandTimeout)
 	defer cancel()
-	buildCmd := exec.CommandContext(ctx, "go", "build", "-o", outPath, pkg)
-	buildCmd.Dir = dir
-	return buildCmd.Run()
+	buildCmd := exec.CommandContext(ctx, "go", "build", "-o", absOut, pkg)
+	buildCmd.Dir = absDir
+	if err := buildCmd.Run(); err != nil {
+		return "", err
+	}
+	return absOut, nil
 }
 
 func buildArtifactCandidates(dir, cliName string) []string {

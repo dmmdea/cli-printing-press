@@ -1,5 +1,9 @@
 # CLI Printing Press - Development Conventions
 
+## Review docs
+- [`CODING_STANDARDS.md`](CODING_STANDARDS.md): the rules code in this repo follows. Read it before writing or reviewing code; update it when a change establishes or retires a rule.
+- [`REVIEW.md`](REVIEW.md): severity, what not to flag, and the evidence a finding needs. Read it before reviewing code or answering review findings; update it when review policy changes.
+
 ## Machine vs Printed CLI
 This repo is **the machine** (generator, templates, binary, skills) that produces **printed CLIs**. When fixing a bug or adding a feature, ask: machine change or printed-CLI change?
 - **Machine changes** (generator, templates, parser, skills) affect every future CLI and must generalize across APIs, spec formats, and auth patterns.
@@ -38,9 +42,13 @@ MCP hosts use `readOnlyHint` / `destructiveHint` / `idempotentHint` / `openWorld
 - Endpoint mirrors: conventional REST `GET` -> read-only + open-world; RPC-over-GET without a read signal (or an explicit / name-token mutation) is not read-only. `DELETE` -> destructive + open-world, `POST`/`PUT`/`PATCH` -> open-world unless a read signal applies.
 - Built-in tools: `context`, `sql`, `search` are read-only and local-only.
 - Runtime walker shell-out tools get no annotations by default. Opt into read-only with `cmd.Annotations["mcp:read-only"] = "true"` for novel commands that only read from the API, the local store, or the CLI tree itself. Skip the annotation when the command can mutate external state (writes via API, store updates other than telemetry-class writes below, git pushes) or write to user-visible files outside the local cache (commands accepting `--output <file>`, `--repo <dir>`, etc.).
-- Declare every novel flag whose value chooses a filesystem write destination with `cmd.Annotations["mcp:write-flags"] = "save-to,report-path"` (comma-, semicolon-, or whitespace-separated Cobra long names) on the command that defines the flag. The walker drops those flags, plus the unambiguous destination names in `blockedDestinationFlags` (`output`, `out`, `output-dir`, `output-file`, `out-dir`, `out-file`, `o`, `db`, `audit-dir`, `receipt-file`), from the MCP schema and rejects them as structured arguments. A parent annotation also blocks a persistent flag that parent supplies and a child inherits. A nearer command that redeclares the same persistent name owns that flag. Recipe tools resolve Cobra aliases and apply the same block at registration, so a README recipe cannot re-expose the destination. `mcp:read-only` does not weaken that block. Do not list input paths (`--file`, `--path`).
+- Declare every novel flag whose value chooses a filesystem write destination with `cmd.Annotations["mcp:write-flags"] = "save-to,report-path"` (comma-, semicolon-, or whitespace-separated Cobra long names) on the command that defines the flag. The walker drops those flags, plus the unambiguous destination names in `blockedDestinationFlags` (`output`, `out`, `output-dir`, `output-file`, `out-dir`, `out-file`, `o`, `db`, `audit-dir`, `receipt-file`), from the MCP schema and rejects them as structured arguments. A parent annotation also blocks a persistent flag that parent supplies and a child inherits. A nearer command that redeclares the same persistent name owns that flag. Recipe tools resolve Cobra aliases and apply the same block at registration, so a README recipe cannot re-expose the destination. `mcp:read-only` does not weaken that block. Declare read-path flags with `mcp:read-flags`, not `mcp:write-flags`.
+- Declare every novel flag whose value is a filesystem path opened for reading with `cmd.Annotations["mcp:read-flags"] = "file,secret-file"` (same separators as `mcp:write-flags`) on the command that defines the flag. The walker drops those flags, plus the unambiguous read-path names in `blockedInputFlags` (`cookies-file`, `input`, `input-file`, `notes-file`, `password-file`, `playbook-file`, `playbook-notes-file`), from the MCP schema and rejects them as structured arguments. Inheritance matches write sinks: a parent annotation covers a persistent flag that parent supplies, and a nearer redeclaration owns that flag. Recipe tools apply the same block. Names that are often not paths (`file`, `path`) stay available until listed in `mcp:read-flags`.
 - Telemetry-class local writes do not disqualify `mcp:read-only`: a best-effort local write that never fails the command and is never observable in domain output (recall's usage-event insert, journal appends) is telemetry, not a store update in the sense above. Keep `readOnlyHint: true` on such commands.
-- Annotate commands whose only writes land in the CLI's own local store (teach-style learn writes, playbook amendments) with `cmd.Annotations["mcp:local-write"] = "true"`: the walker emits `destructiveHint: false` + `openWorldHint: false` and leaves `readOnlyHint` unset. Do not apply it to commands that delete user-visible data (`learnings forget`, `learnings reject` keep honest destructive semantics).
+- Annotate commands whose only writes land in the CLI's own local store (teach-style learn writes, playbook amendments) with `cmd.Annotations["mcp:local-write"] = "true"`: the walker does not emit `destructiveHint: false` (the tool stays possibly destructive), emits `openWorldHint: true`, and leaves `readOnlyHint` unset so hosts prompt. Do not apply it to commands that delete user-visible data (`learnings forget`, `learnings reject` keep honest destructive semantics).
+- The root `--yes` flag is not an MCP parameter on cobratree mirrors. It is omitted from tool schemas and rejected at call time, including when a command redeclares `--yes` locally. Per-command confirm flags (`--force`, `--confirm`, `--launch`) stay. A mirrored command that already requires `--yes` fails that check (the mirror does not attach a terminal and does not inject `--yes`); `--dry-run` stays available when the command has it.
+- `<CLI>_MCP_READ_ONLY=1` (printed env prefix, value exactly `1`) leaves only tools annotated `readOnlyHint: true`: after every registration, `RegisterTools` drops the rest, including typed endpoint tools, intents, `mcp:local-write` mirrors, and `<api>_execute`. The mirror also skips registering commands that are not annotated `mcp:read-only`, `mcp:local-write`, or `mcp:read-only-unless-flags`, and a call-time wrapper refuses those commands without spawning the CLI. The `<api>_execute` handler still refuses state-changing calls, including mutating GETs and every non-GET, while the switch is on. `<api>_read` still serves GET reads and codegen-marked read-only POSTs.
+- `cmd.Annotations["mcp:read-only-unless-flags"] = "fix,fix-limit"` lists command-local Cobra long names that turn an otherwise readable command into a write. With the switch on, the command stays registered, those flags leave the schema and are rejected without spawning, and the tool gets `readOnlyHint=true` plus `destructiveHint=false`. With the switch off, the schema and hints are unchanged.
 Wrong annotations are worse than missing ones. A false `readOnlyHint: true` on a mutating tool is a real bug; a missing annotation is just a permission prompt.
 
 ### Side-effect commands
@@ -56,6 +64,9 @@ Generated endpoint-mirror commands also gate mutating HTTP verbs (DELETE/POST/PU
 ### Long-running commands under live-dogfood
 Hand-written novel commands whose happy path is an expensive read/network operation (full sync loops, content crawlers, bulk archive walks) MUST curtail work when `cliutil.IsDogfoodEnv()` returns true. The `cli-printing-press dogfood --live` runner sets `PRINTING_PRESS_DOGFOOD=1` in every subprocess under a flat 30s per-command timeout, so an uncapped happy path trips the matrix verdict to FAIL. Unlike `IsAnyHarness`, this does NOT mean "don't hit the network" — dogfood is a real-API matrix for reads; use it to bound read work (paginate once, fetch a bounded sample, honor a smaller `--limit` default), never to substitute mock data for real calls.
 
+### Preview happy path under live-dogfood
+Annotate a mutating novel command `cmd.Annotations["pp:preview-happy-path"] = "true"` only when running it without `--dry-run` and without its confirm flag performs no external write (it prints a preview). `dogfood --live` then runs its happy path for real from a scratch directory without `--allow-destructive`, and that pass clears hollow coverage. `pp:happy-args` for such a command must not carry a confirm flag (`--yes`, `-y`, `--confirm`, `--force`, `--execute`, `--apply`, `--send`, `--launch`); the runner fails the row if it does. Destructive-at-auth commands stay skipped. Commands whose happy path actually writes keep `pp:live-happy-path` plus `--allow-destructive`.
+
 ### Generator-reserved namespaces
 `internal/cliutil/`, `internal/learn/`, and `internal/mcp/cobratree/` are generator-owned packages emitted into every printed CLI. Do not hand-author code in them and do not name agent-authored helpers that collide with their exports — regen will overwrite the work. Novel-feature code goes in command packages and may import from `cliutil` or `learn`.
 
@@ -63,6 +74,9 @@ The `internal/learn` templates under `internal/generator/templates/learn**` must
 
 ### Typed exit-code verification
 `cli-printing-press verify` treats exit `0` as success by default. For commands where a non-zero code is intentional control flow, declare it in Cobra with `Annotations: map[string]string{"pp:typed-exit-codes": "0,2"}`. The verifier reads that annotation first, then falls back to a command-level `Exit codes:` help block. Do not put the whole global failure palette in a command-level help block unless those codes should count as verify-pass for that specific command.
+
+### Proof-backed novel-feature coverage
+Use `cmd.Annotations["pp:verified-by-proof"] = "<file>.md"` only for a state-dependent novel command whose real happy path needs state a prior real write created (for example `<cmd> <batch-id>` on a batch that exists), so live dogfood can never pass it without `--dry-run`. It is not a substitute for a runnable happy path. The value is a bare `.md` or `.txt` filename (no separators, no `..`) in the same proofs directory as `--write-acceptance`. `dogfood --live` counts the feature as covered only when the file is non-empty, mentions the command path, and this run passed the command's help plus a dry-run `happy_path` or `dry_run_json` check; otherwise it stays in `hollow_features`. Accepted features are listed in `proof_covered_features` on the report and `phase5-acceptance.json`, and the phase5 gate fails when a listed proof file is missing beside the marker.
 
 ## Build, Test & Lint
 ```bash
@@ -141,7 +155,7 @@ The same lockstep applies to the learn-loop templates under `internal/generator/
 - `internal/generator/` - Template engine + quality gates
 - `skills/` - Claude Code skill definitions
 - `testdata/` - Test fixtures (internal + OpenAPI specs)
-- `docs/PIPELINE.md` - Portable contract for the 9-phase generation pipeline. Update it when `internal/pipeline/state.go` or `internal/pipeline/seeds.go` changes
+- `docs/PIPELINE.md` - Portable contract for the 9-phase generation pipeline. Update it when `internal/pipeline/state.go`, `internal/pipeline/seeds.go`, or `internal/pipeline/source_fingerprint.go` changes
 - `docs/SPEC-EXTENSIONS.md` - Canonical reference for Printing Press-specific OpenAPI `x-*` extensions. Update it when `internal/openapi/parser.go` adds or changes an `Extensions["x-*"]` lookup
 - `docs/SKILLS.md` - Skill authoring conventions: workflow parity, reference-file pattern, frontmatter fields
 - `docs/PATTERNS.md` - Cross-cutting design patterns
@@ -239,6 +253,7 @@ python3 .github/scripts/pr-review-state/greptile_feedback.py <PR_NUMBER>
 
 ## Versioning
 Releases are automated by release-please. Never manually edit version numbers.
+- A release is complete only after GoReleaser succeeds and the release job confirms all six platform archives and `checksums.txt` are non-empty. Recover a failed artifact build by re-running only the failed GoReleaser job from its original run; do not re-run successful Release Please jobs. Do not raise the supported-version floor to an incomplete release.
 - Normal feature/fix PRs land through the Mergify queue: add the `ready-to-merge` label when the PR is ready to merge, and let Mergify rebase/test/merge it. Do not use the GitHub merge button for normal PRs once `Mergify Merge Protections` is required on `main`.
 - release-please PRs are the release control point: they collect already-merged conventional commits, so merge one only when you intend to cut a release. Mergify lets release-please PRs satisfy merge protection without `ready-to-merge`, so maintainers can merge them manually after CI passes.
 - When enabling branch protection for the Mergify queue, require the `Mergify Merge Protections` status check and set `required_status_checks.strict=false`; Mergify owns latest-`main` validation through the queue, and GitHub's strict up-to-date requirement recreates the manual rebase loop.
@@ -249,14 +264,14 @@ See [`docs/RELEASE.md`](docs/RELEASE.md) for the merge-the-release-PR flow.
 
 ## Supported-version floor
 `supported-versions.txt` (repo root) is the **currency floor** — the lowest binary version the generation skills will generate with. The `printing-press` and `printing-press-amend` preflights (and `reprint`, via its hand-off) fetch it from `main` and **hard-block** with `[upgrade-required]` (interactive upgrade-or-abort, no skip) when the installed binary is below it. To push users off a known-buggy release, bump `min_supported` — a one-line PR that takes effect within the 24h version-check cache, no binary or skill release needed.
-- `min_supported` must be `major.minor.patch`. At runtime it is clamped to `<= latest` (a value above the newest release is ignored, so a typo cannot brick installs) and is a no-op below the frozen `min-binary-version`.
-- Distinct from `min-binary-version`: that is the release-managed, skill-frontmatter compatibility floor (the hard "skill cannot run below this" baseline, tracking the major and moving only on a major bump). The currency floor is a freely-tunable freshness gate. Do not conflate them.
+- `min_supported` must be `major.minor.patch`. At runtime it is clamped to `<= latest` (a value above the newest release is ignored, so a typo cannot brick installs) and is a no-op below the skill-embedded `min-binary-version`.
+- Distinct from `min-binary-version`: that is the skill-embedded compatibility floor (`SKILL.md` frontmatter, the setup-contract `# min-binary-version:` comment, and `_min_binary_version=`). It moves when skill text depends on a newer binary capability, including a minor or patch. Preflight compares it locally on every run (`[binary-below-min]`, no `.version-check` TTL, no network). The currency floor is the out-of-band freshness gate. Do not conflate them.
 - `TestSkillsEnforceCurrencyFloor` in [`internal/pipeline/contracts_test.go`](internal/pipeline/contracts_test.go) locks the file shape and both contracts' enforce-every-run gate and clamp.
 
 ## Skill-version floor
 The binary's `MinSkillVersion` (`internal/cli/skill_compat.go`) is the oldest printing-press skill frontmatter `version:` this binary will run with — the reverse of `min-binary-version`. When skill shape changes so a stale install would follow deleted commands, bump `MinSkillVersion`, the skill `version:` field, and the setup-contract `# skill-version:` / `_this_skill_version=` values together. Preflight hard-blocks with `[skill-stale]` (reinstall via `scripts/install.sh --skills-only`, then restart the session; no skip). `version --json` also warns on stderr when a well-known install path still has an older copy. `TestPrintingPressSkillVersionMatchesBinaryFloor` and `TestSkillsEnforceCurrencyFloor` lock the contract.
 
-See [`docs/SKILLS.md`](docs/SKILLS.md) for the frontmatter bump rule.
+See [`docs/SKILLS.md`](docs/SKILLS.md) for the frontmatter bump rules (`version` / `MinSkillVersion`, and `min-binary-version` when skill text depends on a newer binary).
 
 ## Testing
 When you change code, check for a `_test.go` file in the same package. If one exists, read it; your change likely requires a test update. If tests fail after your change, investigate whether it is a bug in your code or a stale test; do not just delete the test.
@@ -266,7 +281,16 @@ Run `go test ./...` before considering your work done.
 ## Quality Gates
 Generated CLIs must pass 9 gates: `go mod tidy`, generated `go test ./...`, `govulncheck`, `go vet`, `go build`, binary build, `--help`, `version`, and `doctor`.
 Run `govulncheck` in default mode only, scoped to the generated or publishing CLI module (`./...` from that CLI directory). Do not use `-show verbose` or a whole public-library scan as a blocking gate; blocking CI scans only added or changed CLI modules, leaving whole-library sweeps to scheduled/reporting workflows.
+Under `go test`, that govulncheck gate skips the live vulnerability database unless `PP_LIVE_GOVULNCHECK=1`. See Go security floor.
 - For CLIs with `auth.type` of `cookie` or `composed`, `press-auth` (`cmd/press-auth/`) is the canonical cookie capture path. The generated `auth login --chrome` prefers it; the legacy extraction chain (pycookiecheat / browser-use / etc.) is the fallback when press-auth isn't installed. See [`skills/printing-press/references/auth-companion.md`](skills/printing-press/references/auth-companion.md).
+
+## Go security floor
+
+The root `go.mod` `go` directive is the source of truth. `librarySafeGoDirective` in `internal/generator/go_version.go` is the `go` and `toolchain` version printed CLIs declare, and it must be <= the root `go` directive. Before raising `librarySafeGoDirective`, confirm `mvanhorn/printing-press-library` `.go-version` (https://raw.githubusercontent.com/mvanhorn/printing-press-library/main/.go-version) is already >= the new value. The library bumps first.
+
+Run `python3 scripts/verify-go-floor.py` and update every surface it reports (generator text, templates, install docs, fixtures, and goldens). Renovate opens the grouped patch PR that bumps the root `go` directive, a root `toolchain` line when one is present, and `librarySafeGoDirective` together. Finish those reported surfaces on that PR. Do not automerge it. On pull requests and main CI the library comparison warns and does not fail the job, including when `.go-version` cannot be fetched. `release.yml` sets `GO_FLOOR_ENFORCE_LIBRARY=1` and refuses to publish when `librarySafeGoDirective` is newer than the library `.go-version`, or when that file cannot be read.
+
+Generated-CLI quality gates skip live `govulncheck` under `go test` unless `PP_LIVE_GOVULNCHECK=1`. The daily `govulncheck-watch` workflow scans the press module and one freshly generated golden CLI with the live database. On a reachable standard-library finding it opens or updates one issue titled `Go floor: bump to <fixed version>`, labeled `bug`, `priority:P1`, and `comp:generator`.
 
 ## Supply-chain hardening
 
@@ -303,26 +327,8 @@ This copies the skills to `~/.claude/skills/`.
 When a machine change alters what an agent should do or what a command guarantees, update the relevant `SKILL.md` router and its phase files under `skills/printing-press/phases/` in the same change; do not leave the skill as a stale manual workaround for behavior the machine now owns.
 Detail in [`docs/SKILLS.md`](docs/SKILLS.md): install targets, workflow parity, the thin-spine plus `phases/` / `references/` pattern, the skill `version:` / `MinSkillVersion` bump rule, and the `context: fork` / `user-invocable` frontmatter fields.
 
-## Code & Comment Hygiene
-### Write-time defaults
-- No speculative future-proofing in comments.
-- No dates, incidents, or ticket numbers in code comments.
-- Exception for dependency-pin / floor comments: `GO-YYYY-NNNN` advisory IDs and CVE IDs are allowed so the floor stays tied to a named advisory (precedent: `internal/generator/xnet_guard.go` citing `GO-2026-5942`). Still forbidden: GitHub issue/PR numbers, incident tickets, dates.
-- Code comments must be self-contained; do not make them load-bearing on in-repo skills, plans, or reference prose.
-- Do not restate the field or function name in its comment; document why, not what.
-- Categorical strings -> typed const at introduction.
-- Single-case switch with default fallthrough -> `||`.
-- Parse command inputs once at the entry point.
-- Use UTF-8-safe string truncation.
-
-### Pre-commit: scan the diff
-- Near-identical loops or functions that should share a helper
-- A compound predicate inlined at 3+ sites that should be a named function
-- Parallel `hasX() bool` / `xCount() int` that drifted apart
-- The same string literal repeated across sites where the categorical-const rule should have applied
-
 ## Editing AGENTS.md
-The "Code & Comment Hygiene" rules apply here too. Keep inline `AGENTS.md` rules command-shaped: trigger, required action or prohibition, concrete values, then a pointer to any longer doc.
+The comment rules in [`CODING_STANDARDS.md`](CODING_STANDARDS.md) ("Comments and code shape") apply here too. Keep inline `AGENTS.md` rules command-shaped: trigger, required action or prohibition, concrete values, then a pointer to any longer doc.
 
 **Pointer-rot rule.** When editing a doc under `docs/` that `AGENTS.md` points to, update the inline trigger sentence here in the same PR if applicability changes — a new fire condition, a removed fire condition, or a changed prohibition, enum, file path, test name, or required value. The inline rule is what the agent sees on every turn; the extracted doc is only loaded if the agent follows the pointer.
 

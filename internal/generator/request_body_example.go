@@ -103,7 +103,7 @@ func requiredBodyExampleFlags(body []spec.Param, prefix string, depth int, flat 
 		if !ok {
 			continue
 		}
-		parts = appendExampleFlag(parts, joinFlag(prefix, publicFlagName(p)), text)
+		parts = appendExampleFlag(parts, joinFlag(prefix, publicFlagName(p)), text, p)
 	}
 	return parts
 }
@@ -126,7 +126,7 @@ func emitBodyExampleValue(p spec.Param, val any, prefix string, depth int, flat 
 	if !ok {
 		return nil
 	}
-	return appendExampleFlag(nil, flag, text)
+	return appendExampleFlag(nil, flag, text, p)
 }
 
 // Multipart and form bodies stay one flag per top-level field, so only
@@ -191,9 +191,15 @@ func exampleField(obj map[string]any, p spec.Param) (any, bool) {
 	return nil, false
 }
 
-func appendExampleFlag(parts []string, flag, value string) []string {
+func appendExampleFlag(parts []string, flag, value string, param spec.Param) []string {
 	if flag == "" || value == "" {
 		return parts
+	}
+	if primitiveKind(param.Type) == "bool" {
+		if value == "true" && !isStringBackedBoolParam(param) {
+			return append(parts, "--"+flag)
+		}
+		return append(parts, "--"+flag+"="+value)
 	}
 	return append(parts, "--"+flag, value)
 }
@@ -244,8 +250,14 @@ func formatExampleFloat(v float64) (string, bool) {
 	if math.IsNaN(v) || math.IsInf(v, 0) {
 		return "", false
 	}
-	if v == math.Trunc(v) && v >= math.MinInt64 && v <= math.MaxInt64 {
-		return strconv.FormatInt(int64(v), 10), true
+	if v == math.Trunc(v) {
+		// float64(math.MaxInt64) rounds up to 2^63, which int64 cannot hold, so
+		// the upper bound is strict. Larger whole numbers keep their exact
+		// digits; the shortest round-trip form would print trailing zeros.
+		if v >= math.MinInt64 && v < math.MaxInt64 {
+			return strconv.FormatInt(int64(v), 10), true
+		}
+		return strconv.FormatFloat(v, 'f', 0, 64), true
 	}
 	return strconv.FormatFloat(v, 'f', -1, 64), true
 }

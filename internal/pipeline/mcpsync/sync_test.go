@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/mvanhorn/cli-printing-press/v4/internal/generator"
+	"github.com/mvanhorn/cli-printing-press/v4/internal/openapi"
 	"github.com/mvanhorn/cli-printing-press/v4/internal/pipeline"
 	"github.com/mvanhorn/cli-printing-press/v4/internal/spec"
 	"github.com/stretchr/testify/assert"
@@ -139,6 +140,61 @@ func TestSyncPreservesGeneratedRecipeIntentRegistration(t *testing.T) {
 	cmd.Dir = cliDir
 	output, err := cmd.CombinedOutput()
 	require.NoError(t, err, "post-sync MCP package must compile and test: %s", output)
+}
+
+func TestExtractMCPRecipeIntentSourceKeepsReferencedHelpers(t *testing.T) {
+	t.Parallel()
+
+	source := `package mcp
+
+func RegisterIntents(s *server.MCPServer) {
+	s.AddTool(mcplib.NewTool("list_things"), handleListThings)
+	s.AddTool(mcplib.NewTool("explicit"), handleExplicit)
+}
+
+func handleListThings(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
+	if recipeCLIPathErr != nil {
+		return nil, recipeCLIPathErr
+	}
+	args := []string{}
+	args, _ = appendRecipePositional(args, "x", true)
+	return nil, nil
+}
+
+func handleExplicit(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
+	return nil, nil
+}
+
+var recipeCLIPathErr error
+
+func appendRecipePositional(args []string, value any, required bool) ([]string, bool) {
+	if recipePositionalNeedsSeparator("x") && recipeEndOfFlagsIndex(args) < 0 {
+		return insertRecipeBeforeEndOfFlags(args, "--"), false
+	}
+	return positionalGuard(args), false
+}
+
+func recipePositionalNeedsSeparator(value string) bool { return false }
+
+func recipeEndOfFlagsIndex(args []string) int { return -1 }
+
+func insertRecipeBeforeEndOfFlags(args []string, tokens ...string) []string { return args }
+
+func positionalGuard(args []string) []string { return args }
+
+func explicitOnlyHelper() {}
+`
+	got, err := extractMCPRecipeIntentSource(source, "example.com/cli")
+	require.NoError(t, err)
+	text := string(got)
+	assert.Contains(t, text, "func handleListThings(")
+	assert.Contains(t, text, "func appendRecipePositional(")
+	assert.Contains(t, text, "func recipePositionalNeedsSeparator(")
+	assert.Contains(t, text, "func recipeEndOfFlagsIndex(")
+	assert.Contains(t, text, "func insertRecipeBeforeEndOfFlags(")
+	assert.Contains(t, text, "func positionalGuard(")
+	assert.NotContains(t, text, "func handleExplicit(")
+	assert.NotContains(t, text, "func explicitOnlyHelper(")
 }
 
 func TestSyncLeavesRecipeOnlyIntentFileUnchanged(t *testing.T) {
@@ -552,6 +608,59 @@ func TestSyncRefreshesProvenanceFromSpec(t *testing.T) {
 	assert.NotContains(t, manifestStr, `"PRINTING_PRESS_CLIENT_PROFILE"`)
 	assert.NotContains(t, manifestStr, `"PROVREFRESH_BASE_URL"`,
 		"spec-defaulted BASE_URL must not be wired as ${user_config.*}")
+}
+
+func TestSyncPreservesManifestAuthPreference(t *testing.T) {
+	const openAPISpec = `openapi: 3.0.3
+info:
+  title: Dual Auth
+  version: 1.0.0
+servers:
+  - url: https://api.example.com
+security:
+  - accountToken: []
+  - serverToken: []
+components:
+  securitySchemes:
+    accountToken:
+      type: apiKey
+      in: header
+      name: X-Account-Token
+    serverToken:
+      type: apiKey
+      in: header
+      name: X-Server-Token
+paths:
+  /items:
+    get:
+      operationId: listItems
+      responses:
+        "200":
+          description: ok
+`
+
+	parsed, err := openapi.ParseWithOptions([]byte(openAPISpec), openapi.ParseOptions{AuthPreference: "serverToken"})
+	require.NoError(t, err)
+	require.Equal(t, "serverToken", parsed.Auth.Scheme)
+
+	cliDir := filepath.Join(t.TempDir(), "dual-auth-pp-cli")
+	require.NoError(t, generator.New(parsed, cliDir).Generate())
+	require.NoError(t, os.WriteFile(filepath.Join(cliDir, "spec.yaml"), []byte(openAPISpec), 0o644))
+	require.NoError(t, pipeline.WriteManifestForGenerate(pipeline.GenerateManifestParams{
+		APIName:         parsed.Name,
+		SpecArchiveName: "spec.yaml",
+		OutputDir:       cliDir,
+		Spec:            parsed,
+		AuthPreference:  "serverToken",
+	}))
+
+	_, err = Sync(cliDir, Options{})
+	require.NoError(t, err)
+
+	manifest, err := pipeline.ReadCLIManifest(cliDir)
+	require.NoError(t, err)
+	assert.Equal(t, "serverToken", manifest.AuthPreference)
+	assert.Equal(t, parsed.Auth.EnvVars, manifest.AuthEnvVars)
 }
 
 // TestValidateSpecNameMatchesDirAccepts ensures matching name and dir

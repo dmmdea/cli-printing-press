@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -32,6 +33,17 @@ const (
 	StatusFail                 LiveStatus = "fail"
 	StatusSkip                 LiveStatus = "skip"
 	StatusPrerequisiteUnsynced LiveStatus = "prerequisite_unsynced"
+)
+
+// SampleReviewStatus is the plausibility-review outcome. Skipped means the
+// review had no passing sample to assess; that is a distinct result from a
+// review that ran and passed.
+type SampleReviewStatus string
+
+const (
+	SampleReviewPass    SampleReviewStatus = "pass"
+	SampleReviewFail    SampleReviewStatus = "fail"
+	SampleReviewSkipped SampleReviewStatus = "skipped"
 )
 
 // Default bounds for RunLiveCheck. Exported so callers can override via
@@ -87,6 +99,19 @@ func (r *LiveCheckResult) Evaluated() int {
 		return 0
 	}
 	return r.Passed + r.Failed
+}
+
+// SampleReviewStatus reports the sample-output review, not the mechanical
+// pass rate. With no passing sample the review did not run, so the result
+// is skipped rather than a pass.
+func (r *LiveCheckResult) SampleReviewStatus() SampleReviewStatus {
+	if r == nil || r.Unable || r.Passed == 0 {
+		return SampleReviewSkipped
+	}
+	if r.Failed > 0 {
+		return SampleReviewFail
+	}
+	return SampleReviewPass
 }
 
 // LiveFeatureResult is one feature's outcome.
@@ -179,6 +204,9 @@ func RunLiveCheck(opts LiveCheckOptions) *LiveCheckResult {
 		return out
 	}
 	opts.CLIDir = cliDir
+	// Historical runs left probe directories inside this tree. Drop them on
+	// every return, including the unable paths below.
+	defer removeLiveCheckStagingDirs(cliDir)
 	if opts.ResearchDir != "" {
 		researchDir, err := ResolveTargetDir(opts.ResearchDir)
 		if err != nil {
@@ -244,7 +272,7 @@ func RunLiveCheck(opts LiveCheckOptions) *LiveCheckResult {
 	} else {
 		checkFeatures = enrichLiveCheckFeaturesFromAgentContext(binaryPath, checkFeatures)
 	}
-	probeBinaryPath, cleanupProbeBinary, snapshotErr := snapshotLiveCheckBinary(binaryPath)
+	probeBinaryPath, cleanupProbeBinary, snapshotErr := snapshotLiveCheckBinary(opts.CLIDir, binaryPath)
 	if snapshotErr != nil {
 		out.Unable = true
 		out.Reason = "snapshotting live-check binary: " + snapshotErr.Error()
@@ -352,9 +380,22 @@ func rebuildLiveCheckBinary(cliDir, binaryPath string) error {
 	return nil
 }
 
-func snapshotLiveCheckBinary(binaryPath string) (string, func(), error) {
+// liveCheckStagingDirPrefix is the MkdirTemp pattern for a probe copy.
+const liveCheckStagingDirPrefix = ".printing-press-live-check-"
+
+func isLiveCheckStagingDirName(name string) bool {
+	// The undotted prefix is the historical os.TempDir fallback.
+	return strings.HasPrefix(name, liveCheckStagingDirPrefix) ||
+		strings.HasPrefix(name, "printing-press-live-check-")
+}
+
+func snapshotLiveCheckBinary(cliDir, binaryPath string) (string, func(), error) {
 	// Keep probes on an immutable copy so a later staged refresh cannot replace
 	// the executable backing an in-flight probe.
+	absCLI, err := resolveLiveCheckDir(cliDir)
+	if err != nil {
+		return "", func() {}, fmt.Errorf("resolving CLI directory: %w", err)
+	}
 	info, err := os.Stat(binaryPath)
 	if err != nil {
 		return "", func() {}, fmt.Errorf("statting resolved binary: %w", err)
@@ -364,14 +405,14 @@ func snapshotLiveCheckBinary(binaryPath string) (string, func(), error) {
 		return "", func() {}, fmt.Errorf("reading resolved binary: %w", err)
 	}
 
-	tempDir, err := os.MkdirTemp(filepath.Dir(binaryPath), ".printing-press-live-check-")
+	// Stage outside the CLI tree. RemoveAll of a just-run Windows image can
+	// fail, and a killed scorecard never runs cleanup. In-tree leftovers are
+	// force-added into the public library.
+	tempDir, err := mkdirLiveCheckProbeDir(absCLI)
 	if err != nil {
-		tempDir, err = os.MkdirTemp("", "printing-press-live-check-")
+		return "", func() {}, err
 	}
-	if err != nil {
-		return "", func() {}, fmt.Errorf("creating probe directory: %w", err)
-	}
-	cleanup := func() { _ = os.RemoveAll(tempDir) }
+	cleanup := func() { _ = removeAllRetry(tempDir) }
 
 	dstPath := filepath.Join(tempDir, filepath.Base(binaryPath))
 	if err := os.WriteFile(dstPath, data, info.Mode().Perm()); err != nil {
@@ -379,6 +420,122 @@ func snapshotLiveCheckBinary(binaryPath string) (string, func(), error) {
 		return "", func() {}, fmt.Errorf("writing probe binary: %w", err)
 	}
 	return dstPath, cleanup, nil
+}
+
+func mkdirLiveCheckProbeDir(cliDir string) (string, error) {
+	var attemptErrs []error
+	try := func(parent string) (string, error) {
+		dir, err := os.MkdirTemp(parent, liveCheckStagingDirPrefix)
+		if err != nil {
+			return "", err
+		}
+		inside, err := pathIsInside(cliDir, dir)
+		if err != nil || inside {
+			_ = os.RemoveAll(dir)
+			if err != nil {
+				return "", err
+			}
+			return "", fmt.Errorf("probe directory %s is inside %s", dir, cliDir)
+		}
+		return dir, nil
+	}
+
+	// Parent of the CLI directory stays on the same volume, so the probe is
+	// executable where the temp dir is mounted noexec. Temp is the fallback.
+	parent := filepath.Dir(cliDir)
+	if parent != cliDir {
+		dir, err := try(parent)
+		if err == nil {
+			return dir, nil
+		}
+		attemptErrs = append(attemptErrs, err)
+	}
+	dir, err := try("")
+	if err == nil {
+		return dir, nil
+	}
+	attemptErrs = append(attemptErrs, err)
+	return "", fmt.Errorf("creating probe directory: %w", errors.Join(attemptErrs...))
+}
+
+func resolveLiveCheckDir(dir string) (string, error) {
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return "", err
+	}
+	// A symlinked CLI path is not the tree publish copies. Containment and
+	// the leftover sweep have to use the resolved path.
+	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+		return resolved, nil
+	}
+	return abs, nil
+}
+
+func pathIsInside(root, path string) (bool, error) {
+	root, err := resolveLiveCheckDir(root)
+	if err != nil {
+		return false, err
+	}
+	path, err = resolveLiveCheckDir(path)
+	if err != nil {
+		return false, err
+	}
+	root = filepath.Clean(root)
+	path = filepath.Clean(path)
+	if path == root {
+		return true, nil
+	}
+	// filepath.Rel fails across Windows volumes. A temp dir on another drive
+	// is outside the CLI tree, not a containment error.
+	if !strings.EqualFold(filepath.VolumeName(root), filepath.VolumeName(path)) {
+		return false, nil
+	}
+	rel, err := filepath.Rel(root, path)
+	if err != nil {
+		return false, err
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return false, nil
+	}
+	return true, nil
+}
+
+func removeAllRetry(path string) error {
+	var err error
+	for attempt := range 8 {
+		err = os.RemoveAll(path)
+		if err == nil || os.IsNotExist(err) {
+			return nil
+		}
+		if attempt == 7 {
+			break
+		}
+		// Windows can refuse to delete an executable image briefly after the
+		// process exits. One RemoveAll then leaves the directory behind.
+		time.Sleep(time.Duration(attempt+1) * 25 * time.Millisecond)
+	}
+	return err
+}
+
+func removeLiveCheckStagingDirs(root string) {
+	// WalkDir does not follow a symlink root, so a symlinked CLI directory
+	// would otherwise keep every historical probe directory.
+	if resolved, err := resolveLiveCheckDir(root); err == nil {
+		root = resolved
+	}
+	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d == nil || path == root {
+			return nil
+		}
+		if !isLiveCheckStagingDirName(d.Name()) {
+			return nil
+		}
+		_ = removeAllRetry(path)
+		if d.IsDir() {
+			return fs.SkipDir
+		}
+		return nil
+	})
 }
 
 func replaceLiveCheckBinary(src, dst string) error {
@@ -970,12 +1127,18 @@ func runOneFeatureCheckWithDataSource(cliDir, binaryPath string, f liveCheckFeat
 		return result
 	}
 
+	sample, err := prepareLiveCheckSample(cliDir, args)
+	if err != nil {
+		return fail(err.Error())
+	}
+	defer sample.cleanup()
+
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, binaryPath, args...)
-	cmd.Dir = cliDir
-	applyDefaultSubprocessEnv(cmd)
+	cmd := exec.CommandContext(ctx, binaryPath, sample.args...)
+	cmd.Dir = sample.dir
+	cmd.Env = sample.env
 	// Capture stdout into a bounded buffer. An unbounded `cmd.Output()` call
 	// would let a misbehaving feature exhaust the scorecard's memory.
 	stdoutCap := &bytes.Buffer{}
@@ -1488,15 +1651,17 @@ func (r *LiveCheckResult) MarshalJSON() ([]byte, error) {
 	}
 	return json.Marshal(&struct {
 		*alias
-		Status      string `json:"status"`
-		Checked     int    `json:"checked"`
-		Evaluated   int    `json:"evaluated"`
-		PassRatePct int    `json:"pass_rate_pct"`
+		Status       string             `json:"status"`
+		ReviewStatus SampleReviewStatus `json:"review_status"`
+		Checked      int                `json:"checked"`
+		Evaluated    int                `json:"evaluated"`
+		PassRatePct  int                `json:"pass_rate_pct"`
 	}{
-		alias:       (*alias)(r),
-		Status:      status,
-		Checked:     r.Checked(),
-		Evaluated:   r.Evaluated(),
-		PassRatePct: int(r.PassRate*100 + 0.5),
+		alias:        (*alias)(r),
+		Status:       status,
+		ReviewStatus: r.SampleReviewStatus(),
+		Checked:      r.Checked(),
+		Evaluated:    r.Evaluated(),
+		PassRatePct:  int(r.PassRate*100 + 0.5),
 	})
 }

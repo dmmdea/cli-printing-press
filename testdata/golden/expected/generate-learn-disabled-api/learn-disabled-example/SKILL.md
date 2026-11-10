@@ -43,6 +43,8 @@ the default leaked into an opted-out spec.
 
 Do not activate this CLI for requests that require creating, updating, deleting, publishing, commenting, upvoting, inviting, ordering, sending messages, booking, purchasing, or changing remote state. This printed CLI exposes read-only commands for inspection, export, sync, and analysis.
 
+`--ca-cert`, `LEARN_DISABLED_EXAMPLE_CA_CERT`, or `ca_cert` adds a PEM CA bundle to the system trust roots. `--tls-server-name`, `LEARN_DISABLED_EXAMPLE_TLS_SERVER_NAME`, or `tls_server_name` is the name checked against the certificate. Precedence is flag, then environment, then the config file. A config file other users can change does not supply these settings. `doctor` reports the trust in use and names the setting that fixes a chain or hostname failure.
+
 ## Command Reference
 
 **games** — Minimal syncable resource so the disabled shape still keeps its profile-derived store; the opt-out must remove the learn surface, not the ordinary data layer.
@@ -80,7 +82,7 @@ Global format flags share one contract on promoted, novel, sync, and `--deliver`
 
 - `--json` — one JSON document on stdout (sync progress events go to stderr)
 - `--compact` — keep identity/status/timestamp fields; does not change the document vs stream shape
-- `--csv` / `--plain` — tabular rows (collection envelopes unwrap to the row array)
+- `--csv` / `--plain` — tabular rows (collection envelopes unwrap to the row array). `--csv` prefixes `'` on a cell or header key that starts with `=`, `+`, `-`, `@`, tab, CR, or LF (fullwidth `＝＋－＠` too) so a spreadsheet does not run it as a formula; a plain signed number such as `-5` or `+2.5e3` is unchanged.
 - `--quiet` — one identity value per row, no envelope
 
 - **Pipeable** — JSON on stdout, errors on stderr
@@ -89,7 +91,7 @@ Global format flags share one contract on promoted, novel, sync, and `--deliver`
   ```bash
   learn-disabled-example-pp-cli games --agent
   ```
-- **Previewable** — `--dry-run` shows the request without sending
+- **Previewable** — `--dry-run` shows the request without sending. A completed dry run exits 0 with `"success": true` and `"dry_run": true` and no HTTP `status`; validation failures still exit non-zero with `"success": false`.
 - **Offline-friendly** — sync/search commands can use the local SQLite store when available
 - **Non-interactive** — never prompts, every input is a flag
 - **Read-only** — do not use this CLI for create, update, delete, publish, comment, upvote, invite, order, send, or other mutating requests
@@ -134,6 +136,8 @@ Agents should treat the CLI's path resolver as part of the runtime contract:
 
 Fleet precedence: an inherited per-kind env var overrides an explicit `--home` for that kind. Use `LEARN_DISABLED_EXAMPLE_HOME` or per-kind vars as durable fleet levers, and use `--home` only for a single invocation. Relocation is not reversible by unsetting env vars; move files manually before clearing `LEARN_DISABLED_EXAMPLE_HOME`, or `doctor` will not find credentials left under the former root.
 
+Local data is unencrypted and relies on OS account permissions plus disk encryption. Reads in the default `--data-source auto` mode are written to the SQLite store; GET responses are cached for five minutes under the cache dir. `local-data purge` previews what it would erase (store files, response cache, learn journal) and deletes only with `--yes`; it is not exposed over MCP. `LEARN_DISABLED_EXAMPLE_NO_LOCAL_DATA=1` disables the response cache and store writes, turns `auto` reads into live reads, and blocks `sync` and `workflow archive`; `--data-source local` still reads an existing store, and `LEARN_DISABLED_EXAMPLE_DATA_SOURCE` sets the `--data-source` default.
+
 ## Agent Feedback
 
 When you (or the agent) notice something off about this CLI, record it:
@@ -155,10 +159,10 @@ Every command accepts `--deliver <sink>`. The output goes to the named sink in a
 | Sink | Effect |
 |------|--------|
 | `stdout` | Default; write to stdout only |
-| `file:<path>` | Atomically write output to `<path>` (tmp + rename). Binary-response commands write decoded payload bytes (not the base64 JSON envelope) and print a small JSON receipt on stdout; `--json`/`--csv` do not refuse when this sink is set. |
-| `webhook:<url>` | POST the output body to the URL (`application/json`) |
+| `file:<path>` | Atomically write output to `<path>` as a private 0600 file (exclusive randomly named temp in the destination directory, then rename; a planted symlink is not followed). Binary-response commands write decoded payload bytes (not the base64 JSON envelope) and print a small JSON receipt on stdout; `--json`/`--csv` do not refuse when this sink is set. |
+| `webhook:<url>` | POST the output body to the URL (`application/json`). Redirects are not followed; a 3xx response fails the delivery and the body is not sent to the `Location`. |
 
-Unknown schemes are refused with a structured error naming the supported set. Webhook failures return non-zero and log the URL + HTTP status on stderr.
+Unknown schemes are refused with a structured error naming the supported set. Webhook failures, including redirects, return non-zero and log the URL and HTTP status on stderr.
 
 ## Named Profiles
 
@@ -203,6 +207,8 @@ claude mcp add learn-disabled-example-pp-mcp -- learn-disabled-example-pp-mcp
 ```
 
 Verify: `claude mcp list`
+
+For a remote host, `learn-disabled-example-pp-mcp --transport http` requires `LEARN_DISABLED_EXAMPLE_MCP_HTTP_TOKEN` set to at least 32 characters (callers send `Authorization: Bearer <token>`; `openssl rand -hex 32` prints 64 hex characters and meets that minimum), binds `127.0.0.1:7777` by default, and needs `--tls-cert`/`--tls-key` for any non-loopback `--addr`. Requests with no `Origin` header are accepted. Loopback origins are accepted; any other `Origin` is refused unless listed in `LEARN_DISABLED_EXAMPLE_MCP_HTTP_ALLOWED_ORIGINS` (comma-separated `scheme://host[:port]` values). `LEARN_DISABLED_EXAMPLE_MCP_READ_ONLY=1` drops mirrored write commands (local-write commands that only touch the CLI's own learn store stay) and makes the raw execute tool refuse state-changing calls.
 
 ## Direct Use
 

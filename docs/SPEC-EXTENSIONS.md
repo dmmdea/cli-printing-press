@@ -29,6 +29,7 @@ in the same change as any new `Extensions["x-*"]` lookup in that file.
 | `x-auth-type` | `components.securitySchemes.<name>` | `APISpec.Auth.Type` | No |
 | `x-auth-format` | `components.securitySchemes.<name>` | `APISpec.Auth.Format` | No |
 | `x-prefix` | `components.securitySchemes.<name>` | `APISpec.Auth.Format` | No |
+| `x-auth-value-prefix` | `components.securitySchemes.<name>` | `APISpec.Auth.Prefix` | No |
 | `x-auth-env-vars` | `components.securitySchemes.<name>` | `APISpec.Auth.EnvVars` | No |
 | `x-auth-vars` | `components.securitySchemes.<name>` | `APISpec.Auth.EnvVarSpecs` | No |
 | `x-speakeasy-example` | `components.securitySchemes.<name>` | `APISpec.Auth.EnvVars` | No |
@@ -54,6 +55,8 @@ in the same change as any new `Extensions["x-*"]` lookup in that file.
 | `x-pp-resource` | operation | resource name override | No |
 | `x-pp-pagination` | operation | `Endpoint.Pagination` | No |
 | `x-pp-mutation` | operation | `Endpoint.Mutation` | No |
+| `x-pp-destructive` | operation | `Endpoint.Destructive` | No |
+| `x-pp-replay-safe` | operation | `Endpoint.ReplaySafe` | No |
 | `x-pp-safe-probe` | operation | *skill guidance only; not parsed in parser.go* | No |
 | `x-pp-sync-walker` | operation | `Endpoint.Walker` | No |
 | `x-sync-params` | operation | `Endpoint.SyncParams` | No |
@@ -322,6 +325,11 @@ Rules:
 - Shape mirrors the internal YAML `mcp:` block field-for-field: `transport`,
   `addr`, `intents`, `endpoint_tools`, `orchestration`,
   `orchestration_threshold`.
+- `orchestration: code` emits `<api>_search`, `<api>_get`, `<api>_read`, and
+  `<api>_execute`. `<api>_read` calls GET reads and codegen-marked read-only
+  POSTs. `<api>_execute` returns a preview for DELETE and other state-changing
+  calls, including mutating GETs, and performs no HTTP until `confirm` is
+  boolean `true`. Specs with no state-changing endpoints omit `<api>_execute`.
 - Validated by `validateMCP` at spec load (same allowlist as internal YAML):
   unknown transports and malformed addresses are rejected.
 
@@ -811,6 +819,32 @@ components:
       in: header
       name: Authorization
       x-prefix: Klaviyo-API-Key
+```
+
+### `x-auth-value-prefix`
+
+Declares the Authorization scheme word for a header API key, such as `ApiToken`.
+
+Parsed field: `APISpec.Auth.Prefix`
+
+Rules:
+- Optional.
+- Only read for OpenAPI `apiKey` security schemes with `in: header`.
+- Must be a string.
+- Leading and trailing whitespace is trimmed, so a value of `ApiToken ` is stored as `ApiToken`.
+- Ignored when `Auth.Format` is already set (`x-prefix` and `x-auth-format` win).
+- The generated client emits `<prefix> <token>` and does not add the prefix again when the token already starts with it.
+
+Example:
+
+```yaml
+components:
+  securitySchemes:
+    ApiTokenAuth:
+      type: apiKey
+      in: header
+      name: Authorization
+      x-auth-value-prefix: "ApiToken "
 ```
 
 ### `x-auth-basic-username` / `x-auth-basic-password`
@@ -1587,6 +1621,87 @@ paths:
           description: Matched rows
 ```
 
+### `x-pp-destructive`
+
+Sets the MCP `destructiveHint` for a write that stays a write. Unset DELETE
+operations advertise `destructiveHint: true`. Unset POST, PUT, and PATCH
+operations leave the hint unset, so hosts treat them as possibly destructive.
+`false` marks an additive write (`destructiveHint: false`) without making the
+command read-only. `true` forces `destructiveHint: true`.
+
+A read (GET, `x-pp-mutation: false`, or `mcp:read-only`) keeps
+`readOnlyHint: true` and `destructiveHint: false`. This extension does not
+override that.
+
+Parsed field: `Endpoint.Destructive`
+
+Rules:
+- Optional.
+- Must be a native boolean. A string such as `"false"` is ignored.
+- Applies only at the operation level.
+- Internal YAML uses the same boolean as `destructive:`.
+
+Example:
+
+```yaml
+paths:
+  /devices/{id}/retire:
+    post:
+      operationId: retireDevice
+      responses:
+        "204":
+          description: Retired
+  /devices/{id}/tag:
+    post:
+      operationId: tagDevice
+      x-pp-destructive: false
+      responses:
+        "204":
+          description: Tagged
+```
+
+### `x-pp-replay-safe`
+
+Declares whether the generated client may replay a mutating request after an
+ambiguous failure (a transport error or a 5xx, where the server may already
+have accepted the request). `true` lets the client retry it with backoff.
+`false` forbids replay, even for verbs that are normally retried.
+
+Without this extension, POST and PATCH never replay unless the request
+carries an `Idempotency-Key`. One default is inferred: an endpoint whose body
+is a file (a multipart binary part or an opaque raw body) and whose path has
+an `upload`/`uploads` segment is treated as replay-safe, because a free
+upload can be repeated and each attempt yields an independent object. File
+uploads also get a per-attempt deadline of `--timeout` plus
+size / 128 KiB/s.
+
+Parsed field: `Endpoint.ReplaySafe`
+
+Rules:
+- Optional.
+- Must be a native boolean.
+- Applies only at the operation level.
+- Set `false` on any endpoint that starts billable work (a generation or
+  transcription submit), even when it is upload-shaped. A replayed paid
+  submit can start and bill the same job more than once.
+- Set `true` only when the API is idempotent for the request or the
+  request is free to repeat.
+- Internal YAML uses the same boolean as `replay_safe:`.
+
+Example:
+
+```yaml
+paths:
+  /media/upload:
+    post:
+      operationId: uploadMedia
+      x-pp-replay-safe: true
+  /media/transcode:
+    post:
+      operationId: transcodeUpload
+      x-pp-replay-safe: false
+```
+
 ### `x-tier`
 
 Selects a tier declared by `x-tier-routing` for a path item or one operation.
@@ -1630,11 +1745,24 @@ Rules:
 - Operation-level values override path-item-level values.
 - Must be one of `auto`, `local`, or `live`.
 - `auto` keeps the normal live-with-local-fallback behavior for store-backed
-  reads.
+  reads. Local fallback and `--data-source local` apply equality, parent
+  scope, and limit. A row-selecting parameter that cannot be applied locally
+  (`filter`, `orderBy` / `sort` / `order`, search, cursor, a page without a
+  usable limit, or an equality key that is not a stored field) fails with a
+  clear error naming those parameters
+  and suggesting `--data-source live`, instead of returning a different row
+  set. `auto` still prefers live, and surfaces that same failure when live is
+  unreachable. Projection parameters such as `fields` stay warnings.
 - `local` makes the command use local synced data for `auto` and `local`, and
   reject `--data-source live` with a clear no-live-equivalent error.
 - `live` makes the command use the remote API for `auto` and `live`, and reject
   `--data-source local` with a clear no-local-data-source error.
+- A `pp:data-source` annotation of `live` or `local` on the running command
+  rejects the opposite `--data-source` value before any network or store
+  access, including a value applied from a saved run profile. `auto`,
+  `computed`, and commands with no annotation are unchanged. A command that
+  is live or local only in some modes stays unannotated and validates in its
+  own RunE.
 
 Example:
 
@@ -1828,6 +1956,16 @@ Rules:
 - Negative numeric flag values are emitted in `--flag=-12.3` form so Cobra
   does not parse the value as a shorthand flag cluster.
 - Empty or whitespace-only values behave the same as absence.
+- A declared flag whose value is a placeholder literal (`example-value`,
+  `your-token-here`, or the synthetic placeholder UUID) marks the operation
+  fixture-blocked on any flag name. Use `--flag=example-value` for
+  continuation cursors, account-specific paths, and resource URLs that no
+  portable fixture can satisfy. Live dogfood then records `happy_path` and
+  `json_fidelity` as skipped with `blocked-fixture: required API parameter`
+  instead of running a value the API must reject. Placeholders that come only
+  from the Cobra `Example:` stay name-gated (id, ids, `*-id`, token, key), so
+  ordinary examples still run. A real declared value that fails still counts
+  as a failure.
 
 Example:
 
@@ -1837,6 +1975,13 @@ paths:
     get:
       operationId: listReferents
       x-happy-args: "--song-id=378195"
+      responses:
+        "200": {description: ok}
+  /items/list/continue:
+    post:
+      operationId: listItemsContinue
+      # No portable cursor exists outside the operator's account.
+      x-happy-args: "--cursor=example-value"
       responses:
         "200": {description: ok}
 ```
@@ -1909,6 +2054,12 @@ Rules:
   the single-placeholder default would otherwise pick the wrong slot (or no
   slot at all). The generator warns and drops the walker when it's ambiguous
   and `key_param` is missing.
+- Auto-detected dependents (no walker) are dropped when two or more path
+  placeholders would be filled from the same parent field, because generated
+  sync cannot tell those values apart. Generate warns with the path. Distinct
+  fields stay, even when the parent response does not declare them. Declare
+  `x-pp-sync-walker` with `key_param` to sync a dropped child. Endpoint
+  template variables are not placeholders for this check.
 - Walker-emitted dependents flow through the same `syncDependentResource`
   machinery as auto-detected ones, so concurrency/retry/cursor/Upsert
   behavior is identical.

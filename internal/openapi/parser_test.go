@@ -2,8 +2,10 @@ package openapi
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -122,6 +124,194 @@ paths:
 	}
 	assert.True(t, bodyNames["currentPassword"])
 	assert.True(t, bodyNames["password"])
+}
+
+func TestParseRequestBodyOmitsReadOnlyFields(t *testing.T) {
+	t.Parallel()
+
+	parsed, err := Parse([]byte(`
+openapi: 3.0.3
+info:
+  title: Jobs API
+  version: 1.0.0
+paths:
+  /jobs:
+    post:
+      operationId: createJob
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/JobPostRequestBody'
+      responses:
+        '200':
+          description: Created job
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+components:
+  schemas:
+    Job:
+      type: object
+      required: [kind, targetId, comment, parentJob, serverId]
+      properties:
+        id:
+          type: integer
+        kind:
+          type: string
+          enum: [UNDO]
+        targetId:
+          type: integer
+        comment:
+          type: string
+          readOnly: true
+        parentJob:
+          readOnly: true
+          allOf:
+            - $ref: '#/components/schemas/Job'
+        serverId:
+          allOf:
+            - type: integer
+              readOnly: true
+        serverNote:
+          allOf:
+            - type: string
+              readOnly: true
+        password:
+          type: string
+          writeOnly: true
+        visible:
+          readOnly: false
+          allOf:
+            - type: string
+        server-name:
+          allOf:
+            - type: string
+            - readOnly: true
+        server_name:
+          type: string
+    JobPostRequestBody:
+      type: object
+      required: [kind, targetId]
+      allOf:
+        - $ref: '#/components/schemas/Job'
+      properties:
+        job:
+          $ref: '#/components/schemas/Job'
+`))
+	require.NoError(t, err)
+
+	endpoint := findParsedEndpointByPath(t, parsed, "POST", "/jobs")
+	assert.True(t, endpoint.BodyRequired)
+	byName := map[string]spec.Param{}
+	var bodyNames []string
+	for _, param := range endpoint.Body {
+		byName[param.Name] = param
+		bodyNames = append(bodyNames, param.Name)
+	}
+	assert.Equal(t, []string{"id", "job", "kind", "password", "server_name", "targetId", "visible"}, bodyNames)
+	assert.True(t, byName["kind"].Required)
+	assert.True(t, byName["targetId"].Required)
+	assert.Equal(t, []string{"UNDO"}, byName["kind"].Enum)
+
+	fields := map[string]spec.Param{}
+	var fieldNames []string
+	for _, field := range byName["job"].Fields {
+		fields[field.Name] = field
+		fieldNames = append(fieldNames, field.Name)
+	}
+	assert.Equal(t, []string{"id", "kind", "password", "server_name", "targetId", "visible"}, fieldNames)
+	assert.True(t, fields["kind"].Required)
+	assert.True(t, fields["targetId"].Required)
+
+	responseFields := map[string]spec.TypeField{}
+	for _, field := range parsed.Types["Job"].Fields {
+		responseFields[field.Name] = field
+	}
+	assert.Contains(t, responseFields, "comment")
+	assert.Contains(t, responseFields, "parentJob")
+	assert.Contains(t, responseFields, "serverId")
+	assert.Contains(t, responseFields, "serverNote")
+}
+
+func TestRequestBodyReadOnlyAllOfBoundaries(t *testing.T) {
+	readOnly := &openapi3.Schema{Type: &openapi3.Types{openapi3.TypeInteger}, ReadOnly: true}
+	annotation := &openapi3.Schema{ReadOnly: true}
+	scalar := &openapi3.Schema{Type: &openapi3.Types{openapi3.TypeInteger}}
+	ref := func(schema *openapi3.Schema) *openapi3.SchemaRef {
+		return &openapi3.SchemaRef{Value: schema}
+	}
+	cycle := &openapi3.Schema{}
+	cycle.AllOf = openapi3.SchemaRefs{ref(cycle)}
+	cycleWithReadOnly := &openapi3.Schema{}
+	cycleWithReadOnly.AllOf = openapi3.SchemaRefs{ref(cycleWithReadOnly), ref(readOnly)}
+	readOnlyBeforeCycle := &openapi3.Schema{}
+	readOnlyBeforeCycle.AllOf = openapi3.SchemaRefs{ref(readOnly), ref(readOnlyBeforeCycle)}
+	readOnlyObject := &openapi3.Schema{Type: &openapi3.Types{openapi3.TypeObject}, ReadOnly: true, Properties: openapi3.Schemas{"name": ref(scalar)}}
+
+	for _, tc := range []struct {
+		name   string
+		schema *openapi3.Schema
+		want   bool
+	}{
+		{name: "nil", want: true},
+		{name: "direct", schema: readOnly},
+		{name: "inline allOf", schema: &openapi3.Schema{AllOf: openapi3.SchemaRefs{ref(readOnly)}}},
+		{name: "later annotation-only allOf", schema: &openapi3.Schema{AllOf: openapi3.SchemaRefs{ref(scalar), ref(annotation)}}},
+		{name: "object allOf annotation", schema: &openapi3.Schema{AllOf: openapi3.SchemaRefs{ref(readOnlyObject)}}},
+		{name: "resolved allOf reference", schema: &openapi3.Schema{AllOf: openapi3.SchemaRefs{{Ref: "#/components/schemas/ServerID", Value: readOnly}}}},
+		{name: "allOf chain", schema: &openapi3.Schema{AllOf: openapi3.SchemaRefs{ref(&openapi3.Schema{AllOf: openapi3.SchemaRefs{nil, ref(annotation)}})}}},
+		{name: "unannotated cycle", schema: cycle, want: true},
+		{name: "cycle with read-only sibling", schema: cycleWithReadOnly},
+		{name: "read-only before cycle", schema: readOnlyBeforeCycle},
+		{name: "repeated allOf nodes", schema: &openapi3.Schema{AllOf: openapi3.SchemaRefs{ref(scalar), ref(scalar), ref(annotation), ref(scalar), ref(scalar)}}},
+		{name: "false allOf", schema: &openapi3.Schema{AllOf: openapi3.SchemaRefs{ref(scalar)}}, want: true},
+		{name: "write-only allOf", schema: &openapi3.Schema{AllOf: openapi3.SchemaRefs{ref(&openapi3.Schema{Type: &openapi3.Types{openapi3.TypeString}, WriteOnly: true})}}, want: true},
+		{name: "oneOf annotation", schema: &openapi3.Schema{OneOf: openapi3.SchemaRefs{ref(readOnly), ref(&openapi3.Schema{Type: &openapi3.Types{openapi3.TypeNull}})}}, want: true},
+		{name: "anyOf annotation", schema: &openapi3.Schema{AnyOf: openapi3.SchemaRefs{ref(readOnly), ref(&openapi3.Schema{Type: &openapi3.Types{openapi3.TypeNull}})}}, want: true},
+		{name: "read-only child", schema: &openapi3.Schema{Type: &openapi3.Types{openapi3.TypeObject}, Properties: openapi3.Schemas{"id": ref(readOnly)}}, want: true},
+		{name: "read-only item", schema: &openapi3.Schema{Type: &openapi3.Types{openapi3.TypeArray}, Items: ref(readOnly)}, want: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			property := ref(tc.schema)
+			nested := &openapi3.Schema{
+				Type:       &openapi3.Types{openapi3.TypeObject},
+				Properties: openapi3.Schemas{"value": property},
+				Required:   []string{"value"},
+			}
+			root := &openapi3.Schema{
+				Type:       &openapi3.Types{openapi3.TypeObject},
+				Properties: openapi3.Schemas{"value": property, "nested": ref(nested)},
+				Required:   []string{"value", "nested"},
+			}
+			body, _, _, required, _ := mapRequestBody(&openapi3.RequestBodyRef{Value: &openapi3.RequestBody{
+				Required: true,
+				Content:  openapi3.Content{"application/json": &openapi3.MediaType{Schema: ref(root)}},
+			}}, "POST", "/records")
+			require.True(t, required)
+			byName := map[string]spec.Param{}
+			for _, param := range body {
+				byName[param.Name] = param
+			}
+			_, rootPresent := byName["value"]
+			assert.Equal(t, tc.want, rootPresent, "root input")
+			require.Contains(t, byName, "nested")
+			assert.True(t, byName["nested"].Required, "writable parent requirement")
+			nestedPresent := false
+			for _, field := range byName["nested"].Fields {
+				if field.Name == "value" {
+					nestedPresent = true
+				}
+			}
+			assert.Equal(t, tc.want, nestedPresent, "nested input")
+			assert.True(t, readOnly.ReadOnly)
+			assert.True(t, annotation.ReadOnly)
+			assert.True(t, readOnlyObject.ReadOnly)
+			assert.Same(t, tc.schema, property.Value)
+		})
+	}
 }
 
 func TestGlobalParameterFilteringDoesNotDropRepeatedHeaders(t *testing.T) {
@@ -1560,6 +1750,514 @@ paths:
 	runGo(t, outputDir, "build", "./...")
 }
 
+const nullableScalarBodySpec = `
+openapi: 3.1.0
+info:
+  title: Nullable Scalars
+  version: 1.0.0
+servers:
+  - url: https://api.example.test
+paths:
+  /voices:
+    get:
+      operationId: listVoices
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    id: {type: string}
+    post:
+      operationId: createVoice
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [must_confirm]
+              properties:
+                seed:
+                  description: Random seed
+                  format: int64
+                  maximum: 100
+                  anyOf:
+                    - type: integer
+                    - type: "null"
+                exclude_source_domain:
+                  description: Drop the source domain
+                  anyOf:
+                    - type: boolean
+                    - type: "null"
+                temperature:
+                  oneOf:
+                    - type: number
+                    - type: "null"
+                plain_count:
+                  type: integer
+                nullable_flag:
+                  type: integer
+                  nullable: true
+                typed_null_count:
+                  type: [integer, "null"]
+                lone_integer:
+                  anyOf:
+                    - type: integer
+                repeated_null:
+                  anyOf:
+                    - type: "null"
+                    - type: integer
+                    - type: "null"
+                title:
+                  type: string
+                ambiguous:
+                  anyOf:
+                    - type: integer
+                    - type: string
+                response_engine:
+                  oneOf:
+                    - type: string
+                    - type: object
+                      properties:
+                        type: {type: string}
+                payload:
+                  anyOf:
+                    - type: object
+                      properties:
+                        id: {type: string}
+                    - type: "null"
+                must_confirm:
+                  anyOf:
+                    - type: boolean
+                    - type: "null"
+                wrapped_seed:
+                  allOf:
+                    - anyOf:
+                        - type: integer
+                        - type: "null"
+                ref_seed:
+                  anyOf:
+                    - $ref: "#/components/schemas/SeedInt"
+                    - type: "null"
+                options:
+                  type: object
+                  properties:
+                    retries:
+                      anyOf:
+                        - type: integer
+                        - type: "null"
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+  /blocks:
+    post:
+      operationId: createBlock
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - type: object
+                  properties:
+                    paragraph: {type: string}
+                - type: object
+                  properties:
+                    heading: {type: string}
+      responses:
+        "200":
+          description: ok
+components:
+  schemas:
+    SeedInt:
+      type: integer
+      format: int32
+`
+
+func TestParseNullableAnyOfBodyScalarsKeepDeclaredTypes(t *testing.T) {
+	t.Parallel()
+
+	parsed, err := Parse([]byte(nullableScalarBodySpec))
+	require.NoError(t, err)
+
+	endpoint := findParsedEndpointByPath(t, parsed, "POST", "/voices")
+	require.False(t, endpoint.BodyJSONFallback)
+	byName := map[string]spec.Param{}
+	for _, param := range endpoint.Body {
+		byName[param.Name] = param
+	}
+
+	seed := byName["seed"]
+	assert.Equal(t, "int", seed.Type)
+	assert.Equal(t, "Random seed", seed.Description)
+	assert.Equal(t, "int64", seed.Format)
+	require.NotNil(t, seed.Maximum)
+	assert.Equal(t, 100.0, *seed.Maximum)
+	assert.NotEqual(t, "json_or_scalar", seed.Format)
+
+	assert.Equal(t, "bool", byName["exclude_source_domain"].Type)
+	assert.Equal(t, "float", byName["temperature"].Type)
+	assert.Equal(t, "int", byName["plain_count"].Type)
+	assert.Equal(t, "int", byName["nullable_flag"].Type)
+	assert.Equal(t, "int", byName["typed_null_count"].Type)
+	assert.Equal(t, "int", byName["lone_integer"].Type)
+	assert.Equal(t, "int", byName["repeated_null"].Type)
+	assert.Equal(t, "string", byName["title"].Type)
+	assert.Equal(t, "int", byName["wrapped_seed"].Type)
+	assert.Equal(t, "int", byName["ref_seed"].Type)
+	assert.Equal(t, "int32", byName["ref_seed"].Format)
+	assert.Equal(t, "bool", byName["must_confirm"].Type)
+	assert.True(t, byName["must_confirm"].Required)
+
+	assert.Equal(t, "string", byName["ambiguous"].Type)
+	assert.Empty(t, byName["ambiguous"].Format)
+
+	assert.Equal(t, "string", byName["response_engine"].Type)
+	assert.Equal(t, "json_or_scalar", byName["response_engine"].Format)
+	assert.Equal(t, "string", byName["payload"].Type)
+	assert.Equal(t, "json_or_scalar", byName["payload"].Format)
+
+	require.Equal(t, "object", byName["options"].Type)
+	retries := map[string]spec.Param{}
+	for _, field := range byName["options"].Fields {
+		retries[field.Name] = field
+	}
+	assert.Equal(t, "int", retries["retries"].Type)
+
+	blocks := findParsedEndpointByPath(t, parsed, "POST", "/blocks")
+	assert.True(t, blocks.BodyJSONFallback)
+	assert.Empty(t, blocks.Body)
+}
+
+func TestNullableStringUnionIntersectsWrapperEnum(t *testing.T) {
+	t.Parallel()
+
+	parsed, err := Parse([]byte(`
+openapi: 3.1.0
+info:
+  title: Nullable Enum
+  version: 1.0.0
+servers:
+  - url: https://api.example.test
+paths:
+  /voices:
+    post:
+      operationId: createVoice
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                mode:
+                  enum: ["a"]
+                  anyOf:
+                    - type: string
+                      enum: ["a", "b"]
+                    - type: "null"
+                ordered:
+                  enum: ["b", "a"]
+                  anyOf:
+                    - type: string
+                      enum: ["a", "c", "b"]
+                    - type: "null"
+                tone:
+                  enum: ["soft"]
+                  oneOf:
+                    - type: string
+                      enum: ["soft", "loud"]
+                    - type: "null"
+                branch_only:
+                  anyOf:
+                    - type: string
+                      enum: ["a", "b"]
+                    - type: "null"
+                wrapper_only:
+                  enum: ["a", "c"]
+                  anyOf:
+                    - type: string
+                    - type: "null"
+                disjoint:
+                  enum: ["a"]
+                  anyOf:
+                    - type: string
+                      enum: ["b"]
+                    - type: "null"
+      responses:
+        "200":
+          description: ok
+`))
+	require.NoError(t, err)
+
+	endpoint := findParsedEndpointByPath(t, parsed, "POST", "/voices")
+	byName := map[string]spec.Param{}
+	for _, param := range endpoint.Body {
+		byName[param.Name] = param
+	}
+
+	assert.Equal(t, "string", byName["mode"].Type)
+	assert.Equal(t, []string{"a"}, byName["mode"].Enum)
+	assert.Equal(t, []string{"b", "a"}, byName["ordered"].Enum)
+	assert.Equal(t, []string{"soft"}, byName["tone"].Enum)
+	assert.Equal(t, []string{"a", "b"}, byName["branch_only"].Enum)
+	assert.Equal(t, []string{"a", "c"}, byName["wrapper_only"].Enum)
+	assert.Empty(t, byName["disjoint"].Enum)
+	assert.True(t, byName["disjoint"].EnumUnsatisfiable)
+	assert.False(t, byName["mode"].EnumUnsatisfiable)
+}
+
+func TestGenerateDisjointEnumBodyFlagRejectsValues(t *testing.T) {
+	t.Parallel()
+	if testing.Short() {
+		t.Skip("OpenAPI generated CLI compile coverage runs in the generated-test CI lane")
+	}
+
+	parsed, err := Parse([]byte(`
+openapi: 3.1.0
+info:
+  title: Nullable Enum
+  version: 1.0.0
+servers:
+  - url: https://api.example.test
+paths:
+  /voices:
+    get:
+      operationId: listVoices
+      responses:
+        "200":
+          description: ok
+    post:
+      operationId: createVoice
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                mode:
+                  enum: ["a"]
+                  anyOf:
+                    - type: string
+                      enum: ["a", "b"]
+                    - type: "null"
+                disjoint:
+                  enum: ["a"]
+                  anyOf:
+                    - type: string
+                      enum: ["b"]
+                    - type: "null"
+      responses:
+        "200":
+          description: ok
+`))
+	require.NoError(t, err)
+
+	archived, err := json.Marshal(parsed)
+	require.NoError(t, err)
+	assert.Contains(t, string(archived), `"enum_unsatisfiable":true`)
+	reloaded, err := spec.ParseBytes(archived)
+	require.NoError(t, err)
+	reloadedEndpoint := findParsedEndpointByPath(t, reloaded, "POST", "/voices")
+	var disjoint spec.Param
+	for _, param := range reloadedEndpoint.Body {
+		if param.Name == "disjoint" {
+			disjoint = param
+		}
+	}
+	require.True(t, disjoint.EnumUnsatisfiable, "merged-spec JSON archive must keep disjoint-enum rejection")
+	require.Empty(t, disjoint.Enum)
+
+	outputDir := filepath.Join(t.TempDir(), naming.CLI(reloaded.Name))
+	require.NoError(t, generator.New(reloaded, outputDir).Generate())
+
+	commandSrc := generatedSourceContaining(t, outputDir, "schema permits no value")
+	assert.Contains(t, commandSrc, `cmd.Flags().Changed("disjoint")`)
+	assert.Contains(t, commandSrc, "bodyDisjoint")
+	assert.NotContains(t, commandSrc, "allowedDisjoint")
+	assert.NotContains(t, commandSrc, `"pp:requires-input"`,
+		"an optional disjoint-enum flag must not mark the command as requiring input")
+	assert.NotContains(t, commandSrc, "hasChangedLocalFlags",
+		"bare invocation of an optional-only command must execute instead of printing help")
+
+	binaryPath := filepath.Join(outputDir, naming.CLI(reloaded.Name))
+	runGo(t, outputDir, "mod", "tidy")
+	runGo(t, outputDir, "build", "-o", binaryPath, "./cmd/"+naming.CLI(reloaded.Name))
+
+	bareCtx, bareCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer bareCancel()
+	bare := exec.CommandContext(bareCtx, binaryPath, "voices", "create", "--json", "--timeout", "1ms")
+	bareOut, bareErr := bare.CombinedOutput()
+	require.Error(t, bareErr, "optional-only create should attempt the call: %s", bareOut)
+	assert.NotContains(t, string(bareOut), "requires input")
+	assert.NotContains(t, string(bareOut), "Usage:")
+
+	for _, value := range []string{"a", "b", "hello"} {
+		cmd := exec.Command(binaryPath, "voices", "create", "--disjoint", value, "--dry-run")
+		out, err := cmd.CombinedOutput()
+		require.Error(t, err, "disjoint %q should be rejected: %s", value, out)
+		assert.Contains(t, string(out), fmt.Sprintf("invalid value %q for --disjoint: schema permits no value", value))
+	}
+
+	okCmd := exec.Command(binaryPath, "voices", "create", "--mode", "a", "--dry-run")
+	okOut, err := okCmd.CombinedOutput()
+	require.NoError(t, err, string(okOut))
+	body := unmarshalDryRunBody(t, string(okOut))
+	assert.Equal(t, "a", jsonAny(t, body, "mode"))
+}
+
+func TestGenerateNullableAnyOfBodyScalarsMarshalDeclaredJSONTypes(t *testing.T) {
+	t.Parallel()
+	if testing.Short() {
+		t.Skip("OpenAPI generated CLI compile coverage runs in the generated-test CI lane")
+	}
+
+	parsed, err := Parse([]byte(nullableScalarBodySpec))
+	require.NoError(t, err)
+
+	outputDir := filepath.Join(t.TempDir(), naming.CLI(parsed.Name))
+	require.NoError(t, generator.New(parsed, outputDir).Generate())
+
+	commandSrc := generatedSourceContaining(t, outputDir, `bodyMap["seed"]`)
+	assert.Contains(t, commandSrc, "var bodySeed int")
+	assert.NotContains(t, commandSrc, "var bodySeed string")
+	assert.Contains(t, commandSrc, `bodyMap["seed"] = bodySeed`)
+	assert.Contains(t, commandSrc, "var bodyExcludeSourceDomain bool")
+	assert.Contains(t, commandSrc, "var bodyTemperature float64")
+	assert.Contains(t, commandSrc, "var bodyPlainCount int")
+	assert.Contains(t, commandSrc, "var bodyAmbiguous string")
+	assert.Contains(t, commandSrc, "var bodyMustConfirm string")
+	assert.Contains(t, commandSrc, "strconv.ParseBool(bodyMustConfirm)")
+	assert.Contains(t, commandSrc, `bodyMap["options"] = nestedOptions`)
+	assert.Contains(t, commandSrc, `nestedOptions["retries"] = bodyOptionsRetries`)
+
+	mcpSrc := generatedSourceContaining(t, outputDir, `WithNumber("seed"`)
+	assert.Contains(t, mcpSrc, `WithBoolean("exclude_source_domain"`)
+	assert.Contains(t, mcpSrc, `WithNumber("temperature"`)
+	assert.NotContains(t, mcpSrc, `WithString("seed"`)
+
+	binaryPath := filepath.Join(outputDir, naming.CLI(parsed.Name))
+	runGo(t, outputDir, "mod", "tidy")
+	runGo(t, outputDir, "build", "-o", binaryPath, "./cmd/"+naming.CLI(parsed.Name))
+
+	cmd := exec.Command(binaryPath, "voices", "create",
+		"--seed", "42",
+		"--exclude-source-domain=false",
+		"--temperature", "1.5",
+		"--plain-count", "7",
+		"--typed-null-count", "11",
+		"--nullable-flag", "5",
+		"--lone-integer", "6",
+		"--repeated-null", "4",
+		"--title", "hello",
+		"--ambiguous", "42",
+		"--wrapped-seed", "3",
+		"--ref-seed", "9",
+		"--options-retries", "2",
+		"--must-confirm", "true",
+		"--dry-run",
+	)
+	out, err := cmd.CombinedOutput()
+	require.NoError(t, err, string(out))
+	body := unmarshalDryRunBody(t, string(out))
+
+	assertJSONNumber(t, body, "seed", 42)
+	assertJSONBool(t, body, "exclude_source_domain", false)
+	assertJSONNumber(t, body, "temperature", 1.5)
+	assertJSONNumber(t, body, "plain_count", 7)
+	assertJSONNumber(t, body, "typed_null_count", 11)
+	assertJSONNumber(t, body, "nullable_flag", 5)
+	assertJSONNumber(t, body, "lone_integer", 6)
+	assertJSONNumber(t, body, "repeated_null", 4)
+	assertJSONNumber(t, body, "wrapped_seed", 3)
+	assertJSONNumber(t, body, "ref_seed", 9)
+	assert.Equal(t, "hello", jsonAny(t, body, "title"))
+	assert.Equal(t, "42", jsonAny(t, body, "ambiguous"))
+	assert.Equal(t, true, jsonAny(t, body, "must_confirm"))
+
+	options, ok := jsonAny(t, body, "options").(map[string]any)
+	require.True(t, ok, "options: %#v", jsonAny(t, body, "options"))
+	assert.Equal(t, float64(2), options["retries"])
+
+	nullCmd := exec.Command(binaryPath, "voices", "create", "--stdin", "--dry-run")
+	nullCmd.Stdin = strings.NewReader(`{"seed":null,"exclude_source_domain":null}`)
+	nullOut, err := nullCmd.CombinedOutput()
+	require.NoError(t, err, string(nullOut))
+	nullBody := unmarshalDryRunBody(t, string(nullOut))
+	assertJSONNull(t, nullBody, "seed")
+	assertJSONNull(t, nullBody, "exclude_source_domain")
+}
+
+func generatedSourceContaining(t *testing.T, root, needle string) string {
+	t.Helper()
+	var found string
+	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() || !strings.HasSuffix(path, ".go") || found != "" {
+			return err
+		}
+		data, readErr := os.ReadFile(path)
+		if readErr != nil {
+			return readErr
+		}
+		if strings.Contains(string(data), needle) {
+			found = string(data)
+		}
+		return nil
+	})
+	require.NoError(t, err)
+	require.NotEmpty(t, found, "no generated Go file contains %q", needle)
+	return found
+}
+
+func unmarshalDryRunBody(t *testing.T, output string) map[string]json.RawMessage {
+	t.Helper()
+	var body map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal([]byte(extractDryRunBody(t, output)), &body))
+	return body
+}
+
+func jsonAny(t *testing.T, body map[string]json.RawMessage, key string) any {
+	t.Helper()
+	raw, ok := body[key]
+	require.True(t, ok, "missing %q in %s", key, body)
+	var value any
+	require.NoError(t, json.Unmarshal(raw, &value), string(raw))
+	return value
+}
+
+func assertJSONNumber(t *testing.T, body map[string]json.RawMessage, key string, want float64) {
+	t.Helper()
+	raw := body[key]
+	require.NotEmpty(t, raw, "missing %q", key)
+	assert.NotContains(t, string(raw), `"`, "%s encoded as a JSON string: %s", key, raw)
+	assert.Equal(t, want, jsonAny(t, body, key))
+}
+
+func assertJSONBool(t *testing.T, body map[string]json.RawMessage, key string, want bool) {
+	t.Helper()
+	raw := body[key]
+	require.NotEmpty(t, raw, "missing %q", key)
+	assert.NotContains(t, string(raw), `"`, "%s encoded as a JSON string: %s", key, raw)
+	assert.Equal(t, want, jsonAny(t, body, key))
+}
+
+func assertJSONNull(t *testing.T, body map[string]json.RawMessage, key string) {
+	t.Helper()
+	raw, ok := body[key]
+	require.True(t, ok, "missing %q in %s", key, body)
+	assert.Equal(t, "null", strings.TrimSpace(string(raw)))
+}
+
 const dataEnvelopeAllOfTaskSpec = `
 openapi: 3.0.3
 info:
@@ -1673,7 +2371,7 @@ func TestGenerateDataEnvelopeAllOfBodyFlags(t *testing.T) {
 	runGo(t, outputDir, "mod", "tidy")
 	runGo(t, outputDir, "build", "-o", binaryPath, "./cmd/"+naming.CLI(parsed.Name))
 
-	helpOut, err := exec.Command(binaryPath, "tasks", "update-task", "--help").CombinedOutput()
+	helpOut, err := exec.Command(binaryPath, "tasks", "--help").CombinedOutput()
 	require.NoError(t, err, string(helpOut))
 	help := string(helpOut)
 	for _, want := range []string{
@@ -1689,7 +2387,7 @@ func TestGenerateDataEnvelopeAllOfBodyFlags(t *testing.T) {
 	}
 	assert.NotContains(t, help, "--data-data-")
 
-	cmd := exec.Command(binaryPath, "tasks", "update-task", "123", "--data-html-notes", "<body>foo</body>", "--dry-run")
+	cmd := exec.Command(binaryPath, "tasks", "123", "--data-name", "Task", "--data-html-notes", "<body>foo</body>", "--dry-run")
 	out, err := cmd.CombinedOutput()
 	require.NoError(t, err, string(out))
 	bodyJSON := extractDryRunBody(t, string(out))
@@ -1752,6 +2450,436 @@ components:
 	assert.Equal(t, "object", fieldsByName["child"].Type)
 	assert.Empty(t, fieldsByName["child"].Fields)
 }
+
+func TestParseWritableRequestBodyCycleOmitsNestedFlags(t *testing.T) {
+	warnings := captureWarnings(t, func() {
+		parsed, err := Parse([]byte(writableCycleSpec))
+		require.NoError(t, err)
+
+		direct := bodyFields(t, parsed, "/records")
+		assert.Equal(t, []string{"id", "kind", "parentJob"}, paramNames(direct))
+		assert.Empty(t, fieldByName(t, direct, "parentJob").Fields)
+		assert.Equal(t, "object", fieldByName(t, direct, "parentJob").Type)
+
+		composed := bodyFields(t, parsed, "/composed-records")
+		assert.Equal(t, []string{"id", "kind", "parentJob"}, paramNames(composed))
+		assert.Empty(t, fieldByName(t, composed, "parentJob").Fields)
+
+		nested := bodyFields(t, parsed, "/moves")
+		assert.Equal(t, []string{"destination", "job"}, paramNames(nested))
+		job := fieldByName(t, nested, "job")
+		assert.Equal(t, []string{"id", "kind", "parentJob"}, paramNames(job.Fields))
+		assert.Empty(t, fieldByName(t, job.Fields, "parentJob").Fields)
+		assert.LessOrEqual(t, paramTreeDepth(nested), 2)
+
+		directNested := bodyFields(t, parsed, "/direct-moves")
+		directJob := fieldByName(t, directNested, "job")
+		assert.Equal(t, []string{"id", "kind", "parentJob"}, paramNames(directJob.Fields))
+		assert.Empty(t, fieldByName(t, directJob.Fields, "parentJob").Fields)
+
+		mutual := bodyFields(t, parsed, "/nodes")
+		other := fieldByName(t, mutual, "other")
+		assert.Equal(t, []string{"label", "node"}, paramNames(other.Fields))
+		assert.Empty(t, fieldByName(t, other.Fields, "node").Fields)
+		assert.LessOrEqual(t, paramTreeDepth(mutual), 2)
+
+		longBody := bodyFields(t, parsed, "/long-records")
+		assert.Empty(t, fieldByName(t, longBody, "parentBackgroundJob").Fields)
+		assert.LessOrEqual(t, paramTreeDepth(longBody), 1)
+
+		embedded := bodyFields(t, parsed, "/anonymous-records")
+		assert.Empty(t, fieldByName(t, embedded, "parentJob").Fields)
+
+		shared := bodyFields(t, parsed, "/shipments")
+		for _, name := range []string{"billing", "shipping"} {
+			address := fieldByName(t, shared, name)
+			assert.Equal(t, []string{"city", "country"}, paramNames(address.Fields), name)
+		}
+
+		chain := bodyFields(t, parsed, "/chains")
+		b := fieldByName(t, chain, "b")
+		c := fieldByName(t, b.Fields, "c")
+		assert.Empty(t, fieldByName(t, c.Fields, "a").Fields)
+		assert.LessOrEqual(t, paramTreeDepth(chain), 3)
+
+		plain := bodyFields(t, parsed, "/orders")
+		item := fieldByName(t, fieldByName(t, plain, "order").Fields, "item")
+		assert.Equal(t, "string", fieldByName(t, item.Fields, "sku").Type)
+	})
+
+	for _, field := range []string{"parentJob", "job.parentJob", "other.node", "parentBackgroundJob", "b.c.a"} {
+		assert.Contains(t, warnings, field)
+	}
+	assert.Contains(t, warnings, "--stdin")
+	assert.NotContains(t, warnings, "billing")
+	assert.NotContains(t, warnings, "sku")
+}
+
+func bodyFields(t *testing.T, parsed *spec.APISpec, path string) []spec.Param {
+	t.Helper()
+	endpoint := findParsedEndpointByPath(t, parsed, "POST", path)
+	return endpoint.Body
+}
+
+func paramNames(params []spec.Param) []string {
+	names := make([]string, 0, len(params))
+	for _, param := range params {
+		names = append(names, param.Name)
+	}
+	return names
+}
+
+func fieldByName(t *testing.T, params []spec.Param, name string) spec.Param {
+	t.Helper()
+	for _, param := range params {
+		if param.Name == name {
+			return param
+		}
+	}
+	t.Fatalf("field %q not found in %v", name, paramNames(params))
+	return spec.Param{}
+}
+
+func fieldByWireName(t *testing.T, params []spec.Param, wire string) spec.Param {
+	t.Helper()
+	for _, param := range params {
+		if param.BodyWireName() == wire {
+			return param
+		}
+	}
+	t.Fatalf("body field %q not found in %v", wire, paramNames(params))
+	return spec.Param{}
+}
+
+func paramTreeDepth(params []spec.Param) int {
+	depth := 0
+	for _, param := range params {
+		child := paramTreeDepth(param.Fields)
+		if child+1 > depth {
+			depth = child + 1
+		}
+	}
+	return depth
+}
+
+const writableCycleSpec = `
+openapi: 3.0.3
+info:
+  title: Writable Cycle API
+  version: 1.0.0
+paths:
+  /records:
+    post:
+      operationId: createRecord
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Job'
+      responses:
+        '200': {description: ok}
+  /composed-records:
+    post:
+      operationId: createComposedRecord
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/JobPostRequestBody'
+      responses:
+        '200': {description: ok}
+  /moves:
+    post:
+      operationId: moveRecord
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MoveRequest'
+      responses:
+        '200': {description: ok}
+  /direct-moves:
+    post:
+      operationId: moveRecordDirect
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DirectMoveRequest'
+      responses:
+        '200': {description: ok}
+  /nodes:
+    post:
+      operationId: createNode
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Node'
+      responses:
+        '200': {description: ok}
+  /long-records:
+    post:
+      operationId: createLongRecord
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LongJob'
+      responses:
+        '200': {description: ok}
+  /anonymous-records:
+    post:
+      operationId: createAnonymousRecord
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AnonymousJob'
+      responses:
+        '200': {description: ok}
+  /shipments:
+    post:
+      operationId: createShipment
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Shipment'
+      responses:
+        '200': {description: ok}
+  /chains:
+    post:
+      operationId: createChain
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChainA'
+      responses:
+        '200': {description: ok}
+  /orders:
+    post:
+      operationId: createOrder
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Envelope'
+      responses:
+        '200': {description: ok}
+components:
+  schemas:
+    Job:
+      type: object
+      required: [kind]
+      properties:
+        id: {type: integer}
+        kind: {type: string}
+        parentJob:
+          $ref: '#/components/schemas/Job'
+    JobAllOf:
+      type: object
+      required: [kind]
+      properties:
+        id: {type: integer}
+        kind: {type: string}
+        parentJob:
+          allOf:
+            - $ref: '#/components/schemas/JobAllOf'
+    JobPostRequestBody:
+      required: [kind]
+      allOf:
+        - $ref: '#/components/schemas/JobAllOf'
+    MoveRequest:
+      type: object
+      required: [destination]
+      properties:
+        destination: {type: string}
+        job:
+          allOf:
+            - $ref: '#/components/schemas/JobAllOf'
+    DirectMoveRequest:
+      type: object
+      required: [destination]
+      properties:
+        destination: {type: string}
+        job:
+          $ref: '#/components/schemas/Job'
+    Node:
+      type: object
+      required: [name]
+      properties:
+        name: {type: string}
+        other:
+          allOf:
+            - $ref: '#/components/schemas/Other'
+    Other:
+      type: object
+      properties:
+        label: {type: string}
+        node:
+          allOf:
+            - $ref: '#/components/schemas/Node'
+    LongJob:
+      type: object
+      required: [kind]
+      properties:
+        kind: {type: string}
+        parentBackgroundJob:
+          allOf:
+            - $ref: '#/components/schemas/LongJob'
+    AnonymousJob:
+      allOf:
+        - type: object
+          properties:
+            kind: {type: string}
+            parentJob:
+              allOf:
+                - $ref: '#/components/schemas/AnonymousJob'
+    Shipment:
+      type: object
+      properties:
+        billing:
+          $ref: '#/components/schemas/Address'
+        shipping:
+          $ref: '#/components/schemas/Address'
+    Address:
+      type: object
+      properties:
+        city: {type: string}
+        country: {type: string}
+    ChainA:
+      type: object
+      properties:
+        b:
+          $ref: '#/components/schemas/ChainB'
+    ChainB:
+      type: object
+      properties:
+        c:
+          $ref: '#/components/schemas/ChainC'
+    ChainC:
+      type: object
+      properties:
+        a:
+          $ref: '#/components/schemas/ChainA'
+    Envelope:
+      type: object
+      properties:
+        order:
+          type: object
+          properties:
+            item:
+              type: object
+              properties:
+                sku: {type: string}
+`
+
+func TestParseNestedNonASCIIBodyKeyKeepsWireName(t *testing.T) {
+	warnings := captureWarnings(t, func() {
+		parsed, err := Parse([]byte(nestedNonASCIIBodySpec))
+		require.NoError(t, err)
+
+		plain := bodyFields(t, parsed, "/places")
+		details := fieldByName(t, plain, "details")
+		assert.True(t, details.Required)
+		cafe := fieldByWireName(t, details.Fields, "café")
+		assert.Equal(t, "café", cafe.BodyWireName())
+		assert.Equal(t, "café", cafe.BodyName)
+		assert.Equal(t, "cafe", cafe.Name)
+		assert.True(t, cafe.Required)
+		assert.Equal(t, "string", cafe.Type)
+
+		city := fieldByName(t, details.Fields, "city")
+		assert.Equal(t, "city", city.BodyWireName())
+		assert.Empty(t, city.BodyName)
+		assert.True(t, city.Required)
+
+		note := fieldByName(t, details.Fields, "note")
+		assert.Equal(t, "note", note.BodyWireName())
+		assert.Empty(t, note.BodyName)
+		assert.False(t, note.Required)
+
+		parent := fieldByName(t, details.Fields, "parent")
+		assert.Equal(t, "object", parent.Type)
+		assert.Empty(t, parent.Fields)
+
+		composed := bodyFields(t, parsed, "/composed")
+		composedDetails := fieldByName(t, composed, "details")
+		composedCafe := fieldByWireName(t, composedDetails.Fields, "café")
+		assert.Equal(t, "café", composedCafe.BodyWireName())
+		assert.True(t, composedCafe.Required)
+		assert.Empty(t, fieldByName(t, composedDetails.Fields, "parent").Fields)
+	})
+
+	assert.Contains(t, warnings, "details.parent")
+	assert.NotContains(t, warnings, "café")
+	assert.NotContains(t, warnings, "details.cafe")
+}
+
+const nestedNonASCIIBodySpec = `
+openapi: 3.0.3
+info:
+  title: Accent API
+  version: 1.0.0
+paths:
+  /places:
+    post:
+      operationId: createPlace
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [details]
+              properties:
+                details:
+                  $ref: '#/components/schemas/Details'
+      responses:
+        '200': {description: ok}
+  /composed:
+    post:
+      operationId: createComposed
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [details]
+              properties:
+                details:
+                  allOf:
+                    - $ref: '#/components/schemas/Details'
+      responses:
+        '200': {description: ok}
+components:
+  schemas:
+    Details:
+      type: object
+      required: [café, city]
+      properties:
+        café:
+          type: string
+        city:
+          type: string
+        note:
+          type: string
+        parent:
+          $ref: '#/components/schemas/Details'
+`
 
 func TestParseOneOfRequestBodyEmitsJSONFallback(t *testing.T) {
 	t.Parallel()
@@ -6716,6 +7844,8 @@ paths:
 	assert.Equal(t, spec.AuthEnvVarKindPerCall, additional.EnvVar.Kind)
 	assert.True(t, additional.EnvVar.Required)
 	assert.True(t, additional.EnvVar.Sensitive)
+	assert.False(t, additional.PerOperation)
+	assert.Empty(t, endpointAuthSchemes(parsed)["GET /tenant/{tenant}/customers"])
 }
 
 // Single-scheme apiKey (no sibling OAuth) must keep its existing single-scheme
@@ -6754,6 +7884,7 @@ paths:
 
 	assert.Equal(t, "api_key", parsed.Auth.Type)
 	assert.Empty(t, parsed.Auth.AdditionalHeaders, "single-scheme path must not duplicate the primary envvar as additional")
+	assert.Empty(t, endpointAuthSchemes(parsed)["GET /items"])
 }
 
 // OR-alternative auth: two security requirement objects, each with a single
@@ -6797,6 +7928,7 @@ paths:
 	require.NoError(t, err)
 	assert.Empty(t, parsed.Auth.AdditionalHeaders,
 		"OR alternative schemes must not surface as required siblings")
+	assert.Empty(t, endpointAuthSchemes(parsed)["GET /items"])
 }
 
 // A sibling header apiKey scheme that omits the x-auth-vars extension still
@@ -6992,6 +8124,8 @@ paths:
 	assert.Equal(t, "ApiIntegrationCode", parsed.Auth.Scheme)
 	assert.Empty(t, parsed.Auth.AdditionalHeaders,
 		"operation-specific sibling sets cannot be represented as global additional headers")
+	assert.Empty(t, endpointAuthSchemes(parsed)["GET /tickets"])
+	assert.Empty(t, endpointAuthSchemes(parsed)["GET /companies"])
 }
 
 func TestOpenAPIAuthClassifiesCookieAndOAuth2ClientCredentialsEnvVars(t *testing.T) {
@@ -9397,6 +10531,468 @@ paths:
 			ep := findEndpoint(t, parsed, "/things")
 			assert.Equal(t, tt.wantID, ep.IDField)
 		})
+	}
+}
+
+// TestParseSingleArrayRecordKeepsObject pins the contract that a response
+// object unwraps to its one array only when every sibling is paging or
+// envelope metadata. mapResponse (Response.Type / ResponsePath) and the
+// primary-key walk (IDField, via unwrapItemSchema) share that predicate.
+func TestParseSingleArrayRecordKeepsObject(t *testing.T) {
+	t.Parallel()
+
+	yamlSpec := []byte(`openapi: "3.0.3"
+info:
+  title: Single Array Records
+  version: "1.0"
+servers:
+  - url: https://api.example.com
+paths:
+  /admins/{id}:
+    get:
+      operationId: getAdmin
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  type: {type: string}
+                  id: {type: string}
+                  name: {type: string}
+                  email: {type: string}
+                  team_ids:
+                    type: array
+                    items: {type: string}
+  /messages/{id}:
+    get:
+      operationId: getMessage
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: {type: string}
+                  threadId: {type: string}
+                  snippet: {type: string}
+                  payload:
+                    type: object
+                    properties:
+                      mimeType: {type: string}
+                  labelIds:
+                    type: array
+                    items: {type: string}
+  /servers/{id}:
+    get:
+      operationId: getServer
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  Name: {type: string}
+                  ID: {type: integer}
+                  Color: {type: string}
+                  ApiTokens:
+                    type: array
+                    items: {type: string}
+  /resource-pools/{poolId}:
+    get:
+      operationId: getResourcePool
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  name: {type: string}
+                  cpu_allocation:
+                    type: object
+                    properties:
+                      limit: {type: integer}
+                  memory_allocation:
+                    type: object
+                    properties:
+                      limit: {type: integer}
+                  resource_pools:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: {type: string}
+  /device-commands/{commandId}:
+    get:
+      operationId: getDeviceCommand
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  commandId: {type: string}
+                  errors:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: {type: string}
+                        message: {type: string}
+  /alerts/{id}:
+    get:
+      operationId: getAlert
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: {type: string}
+                  description: {type: string}
+                  allowedActions:
+                    type: array
+                    items: {type: string}
+  /sites/{id}:
+    get:
+      operationId: getSite
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: {type: string}
+                  name: {type: string}
+                  externalIds:
+                    type: array
+                    items: {type: string}
+  /labels:
+    get:
+      operationId: listLabels
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  labels:
+                    type: array
+                    items:
+                      type: object
+                      required: [id]
+                      properties:
+                        id: {type: string}
+                        name: {type: string}
+  /events:
+    get:
+      operationId: listEvents
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  events:
+                    type: array
+                    items:
+                      type: object
+                      required: [event_ticker]
+                      properties:
+                        event_ticker: {type: string}
+                  cursor: {type: string}
+  /events-camel:
+    get:
+      operationId: listEventsCamel
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  Events:
+                    type: array
+                    items:
+                      type: object
+                      required: [event_ticker]
+                      properties:
+                        event_ticker: {type: string}
+                  NextPageToken: {type: string}
+                  HasMore: {type: boolean}
+  /bounces:
+    get:
+      operationId: listBounces
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  TotalCount: {type: integer}
+                  Bounces:
+                    type: array
+                    items:
+                      type: object
+                      required: [id]
+                      properties:
+                        id: {type: string}
+  /items:
+    get:
+      operationId: listItems
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      required: [sku]
+                      properties:
+                        sku: {type: string}
+                  next_cursor: {type: string}
+  /searches:
+    get:
+      operationId: searchRecords
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  results:
+                    type: array
+                    items:
+                      type: object
+                      required: [id]
+                      properties:
+                        id: {type: string}
+                  request_id: {type: string}
+                  status_code: {type: integer}
+                  results_metadata:
+                    type: object
+                    properties:
+                      next_cursor: {type: string}
+  /tickets/query:
+    post:
+      operationId: queryTickets
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      required: [id]
+                      properties:
+                        id: {type: integer}
+                  pageDetails:
+                    type: object
+                    properties:
+                      nextPageUrl: {type: string}
+  /wrapped-data:
+    get:
+      operationId: listWrappedData
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: {type: string}
+                  name: {type: string}
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      required: [sku]
+                      properties:
+                        sku: {type: string}
+  /positions:
+    get:
+      operationId: listPositions
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  event_positions:
+                    type: array
+                    items: {type: object}
+                  market_positions:
+                    type: array
+                    items: {type: object}
+  /events-malformed:
+    get:
+      operationId: listEventsMalformed
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  events:
+                    type: array
+                    items:
+                      type: object
+                      required: [event_ticker]
+                      properties:
+                        event_ticker: {type: string}
+                  legacy:
+                    type: array
+                  cursor: {type: string}
+  /events-malformed-record:
+    get:
+      operationId: getEventsMalformedRecord
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  events:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: {type: string}
+                  legacy:
+                    type: array
+                  name: {type: string}
+  /histories:
+    get:
+      operationId: listHistories
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  history:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: {type: string}
+                  historyId: {type: string}
+                  nextPageToken: {type: string}
+  /flags:
+    get:
+      operationId: getFlags
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: {type: string}
+                  tags:
+                    type: array
+                    items: {type: string}
+`)
+	parsed, err := Parse(yamlSpec)
+	require.NoError(t, err)
+
+	tests := []struct {
+		path     string
+		wantType string
+		wantPath string
+		wantID   string
+	}{
+		{path: "/admins/{id}", wantType: "object", wantPath: "", wantID: "id"},
+		{path: "/messages/{id}", wantType: "object", wantPath: "", wantID: "id"},
+		{path: "/servers/{id}", wantType: "object", wantPath: "", wantID: "ID"},
+		{path: "/resource-pools/{poolId}", wantType: "object", wantPath: "", wantID: "name"},
+		{path: "/device-commands/{commandId}", wantType: "object", wantPath: "", wantID: "commandId"},
+		{path: "/alerts/{id}", wantType: "object", wantPath: "", wantID: "id"},
+		{path: "/sites/{id}", wantType: "object", wantPath: "", wantID: "id"},
+		{path: "/labels", wantType: "array", wantPath: "labels", wantID: "id"},
+		{path: "/events", wantType: "array", wantPath: "events", wantID: "event_ticker"},
+		{path: "/events-camel", wantType: "array", wantPath: "Events", wantID: "event_ticker"},
+		{path: "/bounces", wantType: "array", wantPath: "Bounces", wantID: "id"},
+		{path: "/items", wantType: "array", wantPath: "items", wantID: "sku"},
+		{path: "/searches", wantType: "array", wantPath: "results", wantID: "id"},
+		{path: "/tickets/query", wantType: "array", wantPath: "items", wantID: "id"},
+		{path: "/wrapped-data", wantType: "array", wantPath: "data", wantID: "sku"},
+		{path: "/positions", wantType: "object", wantPath: "", wantID: ""},
+		{path: "/events-malformed", wantType: "array", wantPath: "events", wantID: "event_ticker"},
+		{path: "/events-malformed-record", wantType: "object", wantPath: "", wantID: "name"},
+		{path: "/histories", wantType: "object", wantPath: "", wantID: "historyId"},
+		{path: "/flags", wantType: "object", wantPath: "", wantID: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.path, func(t *testing.T) {
+			t.Parallel()
+			ep := findEndpoint(t, parsed, tt.path)
+			assert.Equal(t, tt.wantType, ep.Response.Type)
+			assert.Equal(t, tt.wantPath, ep.ResponsePath)
+			assert.Equal(t, tt.wantID, ep.IDField)
+		})
+	}
+}
+
+func TestSingleArrayPropertyRefBranches(t *testing.T) {
+	t.Parallel()
+
+	items, name := singleArrayPropertyRef(nil)
+	assert.Nil(t, items)
+	assert.Empty(t, name)
+
+	items, name = singleArrayPropertyRef(&openapi3.Schema{})
+	assert.Nil(t, items)
+	assert.Empty(t, name)
+
+	for _, raw := range []string{"commandId", "historyId", "name", "id", "payload", "provider_type", "sizeEstimate", "status"} {
+		assert.Falsef(t, isEnvelopeMetadataProperty(raw), "%s is a record field", raw)
+	}
+	for _, raw := range []string{"cursor", "CURSOR", "next_page", "NextPage", "has_more", "HasMore", "total_count", "TotalCount", "per_page", "perPage", "request_id", "status_code", "results_metadata", "pageDetails", "nextPageToken", "resultSizeEstimate"} {
+		assert.Truef(t, isEnvelopeMetadataProperty(raw), "%s is envelope metadata", raw)
 	}
 }
 
@@ -13226,6 +14822,19 @@ func TestDetectPaginationPreservesCursorParamCase(t *testing.T) {
 	}
 }
 
+func TestDetectPaginationPairsCursorWithNextCursor(t *testing.T) {
+	t.Parallel()
+
+	responses := openapi3.NewResponses()
+	schema := openapi3.NewObjectSchema().WithProperty("next_cursor", openapi3.NewStringSchema())
+	responses.Set("200", &openapi3.ResponseRef{Value: openapi3.NewResponse().WithJSONSchema(schema)})
+	params := []spec.Param{{Name: "after"}, {Name: "cursor"}, {Name: "limit"}}
+	pag := detectPagination(params, &openapi3.Operation{Responses: responses})
+	require.NotNil(t, pag)
+	assert.Equal(t, "cursor", pag.CursorParam)
+	assert.Equal(t, "next_cursor", pag.NextCursorPath)
+}
+
 func TestDetectPaginationRecognizesTakePageSize(t *testing.T) {
 	t.Parallel()
 
@@ -13752,5 +15361,160 @@ func TestSetParamMaximumNormalizesBounds(t *testing.T) {
 		setParamMaximum(&p, &openapi3.Schema{})
 		assert.Nil(t, p.Maximum)
 		assert.Nil(t, p.ExclusiveMaximum)
+	})
+}
+
+func TestSetParamMinimumNormalizesBounds(t *testing.T) {
+	f := func(v float64) *float64 { return &v }
+	tru := true
+
+	t.Run("inclusive minimum", func(t *testing.T) {
+		p := spec.Param{Type: "int"}
+		setParamMinimum(&p, &openapi3.Schema{Min: f(3)})
+		require.NotNil(t, p.Minimum)
+		assert.Equal(t, 3.0, *p.Minimum)
+	})
+
+	t.Run("openapi 3.0 minimum plus exclusiveMinimum true", func(t *testing.T) {
+		for _, typ := range []string{"int", "integer"} {
+			p := spec.Param{Type: typ}
+			setParamMinimum(&p, &openapi3.Schema{Min: f(0), ExclusiveMin: openapi3.ExclusiveBound{Bool: &tru}})
+			require.NotNil(t, p.Minimum)
+			assert.Equal(t, 1.0, *p.Minimum, typ)
+		}
+	})
+
+	t.Run("openapi 3.1 numeric exclusiveMinimum", func(t *testing.T) {
+		p := spec.Param{Type: "integer"}
+		setParamMinimum(&p, &openapi3.Schema{ExclusiveMin: openapi3.ExclusiveBound{Value: f(1.2)}})
+		require.NotNil(t, p.Minimum)
+		assert.Equal(t, 2.0, *p.Minimum)
+	})
+
+	t.Run("inclusive minimum wins when it is tighter", func(t *testing.T) {
+		p := spec.Param{Type: "int"}
+		setParamMinimum(&p, &openapi3.Schema{Min: f(5), ExclusiveMin: openapi3.ExclusiveBound{Value: f(1.2)}})
+		require.NotNil(t, p.Minimum)
+		assert.Equal(t, 5.0, *p.Minimum)
+	})
+
+	t.Run("non-integer keeps the inclusive minimum", func(t *testing.T) {
+		p := spec.Param{Type: "number"}
+		setParamMinimum(&p, &openapi3.Schema{Min: f(0), ExclusiveMin: openapi3.ExclusiveBound{Bool: &tru}})
+		require.NotNil(t, p.Minimum)
+		assert.Equal(t, 0.0, *p.Minimum)
+	})
+
+	t.Run("nil schema", func(t *testing.T) {
+		p := spec.Param{Type: "int"}
+		setParamMinimum(&p, nil)
+		assert.Nil(t, p.Minimum)
+		assert.NotPanics(t, func() { setParamMinimum(nil, &openapi3.Schema{Min: f(1)}) })
+	})
+
+	t.Run("allOf minimum is the only bound", func(t *testing.T) {
+		p := spec.Param{Type: "int"}
+		setParamMinimum(&p, &openapi3.Schema{
+			AllOf: openapi3.SchemaRefs{{Value: &openapi3.Schema{Min: f(1)}}},
+		})
+		require.NotNil(t, p.Minimum)
+		assert.Equal(t, 1.0, *p.Minimum)
+	})
+
+	t.Run("allOf keeps the tighter floor", func(t *testing.T) {
+		p := spec.Param{Type: "integer"}
+		setParamMinimum(&p, &openapi3.Schema{
+			Min: f(0),
+			AllOf: openapi3.SchemaRefs{
+				nil,
+				{Value: nil},
+				{Value: &openapi3.Schema{Min: f(1)}},
+				{Value: &openapi3.Schema{Min: f(4)}},
+			},
+		})
+		require.NotNil(t, p.Minimum)
+		assert.Equal(t, 4.0, *p.Minimum)
+	})
+
+	t.Run("direct minimum stays when it is tighter than allOf", func(t *testing.T) {
+		p := spec.Param{Type: "int"}
+		setParamMinimum(&p, &openapi3.Schema{
+			Min:   f(5),
+			AllOf: openapi3.SchemaRefs{{Value: &openapi3.Schema{Min: f(1)}}},
+		})
+		require.NotNil(t, p.Minimum)
+		assert.Equal(t, 5.0, *p.Minimum)
+	})
+
+	t.Run("nested allOf", func(t *testing.T) {
+		p := spec.Param{Type: "int"}
+		setParamMinimum(&p, &openapi3.Schema{
+			AllOf: openapi3.SchemaRefs{{
+				Value: &openapi3.Schema{
+					AllOf: openapi3.SchemaRefs{{Value: &openapi3.Schema{Min: f(3)}}},
+				},
+			}},
+		})
+		require.NotNil(t, p.Minimum)
+		assert.Equal(t, 3.0, *p.Minimum)
+	})
+
+	t.Run("allOf exclusiveMinimum normalizes for integer members", func(t *testing.T) {
+		p := spec.Param{Type: "string"}
+		member := &openapi3.Schema{
+			Type:         &openapi3.Types{openapi3.TypeInteger},
+			Min:          f(0),
+			ExclusiveMin: openapi3.ExclusiveBound{Bool: &tru},
+		}
+		setParamMinimum(&p, &openapi3.Schema{AllOf: openapi3.SchemaRefs{{Value: member}}})
+		require.NotNil(t, p.Minimum)
+		assert.Equal(t, 1.0, *p.Minimum)
+	})
+
+	t.Run("allOf exclusive bound can beat a lower inclusive minimum", func(t *testing.T) {
+		p := spec.Param{Type: "int"}
+		setParamMinimum(&p, &openapi3.Schema{
+			Min: f(1),
+			AllOf: openapi3.SchemaRefs{{
+				Value: &openapi3.Schema{ExclusiveMin: openapi3.ExclusiveBound{Value: f(1.2)}},
+			}},
+		})
+		require.NotNil(t, p.Minimum)
+		assert.Equal(t, 2.0, *p.Minimum)
+	})
+
+	t.Run("non-integer allOf keeps the inclusive floor", func(t *testing.T) {
+		p := spec.Param{Type: "number"}
+		setParamMinimum(&p, &openapi3.Schema{
+			Min: f(0),
+			AllOf: openapi3.SchemaRefs{{
+				Value: &openapi3.Schema{Min: f(2.5), ExclusiveMin: openapi3.ExclusiveBound{Bool: &tru}},
+			}},
+		})
+		require.NotNil(t, p.Minimum)
+		assert.Equal(t, 2.5, *p.Minimum)
+	})
+
+	t.Run("non-finite allOf bound loses to a finite sibling", func(t *testing.T) {
+		nan := math.NaN()
+		p := spec.Param{Type: "int"}
+		setParamMinimum(&p, &openapi3.Schema{
+			Min: &nan,
+			AllOf: openapi3.SchemaRefs{
+				{Value: &openapi3.Schema{Min: &nan}},
+				{Value: &openapi3.Schema{Min: f(4)}},
+			},
+		})
+		require.NotNil(t, p.Minimum)
+		assert.Equal(t, 4.0, *p.Minimum)
+	})
+
+	t.Run("cyclic allOf does not recurse forever", func(t *testing.T) {
+		schema := &openapi3.Schema{Min: f(2)}
+		schema.AllOf = openapi3.SchemaRefs{{Value: schema}}
+		p := spec.Param{Type: "int"}
+		assert.NotPanics(t, func() { setParamMinimum(&p, schema) })
+		require.NotNil(t, p.Minimum)
+		assert.Equal(t, 2.0, *p.Minimum)
 	})
 }

@@ -25,7 +25,8 @@ Present via `AskUserQuestion`:
 There is no skip option when an API key is available. Phase 5 auto-skips ONLY
 when the API requires auth AND no key is available: display "No API key
 available — skipping live dogfood testing. The CLI was verified against exit
-codes and dry-run only."
+codes and dry-run only." Record that skip with the Step 4
+`dogfood --write-skip` command. Do not hand-write `phase5-skip.json`.
 
 For APIs with `auth.type: none` (or no auth section in the spec), Phase 5
 is MANDATORY — the API is freely testable without any credentials. Do not
@@ -38,10 +39,8 @@ RFC1918/private hostnames, localhost-shaped appliance endpoints). If Phase 5
 cannot reach the hardware because the generation host is not on that LAN, do
 not fabricate an API-key skip and do not hand-author `phase5-acceptance.json`.
 Ask the user whether to hold the CLI or skip live dogfood and promote anyway.
-Only when the user explicitly chooses the skip/promote path, write
-`phase5-skip.json` with `skip_reason:
-"lan-unreachable-from-generation-host"`, `auth_context.type: "none"`, and
-`auth_context.local_network_only: true`.
+Only when the user explicitly chooses the skip/promote path, record it with
+the Step 4 command for `lan-unreachable-from-generation-host`.
 
 Do NOT proceed without asking. Do NOT substitute an ad-hoc smoke test. If some commands cannot be exercised because fixture values are missing, classify them as `BLOCKED_FIXTURE` and file/fix the machine gap; do not use that as a reason to recommend Quick.
 
@@ -95,7 +94,7 @@ with that diagnosis instead of recording hundreds of command failures; the
 operator's stored refresh token may have been revoked and needs a fresh login.
 
 The live dogfood runner enumerates the CLI's `agent-context` command tree,
-runs help, happy-path, JSON-fidelity, and error-path checks where applicable,
+runs help, happy-path, JSON-fidelity, error-path, and write read-back checks where applicable,
 captures subprocess exit codes directly without shell pipes, and emits a
 structured report with pass/fail/skipped counts. Before running the matrix, it
 atomically rebuilds a selected binary that is older than the CLI's Go sources;
@@ -103,11 +102,31 @@ binaries at least as new as the sources are reused. Save the JSON report to:
 
 `$PROOFS_DIR/<stamp>-dogfood-results.json`
 
+A declared nonzero exit can count as a successful happy path and JSON check
+when it returns a nonempty JSON outcome without an error envelope (for example
+a documented NO-GO verdict). A usage error or silent declared exit does not
+establish real coverage. HTTP 403/404 responses that explicitly say a feature
+is not enabled for the current account are skipped with the live response
+retained as evidence; an ordinary missing resource remains a failure. Inspect
+that evidence rather than manually changing a failed row to skipped.
+
 If the command exits non-zero, inspect the structured failures, fix the CLI, and
 rerun live dogfood. The runner writes `phase5-acceptance.json` on every outcome
 (`status: "pass"` on success, `status: "fail"` with a `failure_summary` block on
 failure), so the [Phase 5.6](20-promote-and-archive.md) gate always has a marker to read. Do not hand-edit
-`phase5-acceptance.json`; it must come from the runner.
+`phase5-acceptance.json`; it must come from the runner. Re-running `shipcheck` after a passing marker does not pass `verify --fix` while that fingerprint matches the tree. `shipcheck --fix` still repairs source and warns that the marker must be re-minted.
+
+When `hollow_features` lists a mutating novel command that only previews unless
+a confirm flag is passed, annotate it `pp:preview-happy-path` (see
+[Phase 3](11-build-the-goat.md)) and rerun without `--allow-destructive`; the
+runner runs that preview for real. When a failure is an endpoint input no
+portable fixture can satisfy (a continuation cursor, an account-specific path,
+a resource URL), declare it as `--flag=example-value` in `pp:happy-args` so the
+row lands as `blocked-fixture` instead of baking real account data into the CLI.
+When publish validate reports hollow coverage for a command the live matrix
+skipped on a positional, the detail names `pp:happy-args`. Set that annotation
+to a real positional. When every positional is optional, flags alone are enough.
+A novel command with no fixture stays hollow.
 
 **Quick check (auto-selected test subset):**
 1. `doctor` — auth valid, API reachable.
@@ -122,6 +141,7 @@ failure), so the [Phase 5.6](20-promote-and-archive.md) gate always has a marker
 - For every command that takes an arg, one error-path test.
 - For every command that supports `--json`, one JSON parse validation.
 - For write-side commands (when API key + user consent): create test entity with obviously-test data, verify in subsequent list/get, test one mutation, verify change.
+- A live create/update that exits 0 records a `write_readback` row. The row passes when a sibling get/show of the created or targeted id shows one submitted field holding that value, or a modification timestamp advanced while the field stayed unchanged. It fails with `mutation reported success but read-back shows field "<name>" unchanged` only when a pre-read shows every comparable field still holding its previous value. The row is skipped, and does not fail the matrix, when no sibling read exists, the id cannot be determined, the submitted field is absent from the read, the value was normalized or transformed, another submitted field shows the write landed, or the read itself fails.
 
 ### Context budget for long matrices
 
@@ -183,9 +203,11 @@ keep PII out of the acceptance report from the moment you write it.
 ```bash
 "$PRINTING_PRESS_BIN" lock release --cli <api>-pp-cli
 ```
-The working copy remains in `$CLI_WORK_DIR`. Proceed to [Phase 5.6](20-promote-and-archive.md) to archive
-manuscripts (archiving still happens on hold). Tag the failure reason in the
-acceptance report so the next run can learn from it.
+The working copy remains in `$CLI_WORK_DIR`. Record the `18→20` hold handoff in
+the completion block below, then proceed to [Phase 5.6](20-promote-and-archive.md)
+to archive manuscripts (archiving still happens on hold). Do not follow the
+canonical `Next:` pointer. Tag the failure reason in the acceptance report so
+the next run can learn from it.
 
 See [references/dogfood-testing.md](../references/dogfood-testing.md) for additional
 guidance on common failure patterns and what NOT to test.
@@ -226,70 +248,59 @@ For `level: "quick"`, `tests_failed` may be `1` only when the Quick Check
 threshold still passed (`matrix_size: 6`, `tests_passed >= 5`) and the miss was
 not auth or sync related. For `level: "full"`, `tests_failed` must be `0`.
 
-If Phase 5 is legitimately skipped because the API requires API-key or bearer
-auth and no credential was available, write:
+**Proof-backed coverage for state-dependent features.** A novel command
+annotated `pp:verified-by-proof` (see [Phase 3](11-build-the-goat.md)) is
+listed as `"proof_covered_features": [{"command": "<cmd>", "proof": "<file>.md"}]`
+instead of in `hollow_features` when its proof file sits in `$PROOFS_DIR` beside
+the acceptance marker. Write that proof before running `dogfood --live`. It
+must record:
+- every command run for the write lifecycle, verbatim, with its exit code
+  (the write that creates the state, the state-dependent command itself, and
+  any verification read);
+- the sandbox used (a disposable folder, test account, or scratch resource,
+  described generically, never real account data or PII);
+- the cleanup performed and its result.
 
-`$PROOFS_DIR/phase5-skip.json`
+Use it only for features that need state a prior real write created. It is not
+a substitute for a runnable happy path, and the gate fails if a listed proof
+file is missing beside `phase5-acceptance.json`.
 
-```json
-{
-  "schema_version": 1,
-  "api_name": "<api>",
-  "run_id": "<run-id>",
-  "status": "skip",
-  "level": "none",
-  "skip_reason": "auth_required_no_credential",
-  "auth_context": {
-    "type": "api_key|bearer_token|oauth2",
-    "api_key_available": false,
-    "browser_session_available": false
-  }
-}
+If Phase 5 is legitimately skipped because the API requires API-key, bearer,
+or OAuth2 auth (`api_key`, `bearer_token`, `oauth2`, `oauth2_refresh`) and no
+credential was available, record the skip with the
+Printing Press. Do not hand-author the marker and do not compute a digest.
+`<AUTH_ENV>` is the credential variable from `.printing-press.json`
+(`auth_env_vars`). The command refuses when that variable, or any manifest
+credential variable, is set, and it refuses this reason for `none`, `cookie`,
+`composed`, and `session_handshake` auth. The marker includes
+`source_fingerprint` and `source_files`. A later `.go` edit makes it stale;
+rerun the command after the tree is final.
+
+```bash
+"$PRINTING_PRESS_BIN" dogfood \
+  --dir "$CLI_WORK_DIR" \
+  --write-skip "$PROOFS_DIR/phase5-skip.json" \
+  --reason auth_required_no_credential \
+  --auth-env "<AUTH_ENV>"
 ```
 
 If Phase 5 is legitimately skipped because a no-auth API is LAN-only and the
-generation host cannot reach the user's LAN hardware, write:
+generation host cannot reach the user's LAN hardware, record that skip the
+same way. The command sets `auth_context.local_network_only` and the
+fingerprint.
 
-`$PROOFS_DIR/phase5-skip.json`
-
-```json
-{
-  "schema_version": 1,
-  "api_name": "<api>",
-  "run_id": "<run-id>",
-  "status": "skip",
-  "level": "none",
-  "skip_reason": "lan-unreachable-from-generation-host",
-  "auth_context": {
-    "type": "none",
-    "api_key_available": false,
-    "browser_session_available": false,
-    "local_network_only": true
-  }
-}
+```bash
+"$PRINTING_PRESS_BIN" dogfood \
+  --dir "$CLI_WORK_DIR" \
+  --write-skip "$PROOFS_DIR/phase5-skip.json" \
+  --reason lan-unreachable-from-generation-host
 ```
 
 If a cookie / composed / session-handshake CLI could not be exercised because
 no captured session was available to the harness (the sandboxed HOME has no
-cookie jar, so every command 401s), the runner writes this skip marker for you
-on a `skip-cookie-auth-no-session` verdict — do not hand-author it:
-
-`$PROOFS_DIR/phase5-skip.json`
-
-```json
-{
-  "schema_version": 1,
-  "api_name": "<api>",
-  "run_id": "<run-id>",
-  "status": "skip",
-  "level": "none",
-  "skip_reason": "cookie-auth-no-harness-session",
-  "auth_context": {
-    "type": "cookie|composed|session_handshake",
-    "browser_session_available": false
-  }
-}
-```
+cookie jar, so every command 401s), `dogfood --live` writes `phase5-skip.json`
+on a `skip-cookie-auth-no-session` verdict. Do not hand-author that marker,
+and do not pass `cookie-auth-no-harness-session` to `--write-skip`.
 
 Prefer the inject-session path in Step 2 (pass the captured session via the
 `<API>_CONFIG` override) so the matrix runs for real; the skip is the floor when
@@ -302,9 +313,22 @@ the LAN-only carve-out above. Do **not** use missing API key
 session-handshake auth; inject the session, or rely on the runner-emitted
 `cookie-auth-no-harness-session` skip when none is available.
 
-Before following `Next:`, record the durable handoff and point `--evidence` at
-the live dogfood acceptance JSON. If dogfood used an allowed skip, record it
-with `--skip --note "<allowed reason>"` and point at the skip marker instead:
+**Run exactly one of the two completion blocks.**
+
+On a hold, after the gate still fails and the lock is released, record the
+archive handoff instead of following `Next:`. Point `--evidence` at the failed
+acceptance marker:
+
+```bash
+"$PRINTING_PRESS_BIN" phase-receipt complete --file "$PHASE_RECEIPT_LOG" --run-id "$RUN_ID" --phase "18-dogfood-testing" --next "20-promote-and-archive" --evidence "$PROOFS_DIR/phase5-acceptance.json" --note "hold: <one-line reason>"
+```
+
+Then proceed to [Phase 5.6](20-promote-and-archive.md).
+
+On a pass, or an allowed skip, record the canonical handoff before following
+`Next:`. Point `--evidence` at the live dogfood acceptance JSON. If dogfood used
+an allowed skip, record it with `--skip --note "<allowed reason>"` and point at
+the skip marker instead:
 
 ```bash
 "$PRINTING_PRESS_BIN" phase-receipt complete --file "$PHASE_RECEIPT_LOG" --run-id "$RUN_ID" --phase "18-dogfood-testing" --evidence "$PROOFS_DIR/phase5-acceptance.json"

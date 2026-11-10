@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"go/ast"
 	"go/parser"
+	"go/scanner"
 	"go/token"
 	"os"
 	"os/exec"
@@ -17,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/mvanhorn/cli-printing-press/v4/internal/artifacts"
 	"github.com/mvanhorn/cli-printing-press/v4/internal/naming"
@@ -200,13 +202,14 @@ type PipelineResult struct {
 }
 
 type ExampleCheckResult struct {
-	Tested        int      `json:"tested"`
-	WithExamples  int      `json:"with_examples"`
-	ValidExamples int      `json:"valid_examples"`
-	InvalidFlags  []string `json:"invalid_flags,omitempty"`
-	Missing       []string `json:"missing,omitempty"`
-	Skipped       bool     `json:"skipped,omitempty"`
-	Detail        string   `json:"detail"`
+	Tested             int      `json:"tested"`
+	WithExamples       int      `json:"with_examples"`
+	ValidExamples      int      `json:"valid_examples"`
+	InvalidFlags       []string `json:"invalid_flags,omitempty"`
+	Missing            []string `json:"missing,omitempty"`
+	OmittedUnderivable []string `json:"omitted_underivable,omitempty"`
+	Skipped            bool     `json:"skipped,omitempty"`
+	Detail             string   `json:"detail"`
 }
 
 type dogfoodAgentContext struct {
@@ -248,12 +251,17 @@ type WorkflowCompleteResult struct {
 }
 
 type openAPISpec struct {
+	Parsed                 *apispec.APISpec
 	Paths                  []string
 	Auth                   apispec.AuthConfig
 	Kind                   string // see apispec.KindREST / apispec.KindSynthetic
 	HTTPTransport          string
 	OAuthScopeRequirements []oauthScopeRequirement
-	NestedDataEnvelopes    map[string]nestedDataEnvelopeFixture
+	NestedDataEnvelopes    map[responseFixtureKey]nestedDataEnvelopeFixture
+	// SyncRequests are the method and path pairs bare sync issues. The mock
+	// row check uses these so a fixture for a different operation cannot
+	// raise the expected count.
+	SyncRequests []responseFixtureKey
 	// ParamDefaults maps a positional placeholder name (lowercase) to its
 	// spec-declared default value, when one is set. Verify mock-mode uses
 	// this as the first step in its lookup chain so spec authors can name
@@ -270,10 +278,29 @@ type openAPISpec struct {
 	// records the dimension as unscored). Surfaced by hackernews retro
 	// #350 finding F8.
 	IsInternalYAML bool
+	// Populated from the spec's cli_description so checkDescriptionDrift can
+	// accept root.Short values the template renders from it, not only the
+	// headline.
+	CLIDescription string
+}
+
+type responseFixtureKind string
+
+const (
+	responseFixtureNestedDataObject responseFixtureKind = "nested-data-object"
+	responseFixtureTopLevel         responseFixtureKind = "top-level"
+	responseFixtureDataArray        responseFixtureKind = "data-array"
+)
+
+type responseFixtureKey struct {
+	Method string
+	Path   string
 }
 
 type nestedDataEnvelopeFixture struct {
+	Kind     responseFixtureKind
 	ArrayKey string
+	Scalars  map[string]any
 }
 
 func (s *openAPISpec) IsSynthetic() bool {
@@ -323,12 +350,14 @@ func RunDogfood(dir, specPath string, opts ...DogfoodOption) (*DogfoodReport, er
 	}
 
 	var spec *openAPISpec
+	var parsedSpec *apispec.APISpec
 	if specPath != "" {
 		loaded, err := loadDogfoodOpenAPISpec(specPath, dogfoodAuthPreferenceFromManifest(dir))
 		if err != nil {
 			return nil, err
 		}
 		spec = loaded
+		parsedSpec = loaded.Parsed
 
 		if spec.IsSynthetic() {
 			// Synthetic CLIs intentionally go beyond the spec; strict
@@ -385,7 +414,7 @@ func RunDogfood(dir, specPath string, opts ...DogfoodOption) (*DogfoodReport, er
 	report.DeadFlags = checkDeadFlags(dir)
 	report.DeadFuncs = checkDeadFunctions(dir)
 	report.PipelineCheck = checkPipelineIntegrity(dir)
-	report.ExampleCheck = checkExamples(dir)
+	report.ExampleCheck = checkExamples(dir, parsedSpec)
 	report.WiringCheck = checkWiring(dir)
 	report.NovelFeaturesCheck = checkNovelFeaturesOpts(dir, cfg.researchDir, cfg.overwriteCommandMirror)
 	report.MCPSurfaceParityCheck = checkMCPSurfaceParity(dir)
@@ -394,7 +423,11 @@ func RunDogfood(dir, specPath string, opts ...DogfoodOption) (*DogfoodReport, er
 		specPaths = []string{specPath}
 	}
 	report.ReimplementationCheck = checkReimplementationWithHostGate(dir, cfg.researchDir, specPaths, dnsNovelHostResolver)
-	if drift := checkDescriptionDrift(dir, cfg.researchDir); shouldReportDescriptionDrift(drift) {
+	var specCLIDescription string
+	if spec != nil {
+		specCLIDescription = spec.CLIDescription
+	}
+	if drift := checkDescriptionDrift(dir, cfg.researchDir, specCLIDescription); shouldReportDescriptionDrift(drift) {
 		report.DescriptionDriftCheck = &drift
 	}
 	report.SourceClientCheck = checkSourceClients(dir)
@@ -556,7 +589,7 @@ func checkNovelFeaturesOpts(cliDir, researchDir string, overwriteCommandMirror b
 		} else if changed {
 			fmt.Fprintln(os.Stderr, "dogfood: synced .printing-press.json (novel_features) from novel_features_built")
 		}
-		if artifacts, err := syncCLITranscendenceDocs(cliDir, built, overwriteCommandMirror); err != nil {
+		if artifacts, err := syncCLITranscendenceDocs(cliDir, built, overwriteCommandMirror, len(research.Alternatives) > 0); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: could not sync transcendence docs: %v\n", err)
 		} else {
 			for _, artifact := range artifacts {
@@ -1232,7 +1265,9 @@ func loadDogfoodOpenAPISpec(specPath string, authPreference string) (*openAPISpe
 		if err != nil {
 			return nil, fmt.Errorf("parsing internal YAML spec: %w", err)
 		}
-		return internalSpecToDogfoodSpec(internal), nil
+		summary := internalSpecToDogfoodSpec(internal)
+		summary.Parsed = internal
+		return summary, nil
 	}
 
 	summary, summaryErr := loadOpenAPISpecData(data, specPath)
@@ -1248,10 +1283,12 @@ func loadDogfoodOpenAPISpec(specPath string, authPreference string) (*openAPISpe
 			scopeRequirements = summary.OAuthScopeRequirements
 		}
 		return &openAPISpec{
+			Parsed:                 parsed,
 			Paths:                  collectDogfoodSpecPaths(parsed.Resources),
 			Auth:                   parsed.Auth,
 			OAuthScopeRequirements: scopeRequirements,
 			NestedDataEnvelopes:    nestedDataEnvelopes,
+			SyncRequests:           defaultSyncRequestKeys(parsed, nestedDataEnvelopes),
 		}, nil
 	}
 
@@ -2169,97 +2206,21 @@ func checkDeadFlags(dir string) DeadCodeResult {
 }
 
 func checkDeadFunctions(dir string) DeadCodeResult {
-	helpersPath := filepath.Join(dir, "internal", "cli", "helpers.go")
-	data, err := os.ReadFile(helpersPath)
-	if err != nil {
+	cliDir := filepath.Join(dir, "internal", "cli")
+	helpersPath := filepath.Join(cliDir, "helpers.go")
+	if _, err := os.Stat(helpersPath); err != nil {
 		return DeadCodeResult{}
 	}
 
-	funcRe := regexp.MustCompile(`(?m)^func\s+([A-Za-z_]\w*)\s*\(`)
-	matches := funcRe.FindAllStringSubmatch(string(data), -1)
-	if len(matches) == 0 {
-		return DeadCodeResult{}
-	}
+	useFiles := append(listGoFiles(cliDir), listGoTestFiles(cliDir)...)
+	// MCP search/sql call CLI helpers such as MCPStorePath. The CLI-only
+	// scan would mark that export dead and drop the dead-code score.
+	mcpDir := filepath.Join(dir, "internal", "mcp")
+	useFiles = append(useFiles, listGoFiles(mcpDir)...)
+	useFiles = append(useFiles, listGoTestFiles(mcpDir)...)
 
-	names := make(map[string]struct{})
-	for _, match := range matches {
-		if isAllowedDeadHelper(match[1]) {
-			continue
-		}
-		names[match[1]] = struct{}{}
-	}
-
-	// Collect external sources (everything except helpers.go) for liveness seeding.
-	files := listGoFiles(filepath.Join(dir, "internal", "cli"))
-	var externalSources []string
-	for _, file := range files {
-		if filepath.Base(file) == "helpers.go" {
-			continue
-		}
-		content, err := os.ReadFile(file)
-		if err != nil {
-			continue
-		}
-		externalSources = append(externalSources, string(content))
-	}
-
-	// Seed live set: functions called from external (non-helpers) files.
-	liveSet := make(map[string]bool)
-	for _, name := range sortedKeys(names) {
-		callRe := regexp.MustCompile(`\b` + regexp.QuoteMeta(name) + `\s*\(`)
-		if slices.ContainsFunc(externalSources, callRe.MatchString) {
-			liveSet[name] = true
-		}
-	}
-
-	// Build intra-helpers call map: for each helper function, which other
-	// helper functions does its body call?
-	helperBodies := extractFunctionBodies(string(data))
-	callsMap := make(map[string][]string)
-	for _, caller := range sortedKeys(names) {
-		body, ok := helperBodies[caller]
-		if !ok {
-			continue
-		}
-		for _, callee := range sortedKeys(names) {
-			if callee == caller {
-				continue
-			}
-			callRe := regexp.MustCompile(`\b` + regexp.QuoteMeta(callee) + `\s*\(`)
-			if callRe.MatchString(body) {
-				callsMap[caller] = append(callsMap[caller], callee)
-			}
-		}
-	}
-
-	// Iterative expansion: mark transitively reachable helpers as live.
-	for range 50 {
-		changed := false
-		for _, fn := range sortedKeys(names) {
-			if !liveSet[fn] {
-				continue
-			}
-			for _, callee := range callsMap[fn] {
-				if !liveSet[callee] {
-					liveSet[callee] = true
-					changed = true
-				}
-			}
-		}
-		if !changed {
-			break
-		}
-	}
-
-	result := DeadCodeResult{Total: len(names)}
-	for _, name := range sortedKeys(names) {
-		if liveSet[name] {
-			continue
-		}
-		result.Dead++
-		result.Items = append(result.Items, name)
-	}
-	return result
+	candidates, dead := scanFuncUses([]string{helpersPath}, useFiles)
+	return DeadCodeResult{Total: len(candidates), Dead: len(dead), Items: dead}
 }
 
 // checkNamingConsistency walks the generated CLI source and reports any
@@ -2364,27 +2325,6 @@ func lookupNamingRule(name, category string) (NamingRule, bool) {
 		}
 	}
 	return NamingRule{}, false
-}
-
-// extractFunctionBodies returns a map from function name to its body text
-// (everything between its func line and the next top-level func line).
-func extractFunctionBodies(source string) map[string]string {
-	bodies := make(map[string]string)
-	funcLineRe := regexp.MustCompile(`(?m)^func\s+([A-Za-z_]\w*)\s*\(`)
-	locs := funcLineRe.FindAllStringIndex(source, -1)
-	nameMatches := funcLineRe.FindAllStringSubmatch(source, -1)
-	for i, match := range nameMatches {
-		name := match[1]
-		start := locs[i][1]
-		var end int
-		if i+1 < len(locs) {
-			end = locs[i+1][0]
-		} else {
-			end = len(source)
-		}
-		bodies[name] = source[start:end]
-	}
-	return bodies
 }
 
 // generatorEmittedPackages names internal/* packages emitted by the Printing
@@ -2604,7 +2544,12 @@ func hasPopulatedSyncResources(syncSource string) bool {
 
 var rootShortLiteralRe = regexp.MustCompile(`Short:\s*(` + "`[^`]*`" + `|"(?:\\.|[^"])*")`)
 
-func checkDescriptionDrift(cliDir, researchDir string) DescriptionDriftResult {
+// checkDescriptionDrift compares the descriptions in the generated CLI against
+// research.json. cliDescription is the spec's cli_description field (empty when
+// the spec is absent or not an internal YAML spec); it is accepted as a valid
+// root.Short value alongside the headline because the root.go template renders
+// Short from cli_description when the spec sets one.
+func checkDescriptionDrift(cliDir, researchDir, cliDescription string) DescriptionDriftResult {
 	if researchDir == "" {
 		return DescriptionDriftResult{Skipped: true}
 	}
@@ -2630,7 +2575,7 @@ func checkDescriptionDrift(cliDir, researchDir string) DescriptionDriftResult {
 		})
 	}
 	rootPath := filepath.Join(cliDir, "internal", "cli", "root.go")
-	if actual, ok := readRootShort(rootPath); ok && !descriptionSurfaceMatches(actual, expected) {
+	if actual, ok := readRootShort(rootPath); ok && !rootShortMatches(actual, expected, cliDescription) {
 		result.Findings = append(result.Findings, DescriptionDriftFinding{
 			Surface:  "root.Short",
 			File:     filepath.Join("internal", "cli", "root.go"),
@@ -2639,6 +2584,47 @@ func checkDescriptionDrift(cliDir, researchDir string) DescriptionDriftResult {
 		})
 	}
 	return result
+}
+
+// Two sources are valid: the research headline (existing behaviour) and the
+// rendered form of cli_description — accepted because the template prefers it
+// over the headline when the spec provides it.
+func rootShortMatches(actual, expected, cliDescription string) bool {
+	if descriptionSurfaceMatches(actual, expected) {
+		return true
+	}
+	if cliDescription == "" {
+		return false
+	}
+	rendered := renderRootShortFromCLIDescription(cliDescription)
+	return descriptionSurfaceMatches(actual, rendered)
+}
+
+// Mirrors truncateWords(200)+goRawSafe from the root.go template so the drift
+// checker can compare against the exact string the template would emit rather
+// than the raw spec field.
+func renderRootShortFromCLIDescription(cliDescription string) string {
+	if cliDescription == "" {
+		return ""
+	}
+	runes := []rune(cliDescription)
+	const max = 200
+	truncated := cliDescription
+	if len(runes) > max {
+		cut := runes[:max-1]
+		boundary := -1
+		for i := len(cut) - 1; i >= 0; i-- {
+			if unicode.IsSpace(cut[i]) {
+				boundary = i
+				break
+			}
+		}
+		if boundary > 0 {
+			cut = cut[:boundary]
+		}
+		truncated = strings.TrimRightFunc(string(cut), unicode.IsSpace) + "…"
+	}
+	return strings.ReplaceAll(truncated, "`", "'")
 }
 
 func readManifestDescription(path string) (string, bool) {
@@ -2961,7 +2947,7 @@ func mcpSurfaceCheckActive(result MCPSurfaceResult) bool {
 	return result.State != ""
 }
 
-func checkExamples(dir string) ExampleCheckResult {
+func checkExamples(dir string, parsedSpec *apispec.APISpec) ExampleCheckResult {
 	result := ExampleCheckResult{}
 
 	cliName := findCLIName(dir)
@@ -2995,7 +2981,9 @@ func checkExamples(dir string) ExampleCheckResult {
 		return result
 	}
 
-	for _, parts := range commandPaths {
+	specEndpoints := liveDogfoodSpecEndpoints(parsedSpec)
+	for _, command := range commandPaths {
+		parts := command.Path
 		result.Tested++
 		cmdLabel := strings.Join(parts, " ")
 
@@ -3008,6 +2996,11 @@ func checkExamples(dir string) ExampleCheckResult {
 
 		examples := extractExamplesSection(cmdOut)
 		if examples == "" {
+			if liveDogfoodOmittedExampleSkipReason(liveDogfoodCommand{Path: parts, Annotations: command.Annotations}, specEndpoints) != "" {
+				result.Tested--
+				result.OmittedUnderivable = append(result.OmittedUnderivable, cmdLabel)
+				continue
+			}
 			result.Missing = append(result.Missing, cmdLabel)
 			continue
 		}
@@ -3040,6 +3033,7 @@ func checkExamples(dir string) ExampleCheckResult {
 
 	result.InvalidFlags = uniqueSorted(result.InvalidFlags)
 	result.Missing = uniqueSorted(result.Missing)
+	result.OmittedUnderivable = uniqueSorted(result.OmittedUnderivable)
 
 	if result.Tested == 0 {
 		result.Detail = "no endpoint commands found to test"
@@ -3053,7 +3047,7 @@ func checkExamples(dir string) ExampleCheckResult {
 	return result
 }
 
-func discoverExampleCheckCommands(binaryPath string) ([][]string, error) {
+func discoverExampleCheckCommands(binaryPath string) ([]dogfoodAgentCommandPath, error) {
 	out, err := runStdoutOnly(binaryPath, 15*time.Second, "agent-context")
 	if err != nil {
 		// Device CLIs (and any CLI lacking agent-context) enumerate via --help.
@@ -3061,16 +3055,20 @@ func discoverExampleCheckCommands(binaryPath string) ([][]string, error) {
 			if len(paths) > 10 {
 				paths = sampleEvenlyCommandPaths(paths, 10)
 			}
-			return paths, nil
+			commands := make([]dogfoodAgentCommandPath, 0, len(paths))
+			for _, path := range paths {
+				commands = append(commands, dogfoodAgentCommandPath{Path: path})
+			}
+			return commands, nil
 		}
 		return nil, fmt.Errorf("agent-context failed: %w", err)
 	}
-	paths, err := dogfoodExampleCommandPathsFromAgentContext(out)
+	paths, err := dogfoodExampleCommandPathsWithAnnotationsFromAgentContext(out)
 	if err != nil {
 		return nil, err
 	}
 	if len(paths) > 10 {
-		paths = sampleEvenlyCommandPaths(paths, 10)
+		paths = sampleEvenlyAgentCommandPaths(paths, 10)
 	}
 	return paths, nil
 }
@@ -3614,6 +3612,16 @@ func extractCommandNames(helpOutput string) []string {
 	return cmds
 }
 
+// configFieldNameRe is the shape of a config key. Dots and hyphens appear in
+// viper-style keys. Spaces and expression punctuation are not keys; a
+// quote-to-quote scan used to report the Go between adjacent literals as one.
+var configFieldNameRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_.-]*$`)
+
+// Free literals on a matching line are kept only when they look like a
+// credential key. Explicit config.Set / viper captures skip this filter, so a
+// key such as "timeout" still counts.
+var configFieldKeywordRe = regexp.MustCompile(`(?i)token|credential|secret|key|auth`)
+
 // checkConfigConsistency scans CLI source for token/credential write and read
 // sites, then verifies they reference the same config field names.
 func checkConfigConsistency(dir string) ConfigConsistResult {
@@ -3646,9 +3654,6 @@ func checkConfigConsistency(dir string) ConfigConsistResult {
 		regexp.MustCompile(`(?i)viper\.Get\s*\(\s*"([^"]+)"`),
 	}
 
-	// Also look for string literals that name token fields
-	fieldExtractRe := regexp.MustCompile(`"([^"]*(?i:token|credential|secret|key|auth)[^"]*)"`)
-
 	writeFields := make(map[string]struct{})
 	readFields := make(map[string]struct{})
 
@@ -3659,8 +3664,8 @@ func checkConfigConsistency(dir string) ConfigConsistResult {
 		}
 		content := string(data)
 
-		collectConfigFields(content, writePatterns, fieldExtractRe, writeFields)
-		collectConfigFields(content, readPatterns, fieldExtractRe, readFields)
+		collectConfigFields(content, writePatterns, writeFields)
+		collectConfigFields(content, readPatterns, readFields)
 	}
 
 	result.WriteFields = sortedKeys(writeFields)
@@ -3695,7 +3700,7 @@ func checkConfigConsistency(dir string) ConfigConsistResult {
 	return result
 }
 
-func collectConfigFields(content string, patterns []*regexp.Regexp, fieldExtractRe *regexp.Regexp, fields map[string]struct{}) {
+func collectConfigFields(content string, patterns []*regexp.Regexp, fields map[string]struct{}) {
 	for _, pat := range patterns {
 		if !pat.MatchString(content) {
 			continue
@@ -3703,19 +3708,53 @@ func collectConfigFields(content string, patterns []*regexp.Regexp, fieldExtract
 		matches := pat.FindAllStringSubmatch(content, -1)
 		for _, m := range matches {
 			if len(m) > 1 && m[1] != "" {
-				fields[m[1]] = struct{}{}
+				addConfigField(fields, m[1])
 			}
 		}
 		for line := range strings.SplitSeq(content, "\n") {
 			if !pat.MatchString(line) {
 				continue
 			}
-			fieldMatches := fieldExtractRe.FindAllStringSubmatch(line, -1)
-			for _, fm := range fieldMatches {
-				fields[fm[1]] = struct{}{}
+			for _, lit := range goStringLiterals(line) {
+				if configFieldKeywordRe.MatchString(lit) {
+					addConfigField(fields, lit)
+				}
 			}
 		}
 	}
+}
+
+func addConfigField(fields map[string]struct{}, name string) {
+	name = strings.TrimSpace(name)
+	if name == "" || !configFieldNameRe.MatchString(name) {
+		return
+	}
+	fields[name] = struct{}{}
+}
+
+// Quote-to-quote matching treats the closer of "" and the opener of the next
+// "" as one string, so SaveTokens("", "", token, "") looked like a field.
+func goStringLiterals(line string) []string {
+	var sc scanner.Scanner
+	fs := token.NewFileSet()
+	file := fs.AddFile("", fs.Base(), len(line))
+	sc.Init(file, []byte(line), func(token.Position, string) {}, 0)
+	var lits []string
+	for {
+		_, tok, lit := sc.Scan()
+		if tok == token.EOF {
+			break
+		}
+		if tok != token.STRING {
+			continue
+		}
+		val, err := strconv.Unquote(lit)
+		if err != nil {
+			continue
+		}
+		lits = append(lits, val)
+	}
+	return lits
 }
 
 // workflowManifest represents the structure of workflow_verify.yaml.

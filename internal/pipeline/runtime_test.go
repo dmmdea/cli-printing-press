@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	apispec "github.com/mvanhorn/cli-printing-press/v4/internal/spec"
@@ -125,7 +126,7 @@ func TestRunBrowserSessionProofTestRequiresValidDoctorProof(t *testing.T) {
 	result := runBrowserSessionProofTest(binary, apispec.AuthConfig{
 		RequiresBrowserSession:       true,
 		BrowserSessionValidationPath: "/api/items",
-	})
+	}, nil)
 
 	assert.Equal(t, 0, result.Score)
 	assert.False(t, result.Execute)
@@ -138,7 +139,7 @@ func TestRunBrowserSessionProofTestPassesValidDoctorProof(t *testing.T) {
 	result := runBrowserSessionProofTest(binary, apispec.AuthConfig{
 		RequiresBrowserSession:       true,
 		BrowserSessionValidationPath: "/api/items",
-	})
+	}, nil)
 
 	assert.Equal(t, 3, result.Score)
 	assert.True(t, result.Execute)
@@ -168,7 +169,7 @@ func TestRunBrowserSessionProofTestPropagatesVerifyEnv(t *testing.T) {
 	result := runBrowserSessionProofTest(binary, apispec.AuthConfig{
 		RequiresBrowserSession:       true,
 		BrowserSessionValidationPath: "/api/items",
-	})
+	}, nil)
 
 	assert.Equal(t, 3, result.Score)
 	assert.True(t, result.Execute)
@@ -179,7 +180,7 @@ func TestRunCommandTestsExecutesMockReadCommands(t *testing.T) {
 	binary := buildCommandProbeBinary(t)
 	cmd := discoveredCommand{Name: "items", Kind: "read"}
 
-	result := runCommandTests(binary, cmd, "mock", os.Environ(), false)
+	result := runCommandTests(binary, cmd, "mock", os.Environ(), false, true)
 	assert.True(t, result.Help)
 	assert.True(t, result.DryRun)
 	assert.False(t, result.Execute)
@@ -196,7 +197,7 @@ func TestRunCommandTestsUsesHappyArgsAnnotation(t *testing.T) {
 		},
 	}
 
-	result := runCommandTests(binary, cmd, "mock", os.Environ(), false)
+	result := runCommandTests(binary, cmd, "mock", os.Environ(), false, true)
 
 	assert.True(t, result.Help)
 	assert.True(t, result.DryRun)
@@ -217,7 +218,7 @@ func TestRunCommandTestsUsesSafeHappyArgsArgv(t *testing.T) {
 		},
 	}
 
-	result := runCommandTests(binary, cmd, "mock", env, false)
+	result := runCommandTests(binary, cmd, "mock", env, false, true)
 
 	assert.True(t, result.Help)
 	assert.True(t, result.DryRun)
@@ -232,8 +233,9 @@ func TestRunCommandTestsUsesSafeHappyArgsArgv(t *testing.T) {
 func TestRunDataPipelineTestMockModeRequiresRows(t *testing.T) {
 	t.Run("fails when sync creates tables but stores no rows", func(t *testing.T) {
 		binary := buildDataPipelineProbeBinary(t, 0)
+		dir := seedRunnableSyncProbeCLI(t, "items")
 
-		pass, detail := runDataPipelineTest(binary, "", "mock", os.Environ, 2)
+		pass, detail := runDataPipelineTest(binary, dir, "mock", os.Environ, 2)
 
 		assert.False(t, pass)
 		assert.Contains(t, detail, "1 domain tables created but 0 rows after sync")
@@ -241,8 +243,9 @@ func TestRunDataPipelineTestMockModeRequiresRows(t *testing.T) {
 
 	t.Run("fails when nested mock sync stores fewer rows than served", func(t *testing.T) {
 		binary := buildDataPipelineProbeBinary(t, 1)
+		dir := seedRunnableSyncProbeCLI(t, "items")
 
-		pass, detail := runDataPipelineTest(binary, "", "mock", os.Environ, 2)
+		pass, detail := runDataPipelineTest(binary, dir, "mock", os.Environ, 2)
 
 		assert.False(t, pass)
 		assert.Contains(t, detail, "items has 1 rows after sync, expected at least 2")
@@ -250,8 +253,9 @@ func TestRunDataPipelineTestMockModeRequiresRows(t *testing.T) {
 
 	t.Run("passes when sync stores rows", func(t *testing.T) {
 		binary := buildDataPipelineProbeBinary(t, 2)
+		dir := seedRunnableSyncProbeCLI(t, "items")
 
-		pass, detail := runDataPipelineTest(binary, "", "mock", os.Environ, 2)
+		pass, detail := runDataPipelineTest(binary, dir, "mock", os.Environ, 2)
 
 		assert.True(t, pass)
 		assert.Contains(t, detail, "items has 2 rows")
@@ -259,8 +263,9 @@ func TestRunDataPipelineTestMockModeRequiresRows(t *testing.T) {
 
 	t.Run("falls back when sync rejects full flag", func(t *testing.T) {
 		binary := buildNoFullSyncDataPipelineProbeBinary(t, 2)
+		dir := seedRunnableSyncProbeCLI(t, "items")
 
-		pass, detail := runDataPipelineTest(binary, "", "mock", os.Environ, 2)
+		pass, detail := runDataPipelineTest(binary, dir, "mock", os.Environ, 2)
 
 		assert.True(t, pass)
 		assert.Contains(t, detail, "items has 2 rows")
@@ -268,8 +273,9 @@ func TestRunDataPipelineTestMockModeRequiresRows(t *testing.T) {
 
 	t.Run("reports unknown sync flag distinctly", func(t *testing.T) {
 		binary := buildUnknownFlagSyncDataPipelineProbeBinary(t)
+		dir := seedRunnableSyncProbeCLI(t, "items")
 
-		pass, detail := runDataPipelineTest(binary, "", "mock", os.Environ, 2)
+		pass, detail := runDataPipelineTest(binary, dir, "mock", os.Environ, 2)
 
 		assert.False(t, pass)
 		assert.Equal(t, "FAIL: sync rejected flag --full", detail)
@@ -288,8 +294,9 @@ func TestRunDataPipelineTestMockModeRequiresRows(t *testing.T) {
 
 	t.Run("passes when an auxiliary table is empty before populated data table", func(t *testing.T) {
 		binary := buildAuxiliaryFirstDataPipelineProbeBinary(t, 0, 2)
+		dir := seedRunnableSyncProbeCLI(t, "items")
 
-		pass, detail := runDataPipelineTest(binary, "", "mock", os.Environ, 2)
+		pass, detail := runDataPipelineTest(binary, dir, "mock", os.Environ, 2)
 
 		assert.True(t, pass)
 		assert.Contains(t, detail, "items has 2 rows")
@@ -297,8 +304,9 @@ func TestRunDataPipelineTestMockModeRequiresRows(t *testing.T) {
 
 	t.Run("passes when an auxiliary table has fewer rows before populated data table", func(t *testing.T) {
 		binary := buildAuxiliaryFirstDataPipelineProbeBinary(t, 1, 2)
+		dir := seedRunnableSyncProbeCLI(t, "items")
 
-		pass, detail := runDataPipelineTest(binary, "", "mock", os.Environ, 2)
+		pass, detail := runDataPipelineTest(binary, dir, "mock", os.Environ, 2)
 
 		assert.True(t, pass)
 		assert.Contains(t, detail, "items has 2 rows")
@@ -306,8 +314,9 @@ func TestRunDataPipelineTestMockModeRequiresRows(t *testing.T) {
 
 	t.Run("fails when only an auxiliary table satisfies expected rows", func(t *testing.T) {
 		binary := buildAuxiliaryFirstDataPipelineProbeBinary(t, 3, 0)
+		dir := seedRunnableSyncProbeCLI(t, "items")
 
-		pass, detail := runDataPipelineTest(binary, "", "mock", os.Environ, 2)
+		pass, detail := runDataPipelineTest(binary, dir, "mock", os.Environ, 2)
 
 		assert.False(t, pass)
 		assert.Contains(t, detail, "items has 0 rows")
@@ -315,8 +324,9 @@ func TestRunDataPipelineTestMockModeRequiresRows(t *testing.T) {
 
 	t.Run("warns when sync command is absent", func(t *testing.T) {
 		binary := buildNoSyncDataPipelineProbeBinary(t)
+		dir := seedRunnableSyncProbeCLI(t, "items")
 
-		pass, detail := runDataPipelineTest(binary, "", "mock", os.Environ, 2)
+		pass, detail := runDataPipelineTest(binary, dir, "mock", os.Environ, 2)
 
 		assert.True(t, pass)
 		assert.Equal(t, "WARN: no sync command — data-pipeline check skipped", detail)
@@ -324,8 +334,9 @@ func TestRunDataPipelineTestMockModeRequiresRows(t *testing.T) {
 
 	t.Run("fails when sync command exists but crashes", func(t *testing.T) {
 		binary := buildFailingSyncDataPipelineProbeBinary(t)
+		dir := seedRunnableSyncProbeCLI(t, "items")
 
-		pass, detail := runDataPipelineTest(binary, "", "mock", os.Environ, 2)
+		pass, detail := runDataPipelineTest(binary, dir, "mock", os.Environ, 2)
 
 		assert.False(t, pass)
 		assert.Equal(t, "FAIL: sync crashed", detail)
@@ -334,8 +345,9 @@ func TestRunDataPipelineTestMockModeRequiresRows(t *testing.T) {
 
 func TestRunDataPipelineTestBoundsLiveSync(t *testing.T) {
 	binary := buildLiveBoundedSyncProbeBinary(t)
+	dir := seedRunnableSyncProbeCLI(t, "repos", "issues")
 
-	pass, detail := runDataPipelineTest(binary, "", "live", os.Environ, 1)
+	pass, detail := runDataPipelineTest(binary, dir, "live", os.Environ, 1)
 
 	assert.True(t, pass)
 	assert.Contains(t, detail, "items has 1 rows")
@@ -383,16 +395,17 @@ func TestRunDataPipelineTestSkipsUnsyncableCLIs(t *testing.T) {
 		assert.Contains(t, detail, "items has 2 rows")
 	})
 
-	t.Run("mock mode skips row requirement for stores without syncable resources", func(t *testing.T) {
+	t.Run("refuses unscoped sync when no syncable resources are declared", func(t *testing.T) {
 		dir := seedDataPipelineCLIDir(t, true)
 		require.NoError(t, WriteCLIManifest(dir, CLIManifest{SpecFormat: "browser-sniff"}))
 		seedDataPipelineStore(t, dir, false)
-		binary := buildDataPipelineProbeBinary(t, 0)
+		binary := buildFailingSyncDataPipelineProbeBinary(t)
 
 		pass, detail := runDataPipelineTest(binary, dir, "mock", os.Environ, 2)
 
-		assert.True(t, pass)
-		assert.Equal(t, "PASS: 1 domain tables created (mock mode; no syncable resources declared)", detail)
+		assert.False(t, pass)
+		assert.Contains(t, detail, "no safe sync resource")
+		assert.Contains(t, detail, "refusing unscoped sync")
 	})
 
 	t.Run("mock mode skips graphql sync data pipeline", func(t *testing.T) {
@@ -547,7 +560,7 @@ paths:
 	assert.Len(t, body, 1)
 }
 
-func TestDetectNestedDataEnvelopeFixturesSortsHTTPMethods(t *testing.T) {
+func TestDetectResponseFixturesKeepsEachMethod(t *testing.T) {
 	spec := []byte(`openapi: 3.0.0
 info:
   title: Method Order API
@@ -590,8 +603,13 @@ paths:
 
 	fixtures := detectNestedDataEnvelopeFixtures(spec)
 
-	require.Contains(t, fixtures, "/items")
-	assert.Equal(t, "items", fixtures["/items"].ArrayKey)
+	getKey := responseFixtureKey{Method: http.MethodGet, Path: "/items"}
+	patchKey := responseFixtureKey{Method: http.MethodPatch, Path: "/items"}
+	require.Contains(t, fixtures, getKey)
+	require.Contains(t, fixtures, patchKey)
+	assert.Equal(t, responseFixtureNestedDataObject, fixtures[getKey].Kind)
+	assert.Equal(t, "items", fixtures[getKey].ArrayKey)
+	assert.Equal(t, "results", fixtures[patchKey].ArrayKey)
 }
 
 func TestRunCommandTestsWithoutHappyArgsKeepsGenericFailure(t *testing.T) {
@@ -602,7 +620,7 @@ func TestRunCommandTestsWithoutHappyArgsKeepsGenericFailure(t *testing.T) {
 		Args: []string{"mock-value"},
 	}
 
-	result := runCommandTests(binary, cmd, "mock", os.Environ(), false)
+	result := runCommandTests(binary, cmd, "mock", os.Environ(), false, true)
 
 	assert.True(t, result.Help)
 	assert.False(t, result.DryRun)
@@ -901,6 +919,10 @@ func main() {
 			fmt.Fprintln(os.Stderr, "live sync probe requires --max-pages 1")
 			os.Exit(1)
 		}
+		if !hasFlagValue(args[1:], "--resources", "repos") {
+			fmt.Fprintln(os.Stderr, "live sync probe requires --resources repos")
+			os.Exit(1)
+		}
 		dbPath := dbArg(args[1:])
 		if dbPath == "" {
 			os.Exit(1)
@@ -1112,6 +1134,30 @@ func defaultSyncResources() []string {
 	writeTestFile(t, filepath.Join(storeDir, "store.go"), content)
 }
 
+// seedRunnableSyncProbeCLI is a printed-CLI tree whose sync command, store,
+// and declared resources let the data-pipeline probe run a scoped sync.
+func seedRunnableSyncProbeCLI(t *testing.T, resources ...string) string {
+	t.Helper()
+
+	dir := seedDataPipelineCLIDir(t, true)
+	require.NoError(t, WriteCLIManifest(dir, CLIManifest{SpecFormat: "openapi3"}))
+	seedDataPipelineStore(t, dir, false)
+	writeDefaultSyncResources(t, dir, resources...)
+	return dir
+}
+
+func writeDefaultSyncResources(t *testing.T, dir string, resources ...string) {
+	t.Helper()
+
+	var body strings.Builder
+	body.WriteString("package cli\n\nfunc defaultSyncResources() []string {\n\treturn []string{\n")
+	for _, resource := range resources {
+		fmt.Fprintf(&body, "\t\t%q,\n", resource)
+	}
+	body.WriteString("\t}\n}\n")
+	writeTestFile(t, filepath.Join(dir, "internal", "cli", "sync.go"), body.String())
+}
+
 func buildAuxiliaryFirstDataPipelineProbeBinary(t *testing.T, settingsRows, itemRows int) string {
 	t.Helper()
 
@@ -1278,7 +1324,7 @@ func main() {
 	out, err := buildCmd.CombinedOutput()
 	require.NoError(t, err, "building test binary: %s", string(out))
 
-	commands := discoverCommands(dir, binaryPath)
+	commands := discoverCommands(dir, binaryPath, nil)
 
 	// Should use help output: iecon-items-440 (not camelToKebab's iecon-items440).
 	assert.Len(t, commands, 2)
@@ -1301,7 +1347,7 @@ func initRoot() {
 `)
 
 	// Pass a non-existent binary path — should fall back to source parsing.
-	commands := discoverCommands(dir, "/nonexistent/binary")
+	commands := discoverCommands(dir, "/nonexistent/binary", nil)
 
 	assert.Len(t, commands, 2)
 	names := make([]string, len(commands))
@@ -1321,7 +1367,7 @@ func initRoot() {
 }
 `)
 
-	commands := discoverCommands(dir, "")
+	commands := discoverCommands(dir, "", nil)
 	assert.Len(t, commands, 1)
 	assert.Equal(t, "users-list", commands[0].Name)
 }
@@ -1521,6 +1567,16 @@ func TestClassifyCommandKindUsesEndpointMutationAnnotations(t *testing.T) {
 	assert.Equal(t, "read", readOnlyPost.Kind)
 }
 
+func TestDryRunProbeEnvSetsVerifyOnlyForLive(t *testing.T) {
+	base := []string{"PATH=/usr/bin", "PRINTING_PRESS_VERIFY=", "KEEP=1"}
+
+	assert.Equal(t, base, dryRunProbeEnv("mock", base))
+
+	live := dryRunProbeEnv("live", base)
+	assert.Equal(t, []string{"PATH=/usr/bin", "KEEP=1", "PRINTING_PRESS_VERIFY=1"}, live)
+	assert.Equal(t, []string{"PATH=/usr/bin", "PRINTING_PRESS_VERIFY=", "KEEP=1"}, base, "live probe must not mutate the execute env")
+}
+
 func TestRunCommandTestsSkipsLiveWriteExecuteUnlessAllowed(t *testing.T) {
 	binary := buildHappyArgsProbeBinary(t)
 	logFile := filepath.Join(t.TempDir(), "probe.log")
@@ -1533,13 +1589,13 @@ func TestRunCommandTestsSkipsLiveWriteExecuteUnlessAllowed(t *testing.T) {
 		},
 	}
 
-	result := runCommandTests(binary, cmd, "live", env, false)
+	result := runCommandTests(binary, cmd, "live", env, false, true)
 	require.True(t, result.Execute, "live write execute is treated as skipped/pass")
 	assert.Equal(t, 3, result.Score)
 	assert.NotContains(t, readProbeLog(t, logFile), "whereabouts Alice --query sunset --json")
 
 	require.NoError(t, os.Remove(logFile))
-	result = runCommandTests(binary, cmd, "live", env, true)
+	result = runCommandTests(binary, cmd, "live", env, true, true)
 	require.True(t, result.Execute)
 	assert.Equal(t, 3, result.Score)
 	assert.Contains(t, readProbeLog(t, logFile), "whereabouts Alice --query sunset --json")
@@ -1685,7 +1741,7 @@ Usage:
 Examples:
   fixture-pp-cli open recipes-1`)
 	cmd := &discoveredCommand{Name: "open"}
-	assert.True(t, helpScanIndicatesSideEffect(binaryPath, cmd),
+	assert.True(t, helpScanIndicatesSideEffect(binaryPath, cmd, nil),
 		"help text mentioning 'browser' should be classified as side-effecting")
 }
 
@@ -1698,7 +1754,7 @@ Usage:
 Examples:
   fixture-pp-cli list --json`)
 	cmd := &discoveredCommand{Name: "list"}
-	assert.False(t, helpScanIndicatesSideEffect(binaryPath, cmd),
+	assert.False(t, helpScanIndicatesSideEffect(binaryPath, cmd, nil),
 		"benign help text should not be classified as side-effecting")
 }
 
@@ -2053,7 +2109,7 @@ func TestRequiredFlagsRegex(t *testing.T) {
 
 func TestInferRequiredFlags_UnknownBinaryReturnsNil(t *testing.T) {
 	// Probing a non-existent binary should return nil cleanly, not panic or hang.
-	result := inferRequiredFlags("/nonexistent/binary/path", "somecmd")
+	result := inferRequiredFlags("/nonexistent/binary/path", "somecmd", nil)
 	assert.Nil(t, result)
 }
 
@@ -2270,6 +2326,12 @@ func Load() *Config {
 	if v := os.Getenv("SHOPIFY_BASE_URL"); v != "" {
 		cfg.BaseURL = v
 	}
+	if v := cliutil.EnvOverride("SHOPIFY_CA_CERT"); v != "" {
+		cfg.CACert = v
+	}
+	if v := cliutil.EnvOverride("SHOPIFY_TLS_SERVER_NAME"); v != "" {
+		cfg.ServerName = v
+	}
 	if cfg.TemplateVars == nil {
 		cfg.TemplateVars = map[string]string{}
 	}
@@ -2291,4 +2353,33 @@ func Load() *Config {
 	gotTemplate := discoverCLITemplateVarEnvs(dir)
 	assert.ElementsMatch(t, []string{"SHOPIFY_SHOP", "SHOPIFY_API_VERSION"}, gotTemplate,
 		"discoverCLITemplateVarEnvs must return the template-var env names so mock mode can inject placeholder values")
+}
+
+func TestVerifyEnvPrefixUsesManifestAPIName(t *testing.T) {
+	t.Run("manifest wins over the folder name", func(t *testing.T) {
+		dir := filepath.Join(t.TempDir(), "renamed-copy")
+		require.NoError(t, os.MkdirAll(dir, 0o755))
+		require.NoError(t, WriteCLIManifest(dir, CLIManifest{APIName: "petstore", CLIName: "petstore-pp-cli"}))
+		assert.Equal(t, "PETSTORE", verifyEnvPrefix(dir))
+	})
+
+	t.Run("hyphenated API name matches the generated config", func(t *testing.T) {
+		dir := filepath.Join(t.TempDir(), "anything")
+		require.NoError(t, os.MkdirAll(dir, 0o755))
+		require.NoError(t, WriteCLIManifest(dir, CLIManifest{APIName: "cal-com", CLIName: "cal-com-pp-cli"}))
+		assert.Equal(t, "CAL_COM", verifyEnvPrefix(dir))
+	})
+
+	t.Run("no manifest falls back to the folder name", func(t *testing.T) {
+		dir := filepath.Join(t.TempDir(), "petstore-pp-cli")
+		require.NoError(t, os.MkdirAll(dir, 0o755))
+		assert.Equal(t, "PETSTORE", verifyEnvPrefix(dir))
+	})
+
+	t.Run("manifest without an API name falls back to the folder name", func(t *testing.T) {
+		dir := filepath.Join(t.TempDir(), "my-api")
+		require.NoError(t, os.MkdirAll(dir, 0o755))
+		require.NoError(t, WriteCLIManifest(dir, CLIManifest{CLIName: "other-pp-cli"}))
+		assert.Equal(t, "MY_API", verifyEnvPrefix(dir))
+	})
 }

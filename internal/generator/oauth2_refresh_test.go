@@ -35,7 +35,7 @@ func TestGenerateOAuth2RefreshAuth(t *testing.T) {
 	readme := readGeneratedFile(t, outputDir, "README.md")
 	skill := readGeneratedFile(t, outputDir, "SKILL.md")
 
-	assert.Contains(t, configSrc, `c.AuthSource = "oauth2_refresh"`)
+	assert.Contains(t, configSrc, `c.stampAuthSource("oauth2_refresh", true)`)
 	assert.Contains(t, configSrc, `return "Bearer " + c.AccessToken`)
 	assert.NotContains(t, configSrc, `c.AuthSource = "bearer_refresh"`)
 	assert.Contains(t, clientSrc, `"grant_type":    {"refresh_token"}`)
@@ -48,12 +48,13 @@ func TestGenerateOAuth2RefreshAuth(t *testing.T) {
 	assert.Contains(t, doctorSrc, `refresh token is configured but OAuth2 client ID is missing`)
 	assert.Contains(t, doctorSrc, `report["auth"] = "configured (oauth2 refresh)"`)
 	assert.Contains(t, doctorSrc, `report["auth_source"] = cfg.AuthSource`)
-	assert.Contains(t, doctorSrc, `report["auth_hint"] = "export OAUTH_REFRESH_REFRESH_TOKEN=<your-oauth-refresh-value>"`)
-	assert.NotContains(t, doctorSrc, `report["auth_hint"] = "export OAUTH_REFRESH_CLIENT_ID=<your-oauth-refresh-value>"`)
+	assert.Contains(t, doctorSrc, `report["auth_hint"] = cliutil.EnvAssignHint(false, "OAUTH_REFRESH_REFRESH_TOKEN", "<your-oauth-refresh-value>")`)
+	assert.NotContains(t, doctorSrc, `cliutil.EnvAssignHint(false, "OAUTH_REFRESH_CLIENT_ID", "<your-oauth-refresh-value>")`)
 	assert.Contains(t, readme, "This CLI uses OAuth2 with refresh-token rotation.")
 	assert.Contains(t, skill, "This CLI uses OAuth2 with refresh-token rotation.")
 
 	writeOAuth2RefreshRuntimeTest(t, outputDir)
+	requireGeneratedCompiles(t, outputDir)
 	runGoCommand(t, outputDir, "test", "./internal/client", "-run", "^TestOAuth2Refresh(TokenUsedBeforeRequest|AfterUnauthorizedPersistsRotatedTokens)$")
 }
 

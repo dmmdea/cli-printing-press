@@ -34,7 +34,7 @@ var infraCoreFiles = map[string]bool{
 var infraAllFiles = map[string]bool{
 	"helpers.go": true, "root.go": true, "doctor.go": true, "auth.go": true,
 	"export.go": true, "import.go": true, "search.go": true, "sync.go": true,
-	"tail.go": true, "analytics.go": true,
+	"tail.go": true, "analytics.go": true, "local_data.go": true,
 }
 
 var actionableDoctorSuggestionRE = regexp.MustCompile(`(?i)\b(run|try)\b.{0,80}\bdoctor\b`)
@@ -1400,7 +1400,7 @@ func recomputeScorecardTotals(sc *Scorecard) {
 		sc.Steinberger.AgentWorkflow,
 	)
 
-	tier1Max := scorecardTierMax(sc, 200, DimMCPDescriptionQuality, DimMCPTokenEfficiency, DimCacheFreshness, DimMCPRemoteTransport, DimMCPToolDesign, DimMCPSurfaceStrategy, DimLocalCache, DimVision, DimWorkflows, DimInsight, DimAgentWorkflow)
+	tier1Max, tier2Max := ScorecardTierDenominators(sc)
 	tier1Normalized := 0
 	if tier1Max > 0 {
 		tier1Normalized = (tier1Raw * 50) / tier1Max
@@ -1416,13 +1416,23 @@ func recomputeScorecardTotals(sc *Scorecard) {
 		sc.Steinberger.LiveAPIVerification,
 	)
 
-	tier2Max := scorecardTierMax(sc, 60, DimLiveAPIVerification, DimPathValidity, DimAuthProtocol, DimSyncCorrectness, DimDataPipelineIntegrity, DimTypeFidelity)
 	tier2Normalized := 0
 	if tier2Max > 0 {
 		tier2Normalized = (tier2Raw * 50) / tier2Max
 	}
 	sc.Steinberger.Total = tier1Normalized + tier2Normalized
 	sc.Steinberger.Percentage = sc.Steinberger.Total
+}
+
+// ScorecardTierDenominators is the pair recomputeScorecardTotals divides by,
+// so a renderer can print the same maxima the total used.
+func ScorecardTierDenominators(sc *Scorecard) (infrastructure, domain int) {
+	if sc == nil {
+		return 0, 0
+	}
+	infrastructure = scorecardTierMax(sc, 200, DimMCPDescriptionQuality, DimMCPTokenEfficiency, DimCacheFreshness, DimMCPRemoteTransport, DimMCPToolDesign, DimMCPSurfaceStrategy, DimLocalCache, DimVision, DimWorkflows, DimInsight, DimAgentWorkflow)
+	domain = scorecardTierMax(sc, 60, DimLiveAPIVerification, DimPathValidity, DimAuthProtocol, DimSyncCorrectness, DimDataPipelineIntegrity, DimTypeFidelity)
+	return infrastructure, domain
 }
 
 func sumScorecardDimensions(scores ...int) (total int) {
@@ -1830,22 +1840,27 @@ func manifestNovelFeatureLeaves(dir string) map[string]bool {
 }
 
 // registeredCommandFiles returns the set of cli/*.go filenames whose command
-// constructor is wired into the Cobra tree through AddCommand calls. Files
-// without a registered constructor should not inflate workflow/insight scores
-// even if they match prefix or behavioral heuristics — they're orphans, dead
-// code, or half-built commands that the user cannot actually invoke.
+// constructor is wired into the Cobra tree. Files without a registered
+// constructor should not inflate workflow/insight scores even if they match
+// prefix or behavioral heuristics — they're orphans, dead code, or
+// half-built commands that the user cannot actually invoke.
 //
-// Returns an empty map if root.go is missing or parsing yields no matches so
-// callers can fall open to the prior heuristic behavior (older or partial CLI
-// trees where the registration graph isn't parseable).
+// Reachability starts at root.go and at every non-test file that calls
+// registerNovelCommand. Hook files are roots because init runs them, and the
+// file often defines no constructor, so a constructor-definition scan never
+// enters it. addNovelCommandIfAbsent inside an already-reachable file counts
+// the same as AddCommand.
+//
+// Returns an empty map if root.go is missing or no registrations are found so
+// callers can fall open for older or partial CLI trees.
 func registeredCommandFiles(cliDir string) map[string]bool {
 	rootContent := readFileContent(filepath.Join(cliDir, "root.go"))
 	if rootContent == "" {
 		return map[string]bool{}
 	}
 
-	reachableCtors := addCommandConstructorCalls(rootContent)
-	if len(reachableCtors) == 0 {
+	entries, err := os.ReadDir(cliDir)
+	if err != nil {
 		return map[string]bool{}
 	}
 
@@ -1853,10 +1868,6 @@ func registeredCommandFiles(cliDir string) map[string]bool {
 	// Re-scan newly reachable command files for child AddCommand calls so
 	// subcommands defined outside root.go still count as user-reachable.
 	defRe := regexp.MustCompile(`^func\s+(new[A-Z][A-Za-z0-9_]*Cmd)\s*\(`)
-	entries, err := os.ReadDir(cliDir)
-	if err != nil {
-		return map[string]bool{}
-	}
 	fileContent := map[string]string{}
 	fileDefs := map[string][]string{}
 	for _, e := range entries {
@@ -1871,6 +1882,14 @@ func registeredCommandFiles(cliDir string) map[string]bool {
 				fileDefs[e.Name()] = append(fileDefs[e.Name()], sm[1])
 			}
 		}
+	}
+
+	reachableCtors := addCommandConstructorCalls(rootContent)
+	for ctor := range novelHookReachableConstructors(fileContent) {
+		reachableCtors[ctor] = true
+	}
+	if len(reachableCtors) == 0 {
+		return map[string]bool{}
 	}
 
 	result := make(map[string]bool)
@@ -1899,6 +1918,161 @@ func registeredCommandFiles(cliDir string) map[string]bool {
 		}
 	}
 	return result
+}
+
+// novelHookReachableConstructors returns constructors passed to AddCommand or
+// addNovelCommandIfAbsent from registerNovelCommand hook files. A hook file is
+// a root even when the callback is a named function, or a package-level
+// variable holding a function literal, in another file: init registers it,
+// and that other file may itself define no constructor.
+func novelHookReachableConstructors(fileContent map[string]string) map[string]bool {
+	type hookIndex struct {
+		calls   bool
+		callees []string
+		funcs   []string
+	}
+	indexed := make(map[string]hookIndex, len(fileContent))
+	definedIn := map[string][]string{}
+	for name, content := range fileContent {
+		if strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		calls, callees, funcs := indexNovelHookFile(content)
+		indexed[name] = hookIndex{calls: calls, callees: callees, funcs: funcs}
+		for _, fn := range funcs {
+			definedIn[fn] = append(definedIn[fn], name)
+		}
+	}
+
+	rooted := map[string]bool{}
+	for name, idx := range indexed {
+		if !idx.calls {
+			continue
+		}
+		rooted[name] = true
+		for _, callee := range idx.callees {
+			for _, file := range definedIn[callee] {
+				rooted[file] = true
+			}
+		}
+	}
+
+	ctors := map[string]bool{}
+	for name := range rooted {
+		for ctor := range addCommandConstructorCalls(fileContent[name]) {
+			ctors[ctor] = true
+		}
+	}
+	return ctors
+}
+
+func indexNovelHookFile(content string) (calls bool, callees []string, funcs []string) {
+	file, err := parser.ParseFile(token.NewFileSet(), "", content, parser.SkipObjectResolution)
+	if err != nil {
+		return false, nil, nil
+	}
+	funcs = novelHookFuncNames(file)
+	ast.Inspect(file, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		ident, ok := call.Fun.(*ast.Ident)
+		if !ok || ident.Name != "registerNovelCommand" || len(call.Args) != 1 {
+			return true
+		}
+		calls = true
+		if arg, ok := call.Args[0].(*ast.Ident); ok && arg.Name != "" {
+			callees = append(callees, arg.Name)
+		}
+		return true
+	})
+	return calls, callees, funcs
+}
+
+// novelHookFuncNames lists names another file can pass to registerNovelCommand:
+// package-level funcs, and package-level variables holding a hook literal.
+// Locals are omitted because indexing one would root its file when a real
+// hook reused the name.
+func novelHookFuncNames(file *ast.File) []string {
+	seen := map[string]bool{}
+	var funcs []string
+	add := func(name string) {
+		if name == "" || name == "_" || seen[name] {
+			return
+		}
+		seen[name] = true
+		funcs = append(funcs, name)
+	}
+	pkgVars := map[string]bool{}
+	for _, decl := range file.Decls {
+		switch d := decl.(type) {
+		case *ast.FuncDecl:
+			if d.Recv != nil || d.Name == nil {
+				continue
+			}
+			add(d.Name.Name)
+		case *ast.GenDecl:
+			if d.Tok != token.VAR {
+				continue
+			}
+			for _, spec := range d.Specs {
+				vs, ok := spec.(*ast.ValueSpec)
+				if !ok {
+					continue
+				}
+				for i, name := range vs.Names {
+					if name == nil || name.Name == "" || name.Name == "_" {
+						continue
+					}
+					pkgVars[name.Name] = true
+					if i < len(vs.Values) && isNovelHookFuncLit(vs.Values[i]) {
+						add(name.Name)
+					}
+				}
+			}
+		}
+	}
+	ast.Inspect(file, func(n ast.Node) bool {
+		assign, ok := n.(*ast.AssignStmt)
+		if !ok || assign.Tok != token.ASSIGN {
+			return true
+		}
+		for i, lhs := range assign.Lhs {
+			ident, ok := lhs.(*ast.Ident)
+			if !ok || !pkgVars[ident.Name] || i >= len(assign.Rhs) {
+				continue
+			}
+			if isNovelHookFuncLit(assign.Rhs[i]) {
+				add(ident.Name)
+			}
+		}
+		return true
+	})
+	return funcs
+}
+
+// registerNovelCommand runs func(root *cobra.Command, ...). Other function
+// values are not that callback.
+func isNovelHookFuncLit(expr ast.Expr) bool {
+	lit, ok := expr.(*ast.FuncLit)
+	if !ok || lit.Type == nil || lit.Type.Params == nil || len(lit.Type.Params.List) == 0 {
+		return false
+	}
+	return isStarCobraCommand(lit.Type.Params.List[0].Type)
+}
+
+func isStarCobraCommand(expr ast.Expr) bool {
+	star, ok := expr.(*ast.StarExpr)
+	if !ok {
+		return false
+	}
+	sel, ok := star.X.(*ast.SelectorExpr)
+	if !ok || sel.Sel == nil || sel.Sel.Name != "Command" {
+		return false
+	}
+	pkg, ok := sel.X.(*ast.Ident)
+	return ok && pkg.Name == "cobra"
 }
 
 func addCommandConstructorCalls(content string) map[string]bool {
@@ -2005,7 +2179,7 @@ func scoreWorkflows(dir string) int {
 			continue
 		}
 
-		// If root.go registration is discoverable, require the file to define a
+		// If command registration is discoverable, require the file to define a
 		// registered constructor. Falls open when no registrations are found at
 		// all (older CLIs or partial builds) so we don't zero out scores
 		// unexpectedly.
@@ -2837,6 +3011,14 @@ func scoreAuthScheme(clientContent, configContent, authContent string, hasStruct
 	}
 
 	switch {
+	case strings.EqualFold(scheme.Type, "apikey") && scheme.In == "cookie":
+		// apiKey cookie attachment follows the declared type. Scheme keys such
+		// as bearerSession, botSession, and basicSession stay on this path.
+		scoreable = true
+		if cookieCredentialAttached(clientContent, cookieAuthHeaderName(scheme)) {
+			authHeaderMatched = true
+			headerNameMatched = true
+		}
 	case strings.Contains(nameLower, "bot"):
 		scoreable = true
 		if authPrefixLiteralPresent("Bot", clientContent, configContent, authContent) {
@@ -2862,7 +3044,7 @@ func scoreAuthScheme(clientContent, configContent, authContent string, hasStruct
 		// For apiKey schemes, the header value format varies (Bearer, Bot, custom).
 		// Credit authHeaderMatched if the client sets the correct header name,
 		// since that proves the auth plumbing is wired correctly regardless of format.
-		if (scheme.In == "header" || scheme.In == "cookie") && headerName != "" {
+		if scheme.In == "header" && headerName != "" {
 			if headerAssignmentPresent(clientContent, headerName) {
 				authHeaderMatched = true
 			}
@@ -2899,7 +3081,9 @@ func scoreAuthScheme(clientContent, configContent, authContent string, hasStruct
 	}
 
 	// AuthProtocol pattern: generated clients use Header.Set/Add with the expected header name.
-	if headerAssignmentPresent(clientContent, headerName) {
+	// Cookie-carried schemes use cookieCredentialAttached above; a bare
+	// Header.Set("Cookie") string is not enough there.
+	if scheme.In != "cookie" && headerAssignmentPresent(clientContent, headerName) {
 		headerNameMatched = true
 	}
 
@@ -3498,20 +3682,12 @@ func scoreDeadCode(dir string) int {
 		}
 	}
 
-	funcRe := regexp.MustCompile(`(?m)^func\s+([A-Za-z_]\w*)\s*\(`)
-	funcNames := uniqueMatches(funcRe, helpersContent)
-	otherHelpers := readOtherGoFiles(cliDir, map[string]bool{"helpers.go": true})
-	// Check both other files AND helpers.go itself for intra-file calls.
-	// Use Count >= 2 because the definition itself contributes 1 occurrence of name+"(".
-	allContent := helpersContent + "\n" + otherHelpers
-	for _, name := range funcNames {
-		if isAllowedDeadHelper(name) {
-			continue
-		}
-		if strings.Count(allContent, name+"(") < 2 {
-			deadFunctions++
-		}
-	}
+	useFiles := append(listGoFiles(cliDir), listGoTestFiles(cliDir)...)
+	mcpDir := filepath.Join(dir, "internal", "mcp")
+	useFiles = append(useFiles, listGoFiles(mcpDir)...)
+	useFiles = append(useFiles, listGoTestFiles(mcpDir)...)
+	_, deadNames := scanFuncUses([]string{filepath.Join(cliDir, "helpers.go")}, useFiles)
+	deadFunctions += len(deadNames)
 
 	score := 5 - (deadFlags + deadFunctions)
 	if score < 0 {
@@ -3521,7 +3697,8 @@ func scoreDeadCode(dir string) int {
 }
 
 // sampleCommandFiles reads up to n command files from internal/cli/.
-// If n <= 0, reads all command files.
+// n <= 0 reads all of them. Tests and files with no cobra.Command literal
+// are skipped so they cannot occupy a bounded sample.
 func sampleCommandFiles(dir string, n int) []string {
 	cliDir := filepath.Join(dir, "internal", "cli")
 	entries, err := os.ReadDir(cliDir)
@@ -3530,21 +3707,60 @@ func sampleCommandFiles(dir string, n int) []string {
 	}
 	var files []string
 	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".go") {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
 			continue
 		}
-		if infraAllFiles[e.Name()] {
+		if infraAllFiles[name] {
 			continue
 		}
-		content := readFileContent(filepath.Join(cliDir, e.Name()))
-		if content != "" {
-			files = append(files, content)
+		content := readFileContent(filepath.Join(cliDir, name))
+		if content == "" || !fileHasCobraCommandLiteral(content) {
+			continue
 		}
+		files = append(files, content)
 		if n > 0 && len(files) >= n {
 			break
 		}
 	}
 	return files
+}
+
+// fileHasCobraCommandLiteral reports whether content contains a composite
+// literal of github.com/spf13/cobra Command. The selector is resolved through
+// the file's import specs. Comments, strings, and *cobra.Command signatures
+// do not qualify.
+func fileHasCobraCommandLiteral(content string) bool {
+	file, err := parser.ParseFile(token.NewFileSet(), "", content, parser.SkipObjectResolution)
+	if err != nil {
+		return false
+	}
+	aliases := cobraImportAliases(file)
+	if len(aliases) == 0 {
+		return false
+	}
+	found := false
+	ast.Inspect(file, func(n ast.Node) bool {
+		if found {
+			return false
+		}
+		lit, ok := n.(*ast.CompositeLit)
+		if !ok || !compositeLitIsCobraCommand(lit, aliases) {
+			return true
+		}
+		found = true
+		return false
+	})
+	return found
+}
+
+func compositeLitIsCobraCommand(lit *ast.CompositeLit, cobraAliases map[string]bool) bool {
+	sel, ok := lit.Type.(*ast.SelectorExpr)
+	if !ok || sel.Sel == nil || sel.Sel.Name != "Command" {
+		return false
+	}
+	pkg, ok := sel.X.(*ast.Ident)
+	return ok && cobraAliases[pkg.Name]
 }
 
 func specPathExists(specPaths []string, actual string) bool {
@@ -3977,6 +4193,11 @@ func writeScorecardMD(sc *Scorecard, pipelineDir string) error {
 	var b strings.Builder
 	fmt.Fprintf(&b, "# Scorecard: %s\n\n", sc.APIName)
 	fmt.Fprintf(&b, "**Overall Grade: %s** (%d%%)\n\n", sc.OverallGrade, sc.Steinberger.Percentage)
+	infraMax, domainMax := ScorecardTierDenominators(sc)
+	fmt.Fprintf(&b, "Denominator: infrastructure %d, domain %d\n\n", infraMax, domainMax)
+	if sc.Steinberger.CalibrationNote != "" {
+		fmt.Fprintf(&b, "Calibration: %s\n\n", sc.Steinberger.CalibrationNote)
+	}
 	if len(sc.UnscoredDimensions) > 0 {
 		fmt.Fprintf(&b, "Unscored dimensions omitted from the total denominator: %s\n\n", strings.Join(sc.UnscoredDimensions, ", "))
 	}

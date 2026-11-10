@@ -8,16 +8,16 @@
 
 ### Acceptance gate check
 
-This gate guards **promotion**, so it applies only when the shipcheck verdict is `ship` or `ship-with-gaps`. A `hold` run reaches this phase from [12-shipcheck](12-shipcheck.md) with no dogfood markers by design — it skips promotion entirely, archives manuscripts, and completes canonically to [21-next-steps](21-next-steps.md). A hold must NOT take the backtrack to [18-dogfood-testing](18-dogfood-testing.md) below; its missing markers are expected. The binary rejects `20→18` when this visit arrived on the `12→20` hold jump.
+This gate guards **promotion**, so it applies only when the shipcheck verdict is `ship` or `ship-with-gaps`. A shipcheck `hold` reaches this phase from [12-shipcheck](12-shipcheck.md) with no dogfood markers by design — it skips promotion entirely, archives manuscripts, and completes canonically to [21-next-steps](21-next-steps.md). A dogfood `fail` reaches this phase from [18-dogfood-testing](18-dogfood-testing.md) on the `18→20` hold handoff with a `status: "fail"` marker and does the same: archive, do not promote, and do not backtrack. A hold must NOT take the backtrack to [18-dogfood-testing](18-dogfood-testing.md) below. A shipcheck hold's missing markers are expected, and a dogfood hold already has its failure marker. The binary rejects `20→18` when this visit arrived on the `12→20` hold jump.
 
 For a ship-verdict run, verify the [Phase 5](18-dogfood-testing.md) JSON gate marker before promoting:
 
 - If `$PROOFS_DIR/phase5-acceptance.json` exists with `status: "pass"` → proceed to promote.
 - If `$PROOFS_DIR/phase5-acceptance.json` exists with `status: "fail"` → CLI is on hold. Do NOT promote. Proceed to Archive Manuscripts.
 - If `$PROOFS_DIR/phase5-skip.json` exists and the auth-aware skip is valid → proceed to promote.
-- If neither JSON marker exists → [Phase 5](18-dogfood-testing.md) was skipped or not recorded. Go back and run it, or write the valid skip marker. Do NOT promote without one.
+- If neither JSON marker exists → [Phase 5](18-dogfood-testing.md) was skipped or not recorded. Go back and run it, or record the valid skip with `dogfood --write-skip` as Phase 5 describes. Do NOT promote without one. Do not hand-write the marker.
 
-**Marker invalidation — any source edit after the acceptance run breaks the gate.** The acceptance marker is bound to a source fingerprint (per-file hashes of the CLI tree). If you edit any `.go` file after the live dogfood run — adding a patch, an annotation, or a transport change — `lock promote`, `publish validate`, and `publish package` all fail with "phase5 marker source fingerprint does not match the current CLI source". Re-run live dogfood (with `--write-acceptance`) after EVERY post-acceptance source change, and sync the fresh marker to both locations:
+**Marker invalidation — any source edit after the acceptance run breaks the gate.** The acceptance marker is bound to a source fingerprint (per-file hashes of the CLI tree). If you edit any `.go` file after the live dogfood run — adding a patch, an annotation, or a transport change — `lock promote`, `publish validate`, and `publish package` all fail with "phase5 marker source fingerprint does not match the current CLI source". `shipcheck` omits `verify --fix` when that marker's fingerprint matches the current tree. `shipcheck --fix` still repairs source and warns that the marker was invalidated. Re-run live dogfood (with `--write-acceptance`) after EVERY post-acceptance source change. A skip marker is refreshed the same way with `dogfood --write-skip` after the tree is final. Sync the fresh marker to both locations:
 
 - The **embedded** copy at `$CLI_DIR/.manuscripts/<run>/proofs/` — what `lock promote` checks.
 - The **archived** copy at `$PRESS_MANUSCRIPTS/<api>/<run>/proofs/` — what `publish package` reads first (manuscript lookup is archive-first; phase5-proof lookup is embedded-first, so a stale copy in either blocks promotion or packaging with the same confusing message).
@@ -200,7 +200,7 @@ fi
 
 `ship-with-gaps` is promoted (on either path) because the verdict means "the CLI is shippable with documented, non-blocking gaps" — the gaps are recorded in the README's `## Known Gaps` block and the user opts in via [Phase 6](21-next-steps.md)'s publish prompt. Treating ship-with-gaps as un-promotable would strand the verified working copy and leave the library on a stale prior run.
 
-If the shipcheck verdict is `hold`, the lock was already released in [Phase 4](12-shipcheck.md). Do NOT promote on either path. The working copy stays in `$CLI_WORK_DIR` and is not copied to the library.
+If the shipcheck verdict is `hold`, the lock was already released in [Phase 4](12-shipcheck.md). Do NOT promote on either path. The working copy stays in `$CLI_WORK_DIR` and is not copied to the library. A dogfood hold is the same outcome: [Phase 5](18-dogfood-testing.md) already released the lock, and a `status: "fail"` marker must not promote.
 
 ### Archive Manuscripts
 
@@ -223,6 +223,11 @@ cp -f "$API_RUN_DIR/research.json" "$PRESS_MANUSCRIPTS/$API_SLUG/$RUN_ID/researc
 cp -r "$PROOFS_DIR/." "$PRESS_MANUSCRIPTS/$API_SLUG/$RUN_ID/proofs/" 2>/dev/null || true
 
 # Archive discovery artifacts (browser-sniff captures, URL lists, traffic analysis, browser-sniff report).
+# This local archive keeps raw captures for later runs on this machine.
+# publish package does not ship them: discovery/ in the library package keeps
+# press-authored summaries (markdown reports, traffic-analysis.json,
+# *-provenance.json, and the other summary files the press writes) unless
+# --include-raw-captures is set.
 # Session state lives outside $DISCOVERY_DIR (see 02-run-initialization.md), so the
 # archive cannot pick it up. The legacy rm is a no-op safety net for an
 # in-flight $DISCOVERY_DIR carried over from a pre-isolation run.

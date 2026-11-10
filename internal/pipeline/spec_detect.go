@@ -48,6 +48,7 @@ func internalSpecToDogfoodSpec(s *apispec.APISpec) *openAPISpec {
 		HTTPTransport:  s.EffectiveHTTPTransport(),
 		ParamDefaults:  collectInternalSpecParamDefaults(s),
 		IsInternalYAML: true,
+		CLIDescription: s.CLIDescription,
 	}
 }
 
@@ -149,6 +150,7 @@ func internalSpecToOpenAPISpecInfo(s *apispec.APISpec) *openAPISpecInfo {
 		case "cookie", "composed":
 			scheme.Type = "apikey"
 			scheme.In = "cookie"
+			scheme.HeaderName = cookieAuthScoreHeader(s.Auth)
 		default:
 			scheme.Type = s.Auth.Type
 		}
@@ -159,6 +161,20 @@ func internalSpecToOpenAPISpecInfo(s *apispec.APISpec) *openAPISpecInfo {
 	}
 
 	return info
+}
+
+// cookieAuthScoreHeader is the header auth_protocol looks for. Jar-only
+// cookie auth keeps Cookie. Composed auth with an empty header is emitted
+// as Authorization; any other explicit header is stamped under that name.
+func cookieAuthScoreHeader(auth apispec.AuthConfig) string {
+	header := strings.TrimSpace(auth.Header)
+	if strings.EqualFold(auth.Type, "composed") && header == "" {
+		return "Authorization"
+	}
+	if header == "" {
+		return "Cookie"
+	}
+	return header
 }
 
 func countInternalSpecPositionals(s *apispec.APISpec) int {

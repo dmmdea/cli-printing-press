@@ -144,37 +144,16 @@ func RunVerify(cfg VerifyConfig) (*VerifyReport, error) {
 	// 4. Start mock server if needed
 	var mockServer *httptest.Server
 	var baseURLOverride string
-	apiName := naming.TrimCLISuffix(filepath.Base(cfg.Dir))
+	envPrefix := verifyEnvPrefix(cfg.Dir)
 	envVarName := cfg.EnvVar
 	if envVarName == "" {
-		envVarName = strings.ToUpper(strings.ReplaceAll(apiName, "-", "_")) + "_TOKEN"
+		envVarName = envPrefix + "_TOKEN"
 	}
-	baseURLEnvVar := strings.ToUpper(strings.ReplaceAll(apiName, "-", "_")) + "_BASE_URL"
+	baseURLEnvVar := envPrefix + "_BASE_URL"
 
 	if report.Mode == "mock" {
 		mockServer, baseURLOverride = startMockServer(spec)
 		defer mockServer.Close()
-	}
-
-	// 5. Discover commands
-	commands := discoverCommands(cfg.Dir, binaryPath)
-
-	// 5.5. Infer positional args from --help output. Pass the spec's
-	// ParamDefaults so positionals named in the spec with a `default:`
-	// (e.g., a real recipe slug for food52, a real symbol for a finance
-	// API) win over the generic canonicalargs registry and the legacy
-	// per-name switch.
-	var paramDefaults map[string]string
-	if spec != nil {
-		paramDefaults = spec.ParamDefaults
-	}
-	for i := range commands {
-		inferPositionalArgs(binaryPath, &commands[i], paramDefaults)
-	}
-
-	// 6. Classify and run each command
-	for i := range commands {
-		classifyCommandKind(&commands[i], spec)
 	}
 
 	// Collect auth env var names from the normalized spec model, then augment
@@ -244,7 +223,7 @@ func RunVerify(cfg VerifyConfig) (*VerifyReport, error) {
 		if report.Mode == "live" {
 			for _, ev := range authEnvVars {
 				if val := os.Getenv(ev); val != "" {
-					env = append(env, ev+"="+val)
+					env = putEnv(env, ev, val)
 				}
 			}
 			// Also pass the explicit --api-key under request credential env var
@@ -252,13 +231,13 @@ func RunVerify(cfg VerifyConfig) (*VerifyReport, error) {
 			// OAuth inputs such as client IDs and client secrets.
 			if cfg.APIKey != "" {
 				for _, ev := range requestAuthEnvVars {
-					env = append(env, ev+"="+cfg.APIKey)
+					env = putEnv(env, ev, cfg.APIKey)
 				}
 			}
 		} else {
-			env = append(env, baseURLEnvVar+"="+baseURLOverride)
+			env = putEnv(env, baseURLEnvVar, baseURLOverride)
 			for _, ev := range requestAuthEnvVars {
-				env = append(env, ev+"=mock-token-for-testing")
+				env = putEnv(env, ev, "mock-token-for-testing")
 			}
 			// Templated URLs (e.g. /admin/api/{api_version}/graphql.json)
 			// need every {var} resolved before buildURL succeeds. Without
@@ -267,7 +246,7 @@ func RunVerify(cfg VerifyConfig) (*VerifyReport, error) {
 			// "mock" is opaque to the test server, which echoes whatever
 			// path it receives.
 			for _, ev := range templateVarEnvs {
-				env = append(env, ev+"=mock")
+				env = putEnv(env, ev, "mock")
 			}
 			// Defense-in-depth: every mock-mode subprocess inherits this
 			// env var. Generated commands that perform visible side
@@ -277,7 +256,7 @@ func RunVerify(cfg VerifyConfig) (*VerifyReport, error) {
 			// command itself doesn't spam the user's environment during
 			// verify. Documented in skills/printing-press/SKILL.md and
 			// AGENTS.md.
-			env = append(env, "PRINTING_PRESS_VERIFY=1")
+			env = putEnv(env, "PRINTING_PRESS_VERIFY", "1")
 			// Verify owns its httptest mock-server and needs the real
 			// wire path to assert against, so it opts back in to the
 			// transport-layer mutating-verb gate that every other
@@ -286,33 +265,61 @@ func RunVerify(cfg VerifyConfig) (*VerifyReport, error) {
 			// DELETE/POST/PUT/PATCH and the mock server never sees the
 			// request — collapsing verify's pass-rate signal to zero
 			// for those verbs.
-			env = append(env, "PRINTING_PRESS_VERIFY_LIVE_HTTP=1")
+			env = putEnv(env, "PRINTING_PRESS_VERIFY_LIVE_HTTP", "1")
 		}
 		return env
+	}
+
+	// Command discovery, positional parsing, and the side-effect help
+	// scan all spawn the printed CLI. They get the same env as the
+	// execute probes so a --help walk cannot carry ambient credentials
+	// or a real base URL into mock mode.
+	commands := discoverCommands(cfg.Dir, binaryPath, buildEnv())
+
+	// Infer positional args from --help output. Pass the spec's
+	// ParamDefaults so positionals named in the spec with a `default:`
+	// (e.g., a real recipe slug for food52, a real symbol for a finance
+	// API) win over the generic canonicalargs registry and the legacy
+	// per-name switch.
+	var paramDefaults map[string]string
+	if spec != nil {
+		paramDefaults = spec.ParamDefaults
+	}
+	for i := range commands {
+		inferPositionalArgs(binaryPath, &commands[i], paramDefaults, buildEnv())
+	}
+
+	for i := range commands {
+		classifyCommandKind(&commands[i], spec)
 	}
 
 	// 7. Run tests
 	for i, cmd := range commands {
 		env := buildEnv()
-		// Mock-mode side-effect detection: if the command opens a
-		// browser tab or otherwise performs a visible action that the
-		// PRINTING_PRESS_VERIFY env var alone may not gate, skip its
-		// Execute test to avoid spamming the user's environment during
-		// verify. The DryRun and Help tests still run — those are read-
-		// only by definition.
-		if report.Mode == "mock" && isSideEffectCommand(binaryPath, &commands[i], cfg.Dir) {
+		// Mock mode skips Execute for commands that open a browser or
+		// dial out, because PRINTING_PRESS_VERIFY alone may not gate an
+		// older handler. Live mode still needs that scan when destructive
+		// calls are off: the bare required-flag probe runs the command
+		// body before the execute gate, and a side-effect read would
+		// otherwise dial with the live credential.
+		sideEffect := false
+		if report.Mode == "mock" || (report.Mode == "live" && !cfg.AllowDestructive) {
+			sideEffect = isSideEffectCommand(binaryPath, &commands[i], cfg.Dir, env)
+		}
+		if report.Mode == "mock" && sideEffect {
 			result := runSideEffectSafeCommandTests(binaryPath, commands[i], env)
 			report.Results = append(report.Results, result)
 			continue
 		}
-		result := runCommandTests(binaryPath, cmd, report.Mode, env, cfg.AllowDestructive)
+		result := runCommandTests(binaryPath, cmd, report.Mode, env, cfg.AllowDestructive, bareProbeAllowed(report.Mode, cfg.AllowDestructive, cmd, sideEffect))
 		commands[i] = cmd // preserve classification
 		report.Results = append(report.Results, result)
 	}
 
 	expectedMockRows := 0
-	if report.Mode == "mock" && spec != nil && len(spec.NestedDataEnvelopes) > 0 {
-		expectedMockRows = 2
+	if report.Mode == "mock" {
+		resource, _ := chooseDataPipelineProbeResource(cfg.Dir)
+		expectedMockRows = expectedMockSyncRowsForResource(spec, resource)
 	}
 	if isDeviceCLIDir(cfg.Dir) {
 		// Device CLIs (BLE) have no sync->sql->search data pipeline; running the
@@ -328,7 +335,7 @@ func RunVerify(cfg VerifyConfig) (*VerifyReport, error) {
 
 	if spec != nil && spec.Auth.RequiresBrowserSession {
 		report.BrowserSessionRequired = true
-		browserProof := runBrowserSessionProofTest(binaryPath, spec.Auth)
+		browserProof := runBrowserSessionProofTest(binaryPath, spec.Auth, buildEnv())
 		report.Results = append(report.Results, browserProof)
 		if browserProof.Score >= 2 {
 			report.BrowserSessionProof = "valid"
@@ -497,8 +504,37 @@ func runSideEffectSafeCommandTests(binary string, cmd discoveredCommand, env []s
 	return result
 }
 
+// bareProbeAllowed reports whether required-flag discovery may invoke the
+// command with no arguments. That probe runs the command body before the
+// live execute gate. With a live credential injected, a parameterless
+// mutation (or a side-effect read) would send a real request, so those
+// commands stay unprobed unless destructive calls are allowed. Mock mode
+// still probes them; the mock server absorbs the body.
+//
+// Data-layer commands are not kind write: classification returns before
+// the mutation check, which hides writers such as import. Dry-run and
+// execute are already skipped for that kind, so the bare probe's only
+// effect is to run the body. Kinds other than read and local are denied
+// so a new or missing classification cannot run a live body.
+func bareProbeAllowed(mode string, allowDestructive bool, cmd discoveredCommand, sideEffect bool) bool {
+	if mode != "live" || allowDestructive {
+		return true
+	}
+	if sideEffect {
+		return false
+	}
+	switch cmd.Kind {
+	case "read", "local":
+		return true
+	default:
+		return false
+	}
+}
+
 // runCommandTests executes the test suite for a single command.
-func runCommandTests(binary string, cmd discoveredCommand, mode string, env []string, allowDestructive bool) CommandResult {
+// bareProbe is false when the no-argument required-flag probe would run a
+// live write or side-effect body. Help and dry-run still run.
+func runCommandTests(binary string, cmd discoveredCommand, mode string, env []string, allowDestructive, bareProbe bool) CommandResult {
 	result := CommandResult{
 		Command: cmd.Name,
 		Kind:    cmd.Kind,
@@ -512,7 +548,7 @@ func runCommandTests(binary string, cmd discoveredCommand, mode string, env []st
 	// Get any required flags/args for this command.
 	// First, probe the binary for cobra-declared required flags (generic, spec-agnostic).
 	// Then fall back to the positional-arg map for commands that take bare positionals.
-	positionals, extraFlags := commandInvocationInputs(binary, cmd)
+	positionals, extraFlags := commandInvocationInputs(binary, cmd, env, bareProbe)
 
 	// Build positional args + flags for test invocations
 	buildTestArgs := func(cmdName string, positionalArgs, flags []string, extra ...string) []string {
@@ -522,7 +558,7 @@ func runCommandTests(binary string, cmd discoveredCommand, mode string, env []st
 	// Test 2: --dry-run (skip for local/data-layer commands that don't make API calls)
 	if cmd.Kind != "local" && cmd.Kind != "data-layer" {
 		args := buildTestArgs(cmd.Name, positionals, extraFlags, "--dry-run")
-		err := runCLI(binary, args, env, 10*time.Second)
+		err := runCLI(binary, args, dryRunProbeEnv(mode, env), 10*time.Second)
 		result.DryRun = err == nil || isIntentionalStubExit(err) || isDocumentedSuccessExit(err, typedCodes)
 	} else {
 		result.DryRun = true // skip = pass
@@ -559,6 +595,29 @@ func runCommandTests(binary string, cmd discoveredCommand, mode string, env []st
 	return result
 }
 
+// Live verify's dry-run probe has no real flag values, and required-input
+// checks waive only when PRINTING_PRESS_VERIFY=1. Mock mode already sets
+// that on every subprocess. Execute keeps the caller's env, and an
+// inherited verify assignment is replaced so a non-"1" value cannot win.
+func dryRunProbeEnv(mode string, env []string) []string {
+	if mode != "live" {
+		return env
+	}
+	return putEnv(env, "PRINTING_PRESS_VERIFY", "1")
+}
+
+// browserSessionProofEnv keeps the verify subprocess env and forces
+// PRINTING_PRESS_VERIFY=1. Mock mode therefore still carries the mock base
+// URL and mock credentials; a nil env is the scoped snapshot direct callers
+// already relied on. A stale PRINTING_PRESS_VERIFY=0 in that snapshot is
+// replaced rather than left in front of the forced value.
+func browserSessionProofEnv(env []string) []string {
+	if env == nil {
+		env = subprocessEnv()
+	}
+	return putEnv(env, "PRINTING_PRESS_VERIFY", "1")
+}
+
 func buildRuntimeTestArgs(cmdName string, positionalArgs, flags []string, extra ...string) []string {
 	args := []string{cmdName}
 	if slices.ContainsFunc(positionalArgs, isNegativeNumericArg) {
@@ -582,7 +641,7 @@ func isIntentionalStubExit(err error) bool {
 		strings.Contains(msg, `"cf_gated": true`)
 }
 
-func runBrowserSessionProofTest(binary string, auth apispec.AuthConfig) CommandResult {
+func runBrowserSessionProofTest(binary string, auth apispec.AuthConfig, env []string) CommandResult {
 	result := CommandResult{
 		Command: "browser-session-proof",
 		Kind:    "auth",
@@ -596,15 +655,13 @@ func runBrowserSessionProofTest(binary string, auth apispec.AuthConfig) CommandR
 		return result
 	}
 
-	// cliutil.IsVerifyEnv() drives doctor's synthetic browser-session
-	// proof short-circuit. Without PRINTING_PRESS_VERIFY=1 the probe
-	// asks the CLI to validate against a real session, which a clean
-	// shipcheck environment doesn't have — every cookie-auth CLI then
-	// scores 0 even when the synthetic proof would have passed. Match
-	// the env-augmentation buildEnv() uses for the other mock-mode
-	// probes so this probe is self-contained.
-	env := append(subprocessEnv(), "PRINTING_PRESS_VERIFY=1")
-	output, err := runCLIWithOutput(binary, []string{"doctor", "--json"}, env, 20*time.Second)
+	// Doctor's reachability GET uses cfg.BaseURL. The caller passes the
+	// same env as the rest of this verify run so mock mode hits the
+	// loopback server. VERIFY=1 is forced on top: the synthetic
+	// browser-session proof short-circuit does not run without it, and
+	// a stale PRINTING_PRESS_VERIFY=0 inherited from the operator must
+	// not win.
+	output, err := runCLIWithOutput(binary, []string{"doctor", "--json"}, browserSessionProofEnv(env), 20*time.Second)
 	if err != nil {
 		result.Error = fmt.Sprintf("doctor --json failed: %v", err)
 		result.Score = 0
@@ -652,6 +709,11 @@ func runDataPipelineTest(binary, cliDir, mode string, envFn func() []string, exp
 		}
 	}
 
+	resource, chooseDetail := chooseDataPipelineProbeResource(cliDir)
+	if resource == "" {
+		return false, chooseDetail
+	}
+
 	env := envFn()
 
 	// Create a temp dir for the test database
@@ -664,31 +726,30 @@ func runDataPipelineTest(binary, cliDir, mode string, envFn func() []string, exp
 	dbPath := filepath.Join(tmpDir, "test.db")
 	env = append(env, "HOME="+tmpDir) // so sync uses temp location
 
-	// Test sync (if it exists)
+	// Every attempt keeps --resources. Unknown --full or --db can be
+	// dropped; a missing resource or any other failure must not widen
+	// the probe to the rest of the sync surface.
+	timeout := dataPipelineSyncTimeout(mode)
 	var syncErrors []error
-	syncErr := runCLI(binary, boundedSyncProbeArgs(mode, []string{"sync", "--db", dbPath, "--resources", "repos", "--full"}), env, 30*time.Second)
-	if syncErr != nil {
+	var syncErr error
+	for _, args := range scopedSyncProbeAttempts(dbPath, resource) {
+		if shouldSkipSyncProbeAttempt(args, syncErrors) {
+			continue
+		}
+		syncErr = runCLI(binary, boundedSyncProbeArgs(mode, args), env, timeout)
+		if syncErr == nil {
+			break
+		}
 		syncErrors = append(syncErrors, syncErr)
-		syncErr = runCLI(binary, boundedSyncProbeArgs(mode, []string{"sync", "--db", dbPath, "--full"}), env, 30*time.Second)
+		if isUnknownSyncCommandError(syncErr) {
+			continue
+		}
+		flag, unknown := unknownSyncFlag(syncErr)
+		if !unknown || !canDropSyncProbeFlag(flag) {
+			break
+		}
 	}
 	if syncErr != nil {
-		syncErrors = append(syncErrors, syncErr)
-		// Sync might not accept --resources or --full; keep --db when
-		// possible so downstream sql probes read the same temporary store.
-		syncErr = runCLI(binary, boundedSyncProbeArgs(mode, []string{"sync", "--db", dbPath}), env, 30*time.Second)
-	}
-	if syncErr != nil {
-		syncErrors = append(syncErrors, syncErr)
-		// Sync might not accept --db either; try the bare command before
-		// deciding the pipeline crashed.
-		syncErr = runCLI(binary, boundedSyncProbeArgs(mode, []string{"sync", "--full"}), env, 30*time.Second)
-	}
-	if syncErr != nil {
-		syncErrors = append(syncErrors, syncErr)
-		syncErr = runCLI(binary, boundedSyncProbeArgs(mode, []string{"sync"}), env, 30*time.Second)
-	}
-	if syncErr != nil {
-		syncErrors = append(syncErrors, syncErr)
 		if allSyncAttemptsWereUnknownCommand(syncErrors) {
 			return true, "WARN: no sync command — data-pipeline check skipped"
 		}
@@ -704,7 +765,7 @@ func runDataPipelineTest(binary, cliDir, mode string, envFn func() []string, exp
 	tableQuery := `SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite%' AND name NOT LIKE '%_fts%' AND name != 'sync_state'`
 	tablesOut, sqlErr := runCLIWithOutput(binary, []string{"sql", "--db", dbPath, tableQuery}, env, 10*time.Second)
 	if sqlErr != nil {
-		return true, "PASS: sync completed (sql unavailable, table validation skipped)"
+		return annotateDataPipelineProbe(true, "PASS: sync completed (sql unavailable, table validation skipped)", resource)
 	}
 
 	// Parse table names from output (one per line, skip empty lines and header noise)
@@ -712,10 +773,10 @@ func runDataPipelineTest(binary, cliDir, mode string, envFn func() []string, exp
 	if len(tables) == 0 {
 		// No domain tables found — ambiguous (could be minimal CLI or unusual naming).
 		// Don't fail the pipeline gate; report for human review.
-		return true, "WARN: sync completed but no domain tables found in sqlite_master"
+		return annotateDataPipelineProbe(true, "WARN: sync completed but no domain tables found in sqlite_master", resource)
 	}
 	if mode == "mock" && strings.TrimSpace(cliDir) != "" && !cliHasSyncableResources(cliDir) {
-		return true, fmt.Sprintf("PASS: %d domain tables created (mock mode; no syncable resources declared)", len(tables))
+		return annotateDataPipelineProbe(true, fmt.Sprintf("PASS: %d domain tables created (mock mode; no syncable resources declared)", len(tables)), resource)
 	}
 
 	var bestShortTable string
@@ -745,22 +806,22 @@ func runDataPipelineTest(binary, cliDir, mode string, envFn func() []string, exp
 				}
 				continue
 			}
-			return true, fmt.Sprintf("PASS: %d domain tables, %s has %d rows", len(tables), table, count)
+			return annotateDataPipelineProbe(true, fmt.Sprintf("PASS: %d domain tables, %s has %d rows", len(tables), table, count), resource)
 		}
 		if expectedRows > 0 && zeroDataTable == "" && !isAuxiliaryPipelineTable(table, len(tables)) {
 			zeroDataTable = table
 		}
 	}
 	if bestPassTable != "" {
-		return true, fmt.Sprintf("PASS: %d domain tables, %s has %d rows", len(tables), bestPassTable, bestPassCount)
+		return annotateDataPipelineProbe(true, fmt.Sprintf("PASS: %d domain tables, %s has %d rows", len(tables), bestPassTable, bestPassCount), resource)
 	}
 	if bestShortTable != "" {
-		return false, fmt.Sprintf("FAIL: %s has %d rows after sync, expected at least %d (%s mode)", bestShortTable, bestShortCount, expectedRows, mode)
+		return annotateDataPipelineProbe(false, fmt.Sprintf("FAIL: %s has %d rows after sync, expected at least %d (%s mode)", bestShortTable, bestShortCount, expectedRows, mode), resource)
 	}
 	if zeroDataTable != "" && len(tables) > 1 {
-		return false, fmt.Sprintf("FAIL: %s has 0 rows after sync, expected at least %d (%s mode)", zeroDataTable, expectedRows, mode)
+		return annotateDataPipelineProbe(false, fmt.Sprintf("FAIL: %s has 0 rows after sync, expected at least %d (%s mode)", zeroDataTable, expectedRows, mode), resource)
 	}
-	return false, fmt.Sprintf("FAIL: %d domain tables created but 0 rows after sync (%s mode)", len(tables), mode)
+	return annotateDataPipelineProbe(false, fmt.Sprintf("FAIL: %d domain tables created but 0 rows after sync (%s mode)", len(tables), mode), resource)
 }
 
 func boundedSyncProbeArgs(mode string, args []string) []string {
@@ -962,8 +1023,8 @@ func startMockServer(spec *openAPISpec) (*httptest.Server, string) {
 
 		// Check if the path looks like a list endpoint
 		path := r.URL.Path
-		if fixture, ok := nestedDataEnvelopeForPath(spec, path); ok {
-			fmt.Fprint(w, renderNestedDataEnvelopeFixture(fixture))
+		if fixture, ok := responseFixtureForRequest(spec, r.Method, path); ok {
+			fmt.Fprint(w, renderResponseFixture(fixture))
 		} else if strings.HasSuffix(path, "s") || strings.Contains(path, "/search") {
 			// Return array
 			fmt.Fprint(w, `[{"id": 1, "name": "mock-item-1", "state": "open", "title": "Mock Item", "created_at": "2026-03-27T00:00:00Z", "updated_at": "2026-03-27T00:00:00Z"}]`)
@@ -983,41 +1044,31 @@ func startMockServer(spec *openAPISpec) (*httptest.Server, string) {
 	return server, server.URL
 }
 
-func nestedDataEnvelopeForPath(spec *openAPISpec, path string) (nestedDataEnvelopeFixture, bool) {
+func responseFixtureForRequest(spec *openAPISpec, method, path string) (nestedDataEnvelopeFixture, bool) {
 	if spec == nil || len(spec.NestedDataEnvelopes) == 0 {
 		return nestedDataEnvelopeFixture{}, false
 	}
-	if fixture, ok := spec.NestedDataEnvelopes[path]; ok {
+	method = strings.ToUpper(method)
+	if fixture, ok := spec.NestedDataEnvelopes[responseFixtureKey{Method: method, Path: path}]; ok {
 		return fixture, true
 	}
-	for specPath, fixture := range spec.NestedDataEnvelopes {
-		if pathMatchesSpec(path, compileSpecPathPatterns([]string{specPath})) {
-			return fixture, true
+	var matchedPath string
+	var matched nestedDataEnvelopeFixture
+	found := false
+	for key, fixture := range spec.NestedDataEnvelopes {
+		if key.Method != method || !pathMatchesSpec(path, compileSpecPathPatterns([]string{key.Path})) {
+			continue
+		}
+		if !found || key.Path < matchedPath {
+			matchedPath = key.Path
+			matched = fixture
+			found = true
 		}
 	}
-	return nestedDataEnvelopeFixture{}, false
-}
-
-func renderNestedDataEnvelopeFixture(fixture nestedDataEnvelopeFixture) string {
-	arrayKey := fixture.ArrayKey
-	if arrayKey == "" {
-		arrayKey = "items"
+	if !found {
+		return nestedDataEnvelopeFixture{}, false
 	}
-	body := map[string]any{
-		"success": true,
-		"data": map[string]any{
-			arrayKey: []map[string]any{
-				{"id": 1, "name": "mock-item-1", "state": "open", "title": "Mock Item", "created_at": "2026-03-27T00:00:00Z", "updated_at": "2026-03-27T00:00:00Z"},
-				{"id": 2, "name": "mock-item-2", "state": "open", "title": "Mock Item 2", "created_at": "2026-03-27T00:00:00Z", "updated_at": "2026-03-27T00:00:00Z"},
-			},
-			"pagination": map[string]any{"total": 2},
-		},
-	}
-	data, err := json.Marshal(body)
-	if err != nil {
-		return `{"success":true,"data":{"items":[{"id":1,"name":"mock-item-1"},{"id":2,"name":"mock-item-2"}],"pagination":{"total":2}}}`
-	}
-	return string(data)
+	return matched, true
 }
 
 // templateVarReadRe matches the shape config.go.tmpl emits for each
@@ -1059,8 +1110,10 @@ func discoverCLIEnvVars(dir string) []string {
 	var envVars []string
 	for _, m := range matches {
 		name := m[1]
-		// Skip base URL and config path env vars — only want auth-related ones
-		if strings.HasSuffix(name, "_BASE_URL") || strings.HasSuffix(name, "_CONFIG") {
+		// Routing and TLS trust are not request credentials. Mock mode
+		// writes a placeholder token into every discovered credential;
+		// that token is not a CA bundle or a certificate name.
+		if isNonCredentialVerifyEnv(name) {
 			continue
 		}
 		if templateVarNames[name] {
@@ -1072,6 +1125,18 @@ func discoverCLIEnvVars(dir string) []string {
 		}
 	}
 	return envVars
+}
+
+func isNonCredentialVerifyEnv(name string) bool {
+	switch {
+	case strings.HasSuffix(name, "_BASE_URL"),
+		strings.HasSuffix(name, "_CONFIG"),
+		strings.HasSuffix(name, "_CA_CERT"),
+		strings.HasSuffix(name, "_TLS_SERVER_NAME"):
+		return true
+	default:
+		return false
+	}
 }
 
 // discoverCLITemplateVarEnvs returns the env var names that feed
@@ -1099,3 +1164,15 @@ func discoverCLITemplateVarEnvs(dir string) []string {
 }
 
 // camelToKebab is defined in verify.go
+
+// verifyEnvPrefix returns the prefix of the environment variables (for example
+// "<PREFIX>_BASE_URL") that the printed CLI in dir reads. It comes from the
+// API name in the CLI's manifest, as the generated config does, so a copy
+// under any folder name gets the right variables. Without a manifest it falls
+// back to the folder name.
+func verifyEnvPrefix(dir string) string {
+	if m, err := ReadCLIManifest(dir); err == nil && strings.TrimSpace(m.APIName) != "" {
+		return naming.EnvPrefix(m.APIName)
+	}
+	return strings.ToUpper(strings.ReplaceAll(naming.TrimCLISuffix(filepath.Base(dir)), "-", "_"))
+}

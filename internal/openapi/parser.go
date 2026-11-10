@@ -31,6 +31,7 @@ var (
 	endpointLimitExplicit        = false // true when user set --max-endpoints-per-resource
 	globalScopeParamNormalizerRE = regexp.MustCompile(`[^a-zA-Z0-9]+`)
 	authFormatPlaceholderRE      = regexp.MustCompile(`\{([A-Za-z_][A-Za-z0-9_]*)\}`)
+	simpleQueryIdentRE           = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 	// Must stay aligned with generated store.unusableResourceID / isoDatePattern.
 	isoDatePattern = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}(?:[T ][0-9:.+-Zz]+)?$`)
 )
@@ -60,6 +61,7 @@ const (
 	extensionAuthSubtype           = "x-auth-subtype"
 	extensionAuthBasicUsername     = "x-auth-basic-username"
 	extensionAuthBasicPassword     = "x-auth-basic-password"
+	extensionAuthValuePrefix       = "x-auth-value-prefix"
 	extensionOAuthDeviceFlow       = "x-oauth-device-flow"
 	extensionOAuthRefreshTokenMech = "x-oauth-refresh-token-mechanism"
 	extensionSpeakeasyExample      = "x-speakeasy-example"
@@ -78,6 +80,8 @@ const (
 	extensionPPQuery               = "x-pp-query"
 	extensionPPResponseEnvelope    = "x-pp-response-envelope"
 	extensionPPMutation            = "x-pp-mutation"
+	extensionPPDestructive         = "x-pp-destructive"
+	extensionPPReplaySafe          = "x-pp-replay-safe"
 	extensionPPSyncable            = "x-pp-syncable"
 	extensionPPPagination          = "x-pp-pagination"
 	extensionSyncWalker            = "x-pp-sync-walker"
@@ -751,6 +755,9 @@ func parseWithLocation(data []byte, lenient bool, strictRefs bool, location *url
 	result.RequiredHeaders, perEndpointHeaders = detectRequiredHeaders(doc, result.Auth)
 	applyHeaderOverrides(result, perEndpointHeaders)
 
+	// Record per-operation schemes before path-parameter defaults rewrite
+	// endpoint paths. The lookup key is the OpenAPI path.
+	applyPerOperationSecurity(doc, result)
 	applyPathParamDefaults(result)
 
 	// Synthesize Params entries for {placeholder} tokens in the path template
@@ -1884,6 +1891,11 @@ func applyAuthOverrideExtensions(auth *spec.AuthConfig, extensions map[string]an
 	}
 	if description := stringExtension(extensions, extensionAuthDescription); description != "" {
 		auth.Description = description
+	}
+	if auth.Type == "api_key" && strings.EqualFold(auth.In, "header") && auth.Format == "" && auth.Prefix == "" {
+		if prefix := strings.TrimSpace(stringExtension(extensions, extensionAuthValuePrefix)); prefix != "" {
+			auth.Prefix = prefix
+		}
 	}
 	if subtype := stringExtension(extensions, extensionAuthSubtype); subtype != "" {
 		// Only known subtype values are accepted. Unknown values would round-trip
@@ -3692,6 +3704,16 @@ func mapResources(doc *openapi3.T, out *spec.APISpec, basePath string) error {
 			if mutation, present := boolExtension(op.Extensions, extensionPPMutation); present {
 				endpoint.Mutation = new(mutation)
 			}
+			if raw, present := op.Extensions[extensionPPDestructive]; present {
+				if destructive, ok := boolExtension(op.Extensions, extensionPPDestructive); ok {
+					endpoint.Destructive = new(destructive)
+				} else {
+					warnf("%s %q: %s must be a boolean; ignoring %T value", strings.ToUpper(method), path, extensionPPDestructive, raw)
+				}
+			}
+			if replaySafe, present := boolExtension(op.Extensions, extensionPPReplaySafe); present {
+				endpoint.ReplaySafe = new(replaySafe)
+			}
 			opSyncable, _ := boolExtension(op.Extensions, extensionPPSyncable)
 			endpoint.Syncable = pathSyncable || opSyncable
 			endpoint.Walker = readWalkerExtension(op.Extensions, fmt.Sprintf("%s %q", strings.ToUpper(method), path))
@@ -4257,8 +4279,6 @@ func assignAliasesForEndpoints(endpoints map[string]spec.Endpoint) {
 }
 
 func computeAlias(method, path, endpointName string) string {
-	_ = endpointName
-
 	hasPathParam := strings.Contains(path, "{")
 	switch strings.ToUpper(method) {
 	case "GET":
@@ -4267,7 +4287,10 @@ func computeAlias(method, path, endpointName string) string {
 		}
 		return "list"
 	case "POST":
-		return "create"
+		if spec.CreateShapedPOST(path, endpointName) {
+			return "create"
+		}
+		return ""
 	case "PUT", "PATCH":
 		return "update"
 	case "DELETE":
@@ -4369,6 +4392,10 @@ func classifyGlobalParams(resources map[string]spec.Resource) {
 			if _, ok := scopeParams[key]; ok {
 				param.Required = true
 				param.GlobalScope = true
+				// Scope flags are env-backed and must send their fallback
+				// without cobra Changed(). A schema default is no longer a
+				// server assumption once the flag is required.
+				param.ServerDefault = false
 			} else if isGlobalFilterCandidate(param) {
 				if _, ok := filteredParams[key]; ok {
 					droppedCounts[key]++
@@ -4413,13 +4440,11 @@ func isPathSubstitutionParam(param spec.Param) bool {
 }
 
 func isGlobalFilterCandidate(param spec.Param) bool {
-	// A param carrying an explicit default expresses deliberate must-send
-	// intent: the author wants that value on the wire, not the API's implicit
-	// server-side default. Exclude such params from the global-frequency filter
-	// so a ubiquitous-but-load-bearing flag (e.g. a supportsAllDrives-style
-	// access scope that defaults true) is not silently stripped, while plain
-	// high-frequency boilerplate (prettyPrint, quotaUser) with no default is
-	// still dropped.
+	// A defaulted param stays on the command even when it is ubiquitous.
+	// Native defaults are client-sent; an OpenAPI optional default is a
+	// server assumption the caller may still override. Dropping the flag
+	// would remove that override. High-frequency params with no default
+	// (prettyPrint, quotaUser) remain eligible to drop.
 	return isQueryParamLocation(param) && !isPathSubstitutionParam(param) && !param.Required && param.Default == nil
 }
 
@@ -4631,10 +4656,20 @@ func mapParameters(pathItem *openapi3.PathItem, op *openapi3.Operation) ([]spec.
 		}
 
 		schema := schemaRefValue(parameter.Schema)
-		// Skip parameters with names that can't be Go identifiers
+		// Skip parameters with names that can't be Go identifiers.
+		// A leading $ on a query name is an OData key ($top): keep the
+		// original as the wire name and the remainder as the flag when
+		// that remainder is an identifier. $.xgafv-style names are not flags.
 		paramName := parameter.Name
+		dollarWire := ""
 		if strings.HasPrefix(paramName, "$") || strings.HasPrefix(paramName, ".") {
-			continue
+			rest := strings.TrimPrefix(paramName, "$")
+			if parameter.In == openapi3.ParameterInQuery && strings.HasPrefix(parameter.Name, "$") && simpleQueryIdentRE.MatchString(rest) {
+				dollarWire = parameter.Name
+				paramName = rest
+			} else {
+				continue
+			}
 		}
 		// Skip phantom names ("" / "[]") that some specs emit for unnamed
 		// array query params. They are not usable MCP/CLI arguments and would
@@ -4671,7 +4706,10 @@ func mapParameters(pathItem *openapi3.PathItem, op *openapi3.Operation) ([]spec.
 				urlNameOverrides = readParamURLNameOverrides(pathItem, op)
 				urlNameOverridesRead = true
 			}
-			param.URLName = paramURLName(paramName, parameter.Extensions, urlNameOverrides)
+			param.URLName = paramURLName(parameter.Name, parameter.Extensions, urlNameOverrides)
+			if param.URLName == "" && dollarWire != "" {
+				param.URLName = dollarWire
+			}
 			if dispatch, ok := boolExtension(parameter.Extensions, extensionDispatchParam); ok {
 				param.DispatchParam = dispatch
 				param.DispatchParamSet = true
@@ -4682,8 +4720,15 @@ func mapParameters(pathItem *openapi3.PathItem, op *openapi3.Operation) ([]spec.
 		}
 		if schema != nil && schema.Default != nil {
 			param.Default = schema.Default
+			// Path defaults fill a URL segment and are client-sent. Optional
+			// query, header, and cookie defaults are what the server assumes
+			// when the parameter is absent.
+			if !parameter.Required && parameter.In != openapi3.ParameterInPath {
+				param.ServerDefault = true
+			}
 		}
 		setParamMaximum(&param, schema)
+		setParamMinimum(&param, schema)
 		if param.Positional {
 			param.Required = true
 		}
@@ -4740,6 +4785,87 @@ func setParamMaximum(param *spec.Param, schema *openapi3.Schema) {
 	if schema.ExclusiveMax.Value != nil {
 		param.ExclusiveMaximum = schema.ExclusiveMax.Value
 	}
+}
+
+// setParamMinimum records the first legal numeric lower bound. Integer
+// exclusiveMinimum (OpenAPI 3.1's number, or 3.0's minimum plus
+// exclusiveMinimum: true) becomes the first integer strictly above that
+// bound, so sync can seed an offset or page from one inclusive value.
+// allOf members are the same constraint, so a minimum that lives only on
+// a member still counts; the highest floor wins. oneOf and anyOf are
+// alternatives and are not folded in.
+func setParamMinimum(param *spec.Param, schema *openapi3.Schema) {
+	if param == nil || schema == nil {
+		return
+	}
+	param.Minimum = tightestSchemaMinimum(schema, param.Type, map[*openapi3.Schema]struct{}{})
+}
+
+func tightestSchemaMinimum(schema *openapi3.Schema, typ string, seen map[*openapi3.Schema]struct{}) *float64 {
+	if schema == nil {
+		return nil
+	}
+	if _, ok := seen[schema]; ok {
+		return nil
+	}
+	seen[schema] = struct{}{}
+
+	best := directSchemaMinimum(schema, typ)
+	for _, ref := range schema.AllOf {
+		best = tighterLowerBound(best, tightestSchemaMinimum(schemaRefValue(ref), typ, seen))
+	}
+	return best
+}
+
+func tighterLowerBound(current, candidate *float64) *float64 {
+	if candidate == nil || math.IsNaN(*candidate) || math.IsInf(*candidate, 0) {
+		return current
+	}
+	if current == nil || math.IsNaN(*current) || math.IsInf(*current, 0) || *candidate > *current {
+		return candidate
+	}
+	return current
+}
+
+func directSchemaMinimum(schema *openapi3.Schema, typ string) *float64 {
+	minimum := schema.Min
+	if !schemaMinimumIsInteger(schema, typ) {
+		return minimum
+	}
+	if exclusive := exclusiveMinimumBound(schema); exclusive != nil && (minimum == nil || *exclusive >= *minimum) {
+		value := math.Floor(*exclusive) + 1
+		return &value
+	}
+	return minimum
+}
+
+func schemaMinimumIsInteger(schema *openapi3.Schema, typ string) bool {
+	if isIntegerParamType(typ) {
+		return true
+	}
+	return schema != nil && schema.Type != nil && schema.Type.Includes(openapi3.TypeInteger)
+}
+
+func isIntegerParamType(typ string) bool {
+	switch strings.ToLower(strings.TrimSpace(typ)) {
+	case "int", "integer":
+		return true
+	default:
+		return false
+	}
+}
+
+func exclusiveMinimumBound(schema *openapi3.Schema) *float64 {
+	if schema == nil {
+		return nil
+	}
+	if schema.ExclusiveMin.Value != nil {
+		return schema.ExclusiveMin.Value
+	}
+	if schema.ExclusiveMin.IsTrue() {
+		return schema.Min
+	}
+	return nil
 }
 
 func readParamURLNameOverrides(pathItem *openapi3.PathItem, op *openapi3.Operation) map[string]string {
@@ -5125,7 +5251,8 @@ func mapRequestBody(requestBodyRef *openapi3.RequestBodyRef, method, path string
 
 	properties := map[string]*openapi3.SchemaRef{}
 	required := map[string]struct{}{}
-	if collectAllOfProperties(media.Schema, properties, required, map[*openapi3.Schema]struct{}{}) {
+	declaredBy := map[string]*openapi3.Schema{}
+	if collectAllOfProperties(media.Schema, properties, required, declaredBy, map[*openapi3.Schema]struct{}{}, foldBodyNames) {
 		// oneOf/anyOf at the body root cannot be flattened to named flags.
 		// Only enable the --body-json fallback for JSON-shaped content
 		// types; the runtime decode path is wired through the JSON branch
@@ -5143,6 +5270,8 @@ func mapRequestBody(requestBodyRef *openapi3.RequestBodyRef, method, path string
 		return nil, "", false, false, false
 	}
 	inferCSVArrays := isJSONContentType(requestContentType)
+	walk := newBodyFieldWalk(method, path, inferCSVArrays)
+	rootSchema := schemaRefValue(media.Schema)
 
 	names := make([]string, 0, len(properties))
 	for name := range properties {
@@ -5153,12 +5282,15 @@ func mapRequestBody(requestBodyRef *openapi3.RequestBodyRef, method, path string
 	body := make([]spec.Param, 0, len(names))
 	seenCamelNames := map[string]bool{}
 	for _, name := range names {
+		schema := schemaRefValue(properties[name])
+		if bodySchemaReadOnly(schema) {
+			continue
+		}
 		camelName := toCamelCase(name)
 		if seenCamelNames[camelName] {
 			continue
 		}
 		seenCamelNames[camelName] = true
-		schema := schemaRefValue(properties[name])
 		paramSchema := bodyParamSchema(schema)
 		description := schemaDescription(schema)
 		if description == "" {
@@ -5168,14 +5300,23 @@ func mapRequestBody(requestBodyRef *openapi3.RequestBodyRef, method, path string
 			description = humanizeFieldName(name)
 		}
 		param := spec.Param{
-			Name:        name,
-			Type:        mapBodyParamType(paramSchema, inferCSVArrays),
-			Required:    isRequired(required, name),
-			Description: description,
-			Fields:      mapBodyFields(paramSchema, inferCSVArrays),
-			Enum:        schemaEnum(paramSchema),
-			Format:      schemaFormat(paramSchema),
-			Example:     schemaExample(paramSchema),
+			Name:              name,
+			Type:              mapBodyParamType(paramSchema, inferCSVArrays),
+			Required:          isRequired(required, name),
+			Description:       description,
+			Enum:              schemaEnum(paramSchema),
+			EnumUnsatisfiable: schemaEnumUnsatisfiable(paramSchema),
+			Format:            schemaFormat(paramSchema),
+			Example:           schemaExample(paramSchema),
+		}
+		if walk.repeats(schema, declaredBy[name]) {
+			walk.warnCycle(name, properties[name])
+		} else {
+			walk.prefix = append(walk.prefix, name)
+			added := walk.push(walk.closure(rootSchema))
+			param.Fields = walk.fields(schema, 0)
+			walk.pop(added)
+			walk.prefix = walk.prefix[:len(walk.prefix)-1]
 		}
 		if schemaHasCompositeUnionAlternative(paramSchema, map[*openapi3.Schema]struct{}{}) {
 			param.Type = "string"
@@ -5184,10 +5325,9 @@ func mapRequestBody(requestBodyRef *openapi3.RequestBodyRef, method, path string
 		if inferCSVArrays && isStringArraySchema(paramSchema) {
 			param.ItemType = "string"
 		}
-		if paramSchema != nil && paramSchema.Default != nil {
-			param.Default = paramSchema.Default
-		}
+		assignBodySchemaDefault(&param, paramSchema)
 		setParamMaximum(&param, paramSchema)
+		setParamMinimum(&param, paramSchema)
 		// For array types, propagate item-level enum as a Fields entry
 		// so downstream consumers (profiler) can access it.
 		if paramSchema != nil && paramSchema.Type != nil && paramSchema.Type.Is(openapi3.TypeArray) &&
@@ -5276,8 +5416,41 @@ func requestBodyMediaType(content openapi3.Content) (string, *openapi3.MediaType
 	return "", nil
 }
 
+// AllOf members describe the same property; unions and child schemas do not.
+func bodySchemaReadOnly(schema *openapi3.Schema) bool {
+	pending := []*openapi3.Schema{schema}
+	visited := map[*openapi3.Schema]struct{}{}
+	for len(pending) > 0 {
+		schema := pending[len(pending)-1]
+		pending = pending[:len(pending)-1]
+		if schema == nil {
+			continue
+		}
+		if _, seen := visited[schema]; seen {
+			continue
+		}
+		visited[schema] = struct{}{}
+		if schema.ReadOnly {
+			return true
+		}
+		for _, ref := range schema.AllOf {
+			pending = append(pending, schemaRefValue(ref))
+		}
+	}
+	return false
+}
+
 func bodyParamSchema(schema *openapi3.Schema) *openapi3.Schema {
-	if schema == nil || len(schema.AllOf) == 0 {
+	if schema == nil {
+		return nil
+	}
+	// anyOf/oneOf wrappers have no schema.Type. Without this unwrap,
+	// mapSchemaType falls back to string and the JSON body quotes numbers
+	// and booleans. allOf still merges below; its scalar members unwrap too.
+	if len(schema.AllOf) == 0 {
+		if scalar := singleScalarUnionBranch(schema); scalar != nil {
+			return scalar
+		}
 		return schema
 	}
 
@@ -5287,7 +5460,7 @@ func bodyParamSchema(schema *openapi3.Schema) *openapi3.Schema {
 
 	properties := map[string]*openapi3.SchemaRef{}
 	required := map[string]struct{}{}
-	if collectAllOfProperties(&openapi3.SchemaRef{Value: schema}, properties, required, map[*openapi3.Schema]struct{}{}) || len(properties) == 0 {
+	if collectAllOfProperties(&openapi3.SchemaRef{Value: schema}, properties, required, nil, map[*openapi3.Schema]struct{}{}, foldBodyNames) || len(properties) == 0 {
 		return schema
 	}
 
@@ -5321,6 +5494,9 @@ func firstAllOfNonObjectSchema(schema *openapi3.Schema, visited map[*openapi3.Sc
 		if value == nil {
 			continue
 		}
+		if scalar := singleScalarUnionBranch(value); scalar != nil {
+			value = scalar
+		}
 		if hasDirectObjectShape(value) {
 			hasObject = true
 		} else if firstScalar == nil && (value.Items != nil || (value.Type != nil && !value.Type.Includes(openapi3.TypeObject))) {
@@ -5347,71 +5523,420 @@ func hasDirectObjectShape(schema *openapi3.Schema) bool {
 	return len(schema.Properties) > 0
 }
 
-func mapBodyFields(schema *openapi3.Schema, inferCSVArrays bool) []spec.Param {
-	return mapBodyFieldsDepth(schema, inferCSVArrays, map[*openapi3.Schema]struct{}{}, 0)
+// Keep multiple non-null branches and object/array alternatives as unions so
+// polymorphic bodies retain --body-json / json_or_scalar.
+func singleScalarUnionBranch(schema *openapi3.Schema) *openapi3.Schema {
+	return singleScalarUnionBranchVisited(schema, map[*openapi3.Schema]struct{}{})
 }
 
-const maxBodyFieldDepth = 8
-
-func mapBodyFieldsDepth(schema *openapi3.Schema, inferCSVArrays bool, visited map[*openapi3.Schema]struct{}, depth int) []spec.Param {
-	if !isObjectSchema(schema) || len(schema.Properties) == 0 {
+func singleScalarUnionBranchVisited(schema *openapi3.Schema, visited map[*openapi3.Schema]struct{}) *openapi3.Schema {
+	if schema == nil || schemaDeclaresNonNullType(schema) {
 		return nil
 	}
-	if depth >= maxBodyFieldDepth {
+	branches := scalarUnionBranches(schema)
+	if len(branches) == 0 {
 		return nil
 	}
-	if _, ok := visited[schema]; ok {
+	if _, seen := visited[schema]; seen {
 		return nil
 	}
 	visited[schema] = struct{}{}
 	defer delete(visited, schema)
 
-	names := make([]string, 0, len(schema.Properties))
-	for name := range schema.Properties {
+	var scalar *openapi3.Schema
+	for _, ref := range branches {
+		value := schemaRefValue(ref)
+		if value == nil {
+			return nil
+		}
+		if isNullSchema(value) {
+			continue
+		}
+		if nested := singleScalarUnionBranchVisited(value, visited); nested != nil {
+			value = nested
+		}
+		if !isNonNullScalarSchema(value) {
+			return nil
+		}
+		if scalar != nil {
+			return nil
+		}
+		scalar = value
+	}
+	if scalar == nil {
+		return nil
+	}
+	return overlayUnionScalar(schema, scalar)
+}
+
+func scalarUnionBranches(schema *openapi3.Schema) openapi3.SchemaRefs {
+	if schema == nil || (len(schema.AnyOf) > 0 && len(schema.OneOf) > 0) {
+		return nil
+	}
+	if len(schema.OneOf) > 0 {
+		return schema.OneOf
+	}
+	return schema.AnyOf
+}
+
+func schemaDeclaresNonNullType(schema *openapi3.Schema) bool {
+	if schema == nil || schema.Type == nil || schema.Type.IsEmpty() {
+		return false
+	}
+	for _, typ := range schema.Type.Slice() {
+		if typ != openapi3.TypeNull {
+			return true
+		}
+	}
+	return false
+}
+
+func isNullSchema(schema *openapi3.Schema) bool {
+	if schema == nil || schema.Type == nil || schema.Type.IsEmpty() {
+		return false
+	}
+	return !schemaDeclaresNonNullType(schema)
+}
+
+func isNonNullScalarSchema(schema *openapi3.Schema) bool {
+	if schema == nil || schema.Type == nil || schema.Type.IsEmpty() {
+		return false
+	}
+	if schema.Type.Includes(openapi3.TypeObject) || schema.Type.Includes(openapi3.TypeArray) || len(schema.Properties) > 0 || schema.Items != nil {
+		return false
+	}
+	sawScalar := false
+	for _, typ := range schema.Type.Slice() {
+		if typ == openapi3.TypeNull {
+			continue
+		}
+		if typ != openapi3.TypeBoolean && typ != openapi3.TypeInteger && typ != openapi3.TypeNumber && typ != openapi3.TypeString {
+			return false
+		}
+		sawScalar = true
+	}
+	return sawScalar
+}
+
+// Flag encoding reads format, default, bounds, and enum from the schema
+// bodyParamSchema returns. Sibling constraints fill what the scalar branch
+// left empty. Enums are combined because a value must satisfy both lists:
+// a wrapper that allows only "a" must not keep a branch value "b".
+func overlayUnionScalar(wrapper, scalar *openapi3.Schema) *openapi3.Schema {
+	if wrapper == nil || scalar == nil || wrapper == scalar {
+		return scalar
+	}
+	out := *scalar
+	if out.Description == "" {
+		out.Description = wrapper.Description
+	}
+	if out.Format == "" {
+		out.Format = wrapper.Format
+	}
+	if out.Default == nil {
+		out.Default = wrapper.Default
+	}
+	if out.Example == nil {
+		out.Example = wrapper.Example
+	}
+	if len(out.Examples) == 0 {
+		out.Examples = wrapper.Examples
+	}
+	if len(out.Enum) == 0 {
+		out.Enum = wrapper.Enum
+	} else if len(wrapper.Enum) > 0 {
+		out.Enum = intersectSchemaEnums(wrapper.Enum, out.Enum)
+	}
+	if out.Min == nil {
+		out.Min = wrapper.Min
+	}
+	if out.Max == nil {
+		out.Max = wrapper.Max
+	}
+	if !out.ExclusiveMin.IsSet() && wrapper.ExclusiveMin.IsSet() {
+		out.ExclusiveMin = wrapper.ExclusiveMin
+	}
+	if !out.ExclusiveMax.IsSet() && wrapper.ExclusiveMax.IsSet() {
+		out.ExclusiveMax = wrapper.ExclusiveMax
+	}
+	return &out
+}
+
+// Both lists apply together. Wrapper order is kept so the first allowed
+// value stays the one declared beside the union. An empty overlap must not
+// fall back to the wider branch set or to "no enum".
+func intersectSchemaEnums(wrapper, branch []any) []any {
+	branchKeys := make(map[string]struct{}, len(branch))
+	for _, value := range branch {
+		branchKeys[enumValueKey(value)] = struct{}{}
+	}
+	out := make([]any, 0, len(wrapper))
+	seen := make(map[string]struct{}, len(wrapper))
+	for _, value := range wrapper {
+		key := enumValueKey(value)
+		if _, ok := branchKeys[key]; !ok {
+			continue
+		}
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, value)
+	}
+	if len(out) == 0 {
+		// An empty Enum is "no constraint" in the generated flag check, so a
+		// disjoint pair would accept every string. Keep a marker the flag
+		// rejects instead of dropping the constraint.
+		return []any{unsatisfiableEnumToken}
+	}
+	return out
+}
+
+// A listed enum value would be accepted by the flag. This marker is stripped
+// before emission and only means the flag must reject every supplied value.
+const unsatisfiableEnumToken = "\x00pp-unsatisfiable-enum"
+
+func schemaEnumUnsatisfiable(schema *openapi3.Schema) bool {
+	if schema == nil || len(schema.Enum) != 1 {
+		return false
+	}
+	text, ok := schema.Enum[0].(string)
+	return ok && text == unsatisfiableEnumToken
+}
+
+func enumValueKey(value any) string {
+	if text, ok := value.(string); ok {
+		return "s:" + text
+	}
+	return "o:" + fmt.Sprint(value)
+}
+
+const maxBodyFieldDepth = 8
+
+// bodyFieldWalk flattens one request body. ancestors is the path of schemas
+// already entered; closures memoizes allOf identity so a merged copy is not
+// required to notice a cycle.
+type bodyFieldWalk struct {
+	inferCSVArrays bool
+	method         string
+	endpoint       string
+	ancestors      map[*openapi3.Schema]struct{}
+	closures       map[*openapi3.Schema]map[*openapi3.Schema]struct{}
+	warned         map[string]struct{}
+	prefix         []string
+}
+
+func newBodyFieldWalk(method, endpoint string, inferCSVArrays bool) *bodyFieldWalk {
+	return &bodyFieldWalk{
+		inferCSVArrays: inferCSVArrays,
+		method:         method,
+		endpoint:       endpoint,
+		ancestors:      map[*openapi3.Schema]struct{}{},
+		closures:       map[*openapi3.Schema]map[*openapi3.Schema]struct{}{},
+		warned:         map[string]struct{}{},
+	}
+}
+
+// repeats reports a writable cycle: the property's schema is already on the
+// path, or the property points back at the schema that declared it (the
+// declarer sits in that schema's allOf closure). allOf merges allocate a new
+// schema per visit, so pointer identity on the merged copy never hits.
+func (w *bodyFieldWalk) repeats(schema, declaredBy *openapi3.Schema) bool {
+	if w == nil || schema == nil {
+		return false
+	}
+	for target := range w.closure(schema) {
+		if _, ok := w.ancestors[target]; ok {
+			return true
+		}
+		if declaredBy != nil {
+			if _, ok := w.closure(target)[declaredBy]; ok {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (w *bodyFieldWalk) warnCycle(name string, ref *openapi3.SchemaRef) {
+	if w == nil {
+		return
+	}
+	parts := append(append([]string{}, w.prefix...), name)
+	label := strings.Join(parts, ".")
+	if _, ok := w.warned[label]; ok {
+		return
+	}
+	w.warned[label] = struct{}{}
+	target := "a schema already on this path"
+	if ref != nil && ref.Ref != "" {
+		target = ref.Ref
+	}
+	where := ""
+	if w.method != "" || w.endpoint != "" {
+		where = fmt.Sprintf("%s %q: ", strings.ToUpper(w.method), w.endpoint)
+	}
+	warnf("%srequest body field %q repeats %s; omitting nested flags (pass that object as JSON, or the full body with --stdin)", where, label, target)
+}
+
+// closure is schema plus the allOf members it is composed of. Property
+// schemas are not included; those are nested values, not this object's identity.
+func (w *bodyFieldWalk) closure(schema *openapi3.Schema) map[*openapi3.Schema]struct{} {
+	if schema == nil {
+		return nil
+	}
+	if cached, ok := w.closures[schema]; ok {
+		return cached
+	}
+	out := map[*openapi3.Schema]struct{}{}
+	w.closures[schema] = out
+	var walk func(*openapi3.Schema)
+	walk = func(s *openapi3.Schema) {
+		if s == nil {
+			return
+		}
+		if _, ok := out[s]; ok {
+			return
+		}
+		out[s] = struct{}{}
+		for _, sub := range s.AllOf {
+			walk(schemaRefValue(sub))
+		}
+	}
+	walk(schema)
+	return out
+}
+
+func (w *bodyFieldWalk) push(schemas map[*openapi3.Schema]struct{}) []*openapi3.Schema {
+	if len(schemas) == 0 {
+		return nil
+	}
+	added := make([]*openapi3.Schema, 0, len(schemas))
+	for schema := range schemas {
+		if schema == nil {
+			continue
+		}
+		if _, ok := w.ancestors[schema]; ok {
+			continue
+		}
+		w.ancestors[schema] = struct{}{}
+		added = append(added, schema)
+	}
+	return added
+}
+
+func (w *bodyFieldWalk) pop(added []*openapi3.Schema) {
+	for _, schema := range added {
+		delete(w.ancestors, schema)
+	}
+}
+
+func (w *bodyFieldWalk) fields(schema *openapi3.Schema, depth int) []spec.Param {
+	if w == nil || schema == nil || depth >= maxBodyFieldDepth {
+		return nil
+	}
+	props := map[string]*openapi3.SchemaRef{}
+	required := map[string]struct{}{}
+	declared := map[string]*openapi3.Schema{}
+	// Keep spec property names. Folding them here renames the JSON key and
+	// misses required, which is declared against the original name.
+	if collectAllOfProperties(&openapi3.SchemaRef{Value: schema}, props, required, declared, map[*openapi3.Schema]struct{}{}, keepBodyNames) || len(props) == 0 {
+		return nil
+	}
+
+	names := make([]string, 0, len(props))
+	for name := range props {
 		names = append(names, name)
 	}
 	sort.Strings(names)
 
-	required := map[string]struct{}{}
-	for _, name := range schema.Required {
-		required[name] = struct{}{}
-	}
-
+	here := w.closure(schema)
 	fields := make([]spec.Param, 0, len(names))
 	for _, name := range names {
-		fieldSchema := bodyParamSchema(schemaRefValue(schema.Properties[name]))
-		description := schemaDescription(schemaRefValue(schema.Properties[name]))
+		propertyRef := props[name]
+		propertySchema := schemaRefValue(propertyRef)
+		if bodySchemaReadOnly(propertySchema) {
+			continue
+		}
+		fieldSchema := bodyParamSchema(propertySchema)
+		description := schemaDescription(propertySchema)
 		if description == "" {
 			description = schemaDescription(fieldSchema)
 		}
 		if description == "" {
 			description = humanizeFieldName(name)
 		}
-		fields = append(fields, spec.Param{
-			Name:        name,
-			Type:        mapBodyParamType(fieldSchema, inferCSVArrays),
-			Required:    isRequired(required, name),
-			Description: description,
-			Fields:      mapBodyFieldsDepth(fieldSchema, inferCSVArrays, visited, depth+1),
-			Enum:        schemaEnum(fieldSchema),
-			Format:      schemaFormat(fieldSchema),
-		})
+		publicName, bodyName := nestedBodyPublicName(name)
+		field := spec.Param{
+			Name:              publicName,
+			BodyName:          bodyName,
+			Type:              mapBodyParamType(fieldSchema, w.inferCSVArrays),
+			Required:          isRequired(required, name),
+			Description:       description,
+			Enum:              schemaEnum(fieldSchema),
+			EnumUnsatisfiable: schemaEnumUnsatisfiable(fieldSchema),
+			Format:            schemaFormat(fieldSchema),
+		}
+		if w.repeats(propertySchema, declared[name]) {
+			w.warnCycle(name, propertyRef)
+		} else {
+			w.prefix = append(w.prefix, name)
+			added := w.push(here)
+			field.Fields = w.fields(propertySchema, depth+1)
+			w.pop(added)
+			w.prefix = w.prefix[:len(w.prefix)-1]
+		}
 		if schemaHasCompositeUnionAlternative(fieldSchema, map[*openapi3.Schema]struct{}{}) {
-			fields[len(fields)-1].Type = "string"
-			fields[len(fields)-1].Format = "json_or_scalar"
+			field.Type = "string"
+			field.Format = "json_or_scalar"
 		}
-		if inferCSVArrays && isStringArraySchema(fieldSchema) {
-			fields[len(fields)-1].ItemType = "string"
+		if w.inferCSVArrays && isStringArraySchema(fieldSchema) {
+			field.ItemType = "string"
 		}
+		assignBodySchemaDefault(&field, fieldSchema)
+		fields = append(fields, field)
 	}
 	return fields
+}
+
+// assignBodySchemaDefault copies an OpenAPI schema default onto a body
+// field. Optional defaults are server assumptions: help shows them, and
+// the request omits them until the caller sets the value. Required
+// defaults stay client-sent once the enclosing object is included; a
+// prefilled child must not by itself put an omitted object on the wire.
+func assignBodySchemaDefault(param *spec.Param, schema *openapi3.Schema) {
+	if param == nil || schema == nil || schema.Default == nil {
+		return
+	}
+	param.Default = schema.Default
+	if !param.Required {
+		param.ServerDefault = true
+	}
+}
+
+const (
+	foldBodyNames = true
+	keepBodyNames = false
+)
+
+func nestedBodyPublicName(wireName string) (publicName, bodyName string) {
+	publicName = naming.ASCIIFold(wireName)
+	if publicName == "" {
+		publicName = wireName
+	}
+	if publicName != wireName {
+		bodyName = wireName
+	}
+	return publicName, bodyName
 }
 
 func collectAllOfProperties(
 	schemaRef *openapi3.SchemaRef,
 	properties map[string]*openapi3.SchemaRef,
 	required map[string]struct{},
+	declaredBy map[string]*openapi3.Schema,
 	visited map[*openapi3.Schema]struct{},
+	foldNames bool,
 ) bool {
 	if schemaRef == nil || schemaRef.Value == nil {
 		return false
@@ -5428,7 +5953,7 @@ func collectAllOfProperties(
 	}
 
 	for _, sub := range schema.AllOf {
-		if collectAllOfProperties(sub, properties, required, visited) {
+		if collectAllOfProperties(sub, properties, required, declaredBy, visited, foldNames) {
 			return true
 		}
 	}
@@ -5439,7 +5964,14 @@ func collectAllOfProperties(
 		if prop == nil {
 			continue
 		}
-		properties[naming.ASCIIFold(name)] = prop
+		key := name
+		if foldNames {
+			key = naming.ASCIIFold(name)
+		}
+		properties[key] = prop
+		if declaredBy != nil {
+			declaredBy[key] = schema
+		}
 	}
 
 	return false
@@ -6552,16 +7084,15 @@ func singularizeIdentifier(s string) string {
 
 // unwrapItemSchema returns the schema of items inside a list response. Handles
 // four shapes: bare array (return Items.Value), {data: [...]} wrapper (fast
-// path; mirrors mapResponse's handling), single-named-array envelope where the
-// resource is wrapped under its own key alongside scalar/object metadata
-// siblings (e.g. Kalshi's {events: [...], cursor: "..."}), and bare object
-// (no array, treat as a single-item resource and inspect its fields).
+// path; mirrors mapResponse's handling), single-named-array envelope whose
+// other properties are paging or envelope metadata (e.g. {events: [...],
+// cursor: "..."}), and a record (no array, or one array plus a domain field
+// such as an id or commandId — inspect the object's own fields).
 //
-// The single-named-array envelope detection is deliberately strict: it
-// requires *exactly one* array-typed property at the top level. Multi-array
-// envelopes (e.g. /portfolio/positions returning event_positions and
-// market_positions) fall through to the bare-object path; they need explicit
-// per-resource declaration since picking one would lose data.
+// Single-array detection requires exactly one array-typed property and
+// rejects any sibling that is not paging or envelope metadata, so a detail
+// object is not treated as a page. Multi-array envelopes fall through to the
+// record path; picking one array would drop the others.
 func unwrapItemSchema(schema *openapi3.Schema) *openapi3.Schema {
 	if schema == nil {
 		return nil
@@ -6578,24 +7109,110 @@ func unwrapItemSchema(schema *openapi3.Schema) *openapi3.Schema {
 			return schemaRefValue(data.Items)
 		}
 	}
-	// Single-named-array envelope: object whose only array-typed property is
-	// the resource list, with the rest being pagination/metadata fields. This
-	// catches API patterns like {events: [...], cursor: "..."} where the
-	// wrapper key matches the resource name. Without this, the PK profiler
-	// would walk the wrapper itself and pick a scalar sibling (cursor,
-	// has_more) as the resource ID.
+	// Single-named-array envelope: one array plus paging/envelope siblings
+	// ({events: [...], cursor: "..."}). A record that merely contains one
+	// array keeps its own fields so the PK walk does not pick a child id.
 	if itemRef, _ := singleArrayPropertyRef(schema); itemRef != nil {
 		return schemaRefValue(itemRef)
 	}
 	return schema
 }
 
+// envelopeMetadataPropertyNames lists sibling names that may sit next to a
+// single array when that object is a list envelope. Domain fields are absent
+// on purpose: an id, a command id, or any other record field means the array
+// is one property of the record. Names are matched after stripping case and
+// separators, so TotalCount, nextPageToken, and request_id all hit.
+var envelopeMetadataPropertyNames = func() map[string]bool {
+	names := []string{
+		"after",
+		"before",
+		"continuation",
+		"continuation_token",
+		"count",
+		"current_page",
+		"cursor",
+		"end_cursor",
+		"has_more",
+		"has_next",
+		"has_previous",
+		"item_count",
+		"items_per_page",
+		"limit",
+		"links",
+		"meta",
+		"metadata",
+		"next",
+		"next_cursor",
+		"next_link",
+		"next_offset",
+		"next_page",
+		"next_page_token",
+		"next_page_url",
+		"next_token",
+		"next_url",
+		"offset",
+		"page",
+		"page_count",
+		"page_details",
+		"page_info",
+		"page_number",
+		"page_size",
+		"page_token",
+		"pagination",
+		"paging",
+		"per_page",
+		"prev",
+		"prev_cursor",
+		"prev_page",
+		"previous",
+		"previous_cursor",
+		"previous_page",
+		"request_id",
+		"response_metadata",
+		"result_size_estimate",
+		"results_metadata",
+		"results_per_page",
+		"start_cursor",
+		"status_code",
+		"total",
+		"total_count",
+		"total_items",
+		"total_pages",
+		"total_results",
+	}
+	set := make(map[string]bool, len(names))
+	for _, name := range names {
+		set[normalizeEnvelopePropertyName(name)] = true
+	}
+	return set
+}()
+
+func normalizeEnvelopePropertyName(name string) string {
+	var b strings.Builder
+	b.Grow(len(name))
+	for _, r := range name {
+		if r == '_' || r == '-' {
+			continue
+		}
+		b.WriteRune(unicode.ToLower(r))
+	}
+	return b.String()
+}
+
+func isEnvelopeMetadataProperty(name string) bool {
+	return envelopeMetadataPropertyNames[normalizeEnvelopePropertyName(name)]
+}
+
 // singleArrayPropertyRef returns the items schema ref and property name of an
-// object's sole array-typed property, or nil if zero or multiple array
-// properties exist.
-// Non-array siblings (scalars, objects) are ignored — they're typically
-// pagination metadata.
+// object's sole array-typed property when every other property is paging or
+// envelope metadata. It returns nil when there is not exactly one array, or
+// when a sibling is part of the record. A malformed array (no items) is
+// ignored and does not count as that sibling.
 func singleArrayPropertyRef(schema *openapi3.Schema) (*openapi3.SchemaRef, string) {
+	if schema == nil {
+		return nil, ""
+	}
 	var items *openapi3.SchemaRef
 	var name string
 	count := 0
@@ -6611,10 +7228,26 @@ func singleArrayPropertyRef(schema *openapi3.Schema) (*openapi3.SchemaRef, strin
 		name = propName
 		items = prop.Items
 	}
-	if count == 1 {
-		return items, name
+	if count != 1 || !envelopeMetadataSiblings(schema, name) {
+		return nil, ""
 	}
-	return nil, ""
+	return items, name
+}
+
+func envelopeMetadataSiblings(schema *openapi3.Schema, arrayName string) bool {
+	for propName, propRef := range schema.Properties {
+		if propName == arrayName {
+			continue
+		}
+		prop := schemaRefValue(propRef)
+		if isArraySchema(prop) && prop.Items == nil {
+			continue
+		}
+		if !isEnvelopeMetadataProperty(propName) {
+			return false
+		}
+	}
+	return true
 }
 
 // isScalarSchema reports whether the schema's type is a scalar — string,
@@ -7042,11 +7675,14 @@ func isStringArraySchema(schema *openapi3.Schema) bool {
 }
 
 func schemaEnum(schema *openapi3.Schema) []string {
-	if schema == nil || len(schema.Enum) == 0 {
+	if schema == nil || len(schema.Enum) == 0 || schemaEnumUnsatisfiable(schema) {
 		return nil
 	}
 	enum := make([]string, 0, len(schema.Enum))
 	for _, value := range schema.Enum {
+		if text, ok := value.(string); ok && text == unsatisfiableEnumToken {
+			continue
+		}
 		switch v := value.(type) {
 		case string:
 			enum = append(enum, v)
@@ -8425,6 +9061,10 @@ func cleanSpecName(title string) string {
 	return cleanSpecNameInternal(title, true)
 }
 
+func SpecNameSlug(title string) string {
+	return cleanSpecName(title)
+}
+
 // cleanSpecNameUnicode is cleanSpecName without the ASCII fold, so display_name
 // keeps accents the slug must drop for filesystem and shell safety.
 func cleanSpecNameUnicode(title string) string {
@@ -8672,43 +9312,55 @@ func selectDescription(summary, description string) string {
 	return description
 }
 
+func paginationParamKey(name string) string {
+	return strings.TrimPrefix(strings.ToLower(strings.TrimSpace(name)), "$")
+}
+
 func detectPagination(params []spec.Param, op *openapi3.Operation) *spec.Pagination {
-	// Map lowercase parameter name back to the spec's original casing so
-	// the detected LimitParam/CursorParam preserves whatever the API
-	// expects (e.g. Google APIs reject `pagesize` but accept `pageSize`).
+	// Map the candidate key back to the wire name so LimitParam/CursorParam
+	// preserve the API's casing and OData $ names (pageSize, $top).
 	originalCase := map[string]string{}
-	paramsByLowerName := map[string]spec.Param{}
+	paramsByKey := map[string]spec.Param{}
 	for _, p := range params {
 		if !isQueryParamLocation(p) || isPathSubstitutionParam(p) {
 			continue
 		}
-		lowerName := strings.ToLower(p.Name)
-		originalCase[lowerName] = p.Name
-		paramsByLowerName[lowerName] = p
+		record := func(key string) {
+			if key == "" {
+				return
+			}
+			originalCase[key] = p.WireName()
+			paramsByKey[key] = p
+		}
+		record(paginationParamKey(p.Name))
+		record(paginationParamKey(p.WireName()))
 	}
 
 	var pag spec.Pagination
 
-	// Detect limit param
-	for _, name := range []string{"limit", "take", "maxresults", "pagesize", "page_size", "max_results", "perpage", "per_page", "page[size]"} {
+	// Detect limit param. top is last so limit still wins when both exist.
+	// count is not a candidate: OData $count is a boolean, and an integer
+	// count is filled later by profiler inference when LimitParam is empty.
+	for _, name := range []string{"limit", "take", "maxresults", "pagesize", "page_size", "max_results", "perpage", "per_page", "page[size]", "top"} {
 		if orig, ok := originalCase[name]; ok {
 			pag.LimitParam = orig
 			break
 		}
 	}
 
-	// Detect cursor param and pagination type
+	// Date-formatted names such as after/before are range filters. Skip them
+	// so a later opaque cursor is still detected.
 	for _, name := range []string{"pagetoken", "page_token"} {
-		if orig, ok := originalCase[name]; ok {
-			pag.CursorParam = orig
+		if p, ok := paramsByKey[name]; ok && !p.HasDateFormat() {
+			pag.CursorParam = p.WireName()
 			pag.Type = "page_token"
 			break
 		}
 	}
 	if pag.Type == "" {
-		for _, name := range []string{"after", "cursor", "page[cursor]", "nexttoken", "next_token"} {
-			if orig, ok := originalCase[name]; ok {
-				pag.CursorParam = orig
+		for _, name := range []string{"after", "cursor", "page[cursor]", "nexttoken", "next_token", "page_key"} {
+			if p, ok := paramsByKey[name]; ok && !p.HasDateFormat() {
+				pag.CursorParam = p.WireName()
 				pag.Type = "cursor"
 				break
 			}
@@ -8716,8 +9368,8 @@ func detectPagination(params []spec.Param, op *openapi3.Operation) *spec.Paginat
 	}
 	if pag.Type == "" {
 		for _, name := range []string{"offset", "skip"} {
-			if orig, ok := originalCase[name]; ok {
-				pag.CursorParam = orig
+			if p, ok := paramsByKey[name]; ok && !p.HasDateFormat() {
+				pag.CursorParam = p.WireName()
 				pag.Type = "offset"
 				break
 			}
@@ -8729,8 +9381,8 @@ func detectPagination(params []spec.Param, op *openapi3.Operation) *spec.Paginat
 	// CursorParam as an integer when no body cursor is extracted.
 	if pag.Type == "" {
 		for _, name := range []string{"page", "pagenumber", "page_number", "page[number]"} {
-			if orig, ok := originalCase[name]; ok {
-				pag.CursorParam = orig
+			if p, ok := paramsByKey[name]; ok && !p.HasDateFormat() {
+				pag.CursorParam = p.WireName()
 				pag.Type = "page"
 				break
 			}
@@ -8739,8 +9391,8 @@ func detectPagination(params []spec.Param, op *openapi3.Operation) *spec.Paginat
 	// `size` is also a common domain filter, so require pagination wording in
 	// its description before treating it as the page length.
 	if pag.LimitParam == "" && pag.CursorParam != "" {
-		if sizeParam, ok := paramsByLowerName["size"]; ok && describesPageSize(sizeParam.Description) {
-			pag.LimitParam = sizeParam.Name
+		if sizeParam, ok := paramsByKey["size"]; ok && describesPageSize(sizeParam.Description) {
+			pag.LimitParam = sizeParam.WireName()
 		}
 	}
 
@@ -8752,6 +9404,15 @@ func detectPagination(params []spec.Param, op *openapi3.Operation) *spec.Paginat
 			if schemaRef != nil && schemaRef.Value != nil {
 				detectPaginationResponseFields(schemaRef.Value, "", &pag)
 			}
+		}
+	}
+	// Some APIs accept both an after filter and an opaque cursor. Prefer the
+	// cursor when the response explicitly supplies its next value.
+	if cursor, ok := paramsByKey["cursor"]; ok && pag.Type == "cursor" &&
+		paginationParamKey(pag.CursorParam) == "after" && !cursor.HasDateFormat() {
+		leaf := pag.NextCursorPath[strings.LastIndex(pag.NextCursorPath, ".")+1:]
+		if strings.EqualFold(leaf, "next_cursor") || strings.EqualFold(leaf, "nextCursor") {
+			pag.CursorParam = cursor.WireName()
 		}
 	}
 	// Preserve the historical Google-style fallback when the response schema

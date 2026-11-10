@@ -35,7 +35,7 @@ This skill drives the `{{.Name}}-pp-cli` binary. **You must verify the CLI is in
 2. Verify: `{{.Name}}-pp-cli --version`
 3. Ensure the reported install directory is on `$PATH` for the agent/runtime that will invoke this skill.
 {{ if .Category}}
-If the `npx` install fails (no Node, offline, etc.), fall back to a direct Go install (requires Go 1.26.6 or newer). This installs into `$GOPATH/bin` (default `$HOME/go/bin`), so add that directory to `$PATH` instead:
+If the `npx` install fails (no Node, offline, etc.), fall back to a direct Go install (requires Go 1.26.10 or newer). This installs into `$GOPATH/bin` (default `$HOME/go/bin`), so add that directory to `$PATH` instead:
 
 ```bash
 go install github.com/mvanhorn/printing-press-library/library/{{.Category}}/{{.Name}}/cmd/{{.Name}}-pp-cli@latest
@@ -76,13 +76,15 @@ Do not activate this CLI for requests that require creating, updating, deleting,
 
 ## Unique Capabilities
 
-These capabilities aren't available in any other tool for this API.
+{{if not .HasListedAlternatives}}{{novelExclusivityClaim}}{{end}}
 {{- $groups := groupNovelFeatures .NovelFeatures}}
 {{- if $groups}}
-{{- range $groups}}
+{{- range $i, $g := $groups}}
+{{- if or (gt $i 0) (not $.HasListedAlternatives)}}
 
-### {{.Name}}
-{{range .Features}}
+{{end -}}
+### {{$g.Name}}
+{{range $g.Features}}
 - **`{{.Command}}`** — {{.Description}}
 {{- if .WhyItMatters}}
 
@@ -146,6 +148,8 @@ This CLI was generated with browser-observed traffic context.
 {{- end}}
 {{- end}}
 
+`--ca-cert`, `{{envPrefix .Name}}_CA_CERT`, or `ca_cert` adds a PEM CA bundle to the system trust roots. `--tls-server-name`, `{{envPrefix .Name}}_TLS_SERVER_NAME`, or `tls_server_name` is the name checked against the certificate. Precedence is flag, then environment, then the config file. A config file other users can change does not supply these settings. `doctor` reports the trust in use and names the setting that fixes a chain or hostname failure.
+
 ## Command Reference
 {{range $name, $resource := .Resources}}
 **{{$name}}** — {{$resource.Description}}
@@ -156,6 +160,15 @@ This CLI was generated with browser-observed traffic context.
 - `{{$.Name}}-pp-cli {{kebab $name}} {{kebab $eName}}` — {{oneline $endpoint.Description}}
 {{- end}}
 {{- end}}
+{{end}}
+{{- if .ReferenceCommandGroups}}
+{{range .ReferenceCommandGroups}}
+**{{.Heading}}**
+
+{{range .Commands}}
+- `{{$.Name}}-pp-cli {{.Invocation}}` — {{.Description}}
+{{end}}
+{{end}}
 {{end}}
 {{- if and .HasDataLayer .HasAutoRefresh}}
 
@@ -260,14 +273,31 @@ export {{(index $deviceEnvVars 0).Name}}=<client-id>
 
 Open the verification URL, enter the printed user code, and return to the CLI. Tokens are stored locally and refreshed automatically.
 {{- else if eq .Auth.Type "oauth2"}}
+{{- if authSetupCommandAvailable}}
 
-Run `{{.Name}}-pp-cli auth setup` for the registration URL and steps (add `--launch` to open the URL). Then authenticate:
+Run `{{.Name}}-pp-cli auth setup` for the registration URL and steps (add `--launch` to open the URL).{{if authLoginCommandAvailable}} Then authenticate:{{end}}
+{{- end}}
+{{- if authLoginCommandAvailable}}
+{{- if not authSetupCommandAvailable}}
+
+Authenticate:
+
+{{- end}}
 
 ```bash
 {{.Name}}-pp-cli auth login
 ```
 
 Tokens are stored locally and refreshed automatically.
+{{- end}}
+{{- if authCodeSetTokenAvailable .Auth}}
+
+To store a bearer you already hold, pipe it on stdin so it does not land in shell history:
+
+```bash
+echo "$TOKEN" | {{.Name}}-pp-cli auth set-token
+```
+{{- end}}
 {{- else if eq .Auth.Type "oauth2_refresh"}}
 
 This CLI uses OAuth2 with refresh-token rotation. Configure the client credentials and refresh token:
@@ -338,7 +368,7 @@ Global format flags share one contract on promoted, novel, sync, and `--deliver`
 
 - `--json` — one JSON document on stdout (sync progress events go to stderr)
 - `--compact` — keep identity/status/timestamp fields; does not change the document vs stream shape
-- `--csv` / `--plain` — tabular rows (collection envelopes unwrap to the row array)
+- `--csv` / `--plain` — tabular rows (collection envelopes unwrap to the row array). `--csv` prefixes `'` on a cell or header key that starts with `=`, `+`, `-`, `@`, tab, CR, or LF (fullwidth `＝＋－＠` too) so a spreadsheet does not run it as a formula; a plain signed number such as `-5` or `+2.5e3` is unchanged.
 - `--quiet` — one identity value per row, no envelope
 
 - **Pipeable** — JSON on stdout, errors on stderr
@@ -352,7 +382,7 @@ Global format flags share one contract on promoted, novel, sync, and `--deliver`
   {{.Name}}-pp-cli --help
   {{- end}}
   ```
-- **Previewable** — `--dry-run` shows the request without sending
+- **Previewable** — `--dry-run` shows the request without sending. A completed dry run exits 0 with `"success": true` and `"dry_run": true` and no HTTP `status`; validation failures still exit non-zero with `"success": false`.
 {{- if .HasDataLayer}}
 - **Offline-friendly** — sync/search commands can use the local SQLite store when available
 {{- end}}
@@ -389,9 +419,8 @@ Agents should treat the CLI's path resolver as part of the runtime contract:
 - Use per-kind env vars only when a specific kind must diverge: `{{envName .Name}}_CONFIG_DIR`, `{{envName .Name}}_DATA_DIR`, `{{envName .Name}}_STATE_DIR`, `{{envName .Name}}_CACHE_DIR`.
 - Resolution order is per-kind env var, `--home`, `{{envName .Name}}_HOME`, XDG (`XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME`, `XDG_CACHE_HOME`), then platform defaults.
 - `config` contains settings like `config.toml` and profiles. `data` contains {{if .HasAuthCommand}}`credentials.toml`, `data.db`, cookies, and auth sidecars{{else}}durable local data such as `data.db`{{end}}. `state` contains persisted queries, jobs, and `teach.log`. `cache` contains regenerable HTTP/cache files.
-{{- if .HasAuthCommand}}
-- Stored secrets live in `credentials.toml` under the data dir. Existing legacy `config.toml` secrets are read for compatibility and leave `config.toml` on the first auth write.
-{{- end}}
+{{if .HasAuthCommand}}- Stored secrets live in `credentials.toml` under the data dir. Existing legacy `config.toml` secrets are read for compatibility and leave `config.toml` on the first auth write.
+{{end -}}
 - Run `{{.Name}}-pp-cli doctor --fail-on warn` to surface {{if .HasAuthCommand}}path and credential-location warnings{{else}}path warnings{{end}}. `agent-context` exposes a schema v4 `paths` block for agents that need the resolved dirs.
 - For MCP, pass relocation through the MCP host config. The MCP binary does not inherit CLI flags:
 
@@ -409,6 +438,8 @@ Agents should treat the CLI's path resolver as part of the runtime contract:
   ```
 
 Fleet precedence: an inherited per-kind env var overrides an explicit `--home` for that kind. Use `{{envName .Name}}_HOME` or per-kind vars as durable fleet levers, and use `--home` only for a single invocation. Relocation is not reversible by unsetting env vars; move files manually before clearing `{{envName .Name}}_HOME`, or `doctor` will not find {{if .HasAuthCommand}}credentials{{else}}files{{end}} left under the former root.
+
+Local data is unencrypted and relies on OS account permissions plus disk encryption. {{if .HasDataLayer}}Reads in the default `--data-source auto` mode are written to the SQLite store; {{end}}GET responses are cached for five minutes under the cache dir. `local-data purge` previews what it would erase (store files, response cache, learn journal) and deletes only with `--yes`; it is not exposed over MCP. `{{envName .Name}}_NO_LOCAL_DATA=1` disables the response cache and store writes, turns `auto` reads into live reads, and blocks `sync`{{if .HasDataLayer}} and `workflow archive`; `--data-source local` still reads an existing store, and `{{envName .Name}}_DATA_SOURCE` sets the `--data-source` default{{end}}.
 {{- if .Learn.Enabled}}
 
 ## Automatic learning
@@ -646,10 +677,10 @@ Every command accepts `--deliver <sink>`. The output goes to the named sink in a
 | Sink | Effect |
 |------|--------|
 | `stdout` | Default; write to stdout only |
-| `file:<path>` | Atomically write output to `<path>` (tmp + rename). Binary-response commands write decoded payload bytes (not the base64 JSON envelope) and print a small JSON receipt on stdout; `--json`/`--csv` do not refuse when this sink is set. |
-| `webhook:<url>` | POST the output body to the URL (`application/json`) |
+| `file:<path>` | Atomically write output to `<path>` as a private 0600 file (exclusive randomly named temp in the destination directory, then rename; a planted symlink is not followed). Binary-response commands write decoded payload bytes (not the base64 JSON envelope) and print a small JSON receipt on stdout; `--json`/`--csv` do not refuse when this sink is set. |
+| `webhook:<url>` | POST the output body to the URL (`application/json`). Redirects are not followed; a 3xx response fails the delivery and the body is not sent to the `Location`. |
 
-Unknown schemes are refused with a structured error naming the supported set. Webhook failures return non-zero and log the URL + HTTP status on stderr.
+Unknown schemes are refused with a structured error naming the supported set. Webhook failures, including redirects, return non-zero and log the URL and HTTP status on stderr.
 
 ## Named Profiles
 
@@ -678,6 +709,8 @@ For endpoints that submit long-running work, the generator detects the submit-th
 | `--wait-interval` | Initial poll interval (default 2s; grows with exponential backoff up to 30s) |
 
 Use async submission without `--wait` when you want to fire-and-forget; use `--wait` when you want one command to return the finished artifact.
+
+If `--wait` times out or polling fails after the job was accepted, the command exits `8` and prints the job ID plus a recovery command that fetches the result. The job may still be running and may already be billed, so run the recovery command instead of resubmitting.
 {{- end}}
 
 ## Exit Codes
@@ -694,7 +727,14 @@ Use async submission without `--wait` when you want to fire-and-forget; use `--w
 {{- if .HasPartialFailureErr}}
 | 6 | Partial failure |
 {{- end}}
+{{- if .HasAuth}}
 | 7 | Rate limited (wait and retry) |
+{{- else}}
+| 7 | Rate limited or blocked by a firewall or bot challenge (back off; do not retry immediately) |
+{{- end}}
+{{- if .HasAsyncJobs}}
+| 8 | Async job submitted but not finished (run the printed recovery command; do not resubmit) |
+{{- end}}
 | 10 | Config error |
 
 ## Argument Parsing
@@ -724,6 +764,10 @@ claude mcp add {{.Name}}-pp-mcp -- {{.Name}}-pp-mcp
 ```
 
 Verify: `claude mcp list`
+{{- end}}
+{{- if .HasMCPTransport "http"}}
+
+For a remote host, `{{.Name}}-pp-mcp --transport http` requires `{{envName .Name}}_MCP_HTTP_TOKEN` set to at least 32 characters (callers send `Authorization: Bearer <token>`; `openssl rand -hex 32` prints 64 hex characters and meets that minimum), binds `{{if .MCP.Addr}}{{.MCP.Addr}}{{else}}127.0.0.1:7777{{end}}` by default, and needs `--tls-cert`/`--tls-key` for any non-loopback `--addr`. Requests with no `Origin` header are accepted. Loopback origins are accepted; any other `Origin` is refused unless listed in `{{envName .Name}}_MCP_HTTP_ALLOWED_ORIGINS` (comma-separated `scheme://host[:port]` values). `{{envName .Name}}_MCP_READ_ONLY=1` drops mirrored write commands (local-write commands that only touch the CLI's own learn store stay) and makes the raw execute tool refuse state-changing calls.
 {{- end}}
 
 ## Direct Use

@@ -1,6 +1,7 @@
 package pipeline
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,6 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/mvanhorn/cli-printing-press/v4/internal/browsersniff"
 	"github.com/mvanhorn/cli-printing-press/v4/internal/graphql"
 	"github.com/mvanhorn/cli-printing-press/v4/internal/naming"
 	"github.com/mvanhorn/cli-printing-press/v4/internal/openapi"
@@ -163,6 +165,12 @@ func ArchiveRunArtifacts(state *PipelineState) (string, error) {
 		{src: state.DiscoveryDir(), dst: ArchivedDiscoveryDir(state.APIName, state.RunID)},
 	}
 
+	// Scan every directory before copying any of them. research/ and
+	// discovery/ are separate calls; a hard link under research/ can name
+	// the same bytes as a raw capture under discovery/.
+	opts := PublishableManuscriptCopyOptions{}
+	var skipped skippedFiles
+	var ready []pair
 	for _, item := range pairs {
 		info, err := os.Stat(item.src)
 		if err != nil {
@@ -174,7 +182,15 @@ func ArchiveRunArtifacts(state *PipelineState) (string, error) {
 		if !info.IsDir() {
 			continue
 		}
-		if err := CopyPublishableManuscriptDir(item.src, item.dst); err != nil {
+		part, err := skippedPublishableContent(item.src, opts)
+		if err != nil {
+			return "", fmt.Errorf("archiving %s: %w", item.src, err)
+		}
+		skipped.merge(part)
+		ready = append(ready, item)
+	}
+	for _, item := range ready {
+		if err := copyPublishableManuscriptDir(item.src, item.dst, opts, skipped); err != nil {
 			return "", fmt.Errorf("archiving %s: %w", item.src, err)
 		}
 	}
@@ -218,6 +234,7 @@ func writeCLIManifestForPublish(state *PipelineState, dir string) error {
 		RunID:                state.RunID,
 	}
 	var existingDescription string
+	var existingAuthPreference string
 	toolsManifestExpected := false
 
 	// Carry forward metadata from the generated manifest when publish-time
@@ -229,6 +246,7 @@ func writeCLIManifestForPublish(state *PipelineState, dir string) error {
 		_ = json.Unmarshal(existingData, &existingRaw)
 		var existing CLIManifest
 		if json.Unmarshal(existingData, &existing) == nil {
+			existingAuthPreference = strings.TrimSpace(existing.AuthPreference)
 			if state.RunID == "" && existing.RunID != "" {
 				state.RunID = existing.RunID
 				m.RunID = existing.RunID
@@ -254,6 +272,9 @@ func writeCLIManifestForPublish(state *PipelineState, dir string) error {
 			if existing.Category != "" {
 				m.Category = existing.Category
 			}
+			if existing.Homepage != "" {
+				m.Homepage = existing.Homepage
+			}
 			if len(existing.Regions) > 0 {
 				m.Regions = append([]string(nil), existing.Regions...)
 			}
@@ -275,8 +296,10 @@ func writeCLIManifestForPublish(state *PipelineState, dir string) error {
 			m.MCPPublicToolCount = existing.MCPPublicToolCount
 			m.MCPReady = existing.MCPReady
 			m.AuthType = existing.AuthType
+			m.AuthPreference = existingAuthPreference
 			m.AuthEnvVars = existing.AuthEnvVars
 			m.AuthEnvVarSpecs = existing.AuthEnvVarSpecs
+			m.AuthAdditionalHeaders = existing.AuthAdditionalHeaders
 			m.EndpointTemplateVars = existing.EndpointTemplateVars
 			m.EndpointTemplateEnvOverrides = existing.EndpointTemplateEnvOverrides
 			m.EndpointTemplateVarDefaults = existing.EndpointTemplateVarDefaults
@@ -293,6 +316,11 @@ func writeCLIManifestForPublish(state *PipelineState, dir string) error {
 	// spec.yaml for YAML inputs; --docs / --plan runs leave no archive and
 	// these fields stay empty.
 	if specFile, data, err := findArchivedSpec(state.EffectiveWorkingDir()); err == nil && specFile != "" {
+		// The archive is the spec shipped with this CLI. Keep the provenance
+		// path pointed at it instead of the original research/download path.
+		if m.SpecPath != "" && m.SpecURL == "" {
+			m.SpecPath = filepath.Base(specFile)
+		}
 		m.SpecFormat = detectSpecFormat(data)
 		if checksum, err := specChecksum(specFile, m.SpecFormat); err == nil {
 			m.SpecChecksum = checksum
@@ -307,7 +335,10 @@ func writeCLIManifestForPublish(state *PipelineState, dir string) error {
 		)
 		switch m.SpecFormat {
 		case "openapi3":
-			parsed, parseErr = openapi.ParseWithPath(data, specFile)
+			parsed, parseErr = openapi.ParseWithOptions(data, openapi.ParseOptions{
+				Path:           specFile,
+				AuthPreference: existingAuthPreference,
+			})
 		case "graphql":
 			parsed, parseErr = graphql.ParseSDLBytes(specFile, data)
 		case "internal":
@@ -466,6 +497,7 @@ func applyPublishSpecMetadata(parsed *spec.APISpec, apiName string) {
 		specmeta.RebaseAuthEnvPrefix(&parsed.Auth, priorName, apiName)
 	}
 	parsed.Name = apiName
+	parsed.ApplyOmittedConfigDefaults()
 }
 
 // loadResearchForPromote returns the research.json relevant to the
@@ -660,22 +692,45 @@ type PublishableManuscriptCopyOptions struct {
 }
 
 // CopyPublishableManuscriptDir copies manuscript artifacts that may be bundled
-// into published CLIs. Raw browser-sniff captures stay in local runstate by
-// default because they can carry cookies, session identifiers, and PII.
-// Live-dogfood transcripts and pipeline runstate are always omitted: they
-// carry API response bodies and absolute host paths, and IncludeRawCaptures
-// does not opt them back in. Phase 5 acceptance and skip markers stay.
+// into published CLIs. Under discovery/, only press-authored summaries ship
+// by default. Raw captures stay behind because they carry third-party pages
+// and contact data. IncludeRawCaptures opts those captures back in for
+// private use. Live-dogfood transcripts and pipeline runstate are always
+// omitted: they carry API response bodies and absolute host paths, and
+// IncludeRawCaptures does not opt them back in. Phase 5 acceptance and skip
+// markers stay. Shipped text has absolute home and .runstate paths rewritten
+// to the <cli-dir> and <runstate> placeholders.
 func CopyPublishableManuscriptDir(src, dst string) error {
 	return CopyPublishableManuscriptDirWithOptions(src, dst, PublishableManuscriptCopyOptions{})
 }
 
 func CopyPublishableManuscriptDirWithOptions(src, dst string, opts PublishableManuscriptCopyOptions) error {
-	return copyDirFiltered(src, dst, func(path string, info fs.FileInfo) bool {
-		return shouldSkipPublishableManuscriptFile(path, info, opts)
-	})
+	skipped, err := skippedPublishableContent(src, opts)
+	if err != nil {
+		return err
+	}
+	return copyPublishableManuscriptDir(src, dst, opts, skipped)
 }
 
-func shouldSkipPublishableManuscriptFile(path string, info fs.FileInfo, opts PublishableManuscriptCopyOptions) bool {
+func copyPublishableManuscriptDir(src, dst string, opts PublishableManuscriptCopyOptions, skipped skippedFiles) error {
+	src = filepath.Clean(src)
+	if err := copyDirFiltered(src, dst, func(path string, info fs.FileInfo) bool {
+		if shouldSkipPublishableManuscriptFile(src, path, info, opts) {
+			return true
+		}
+		// A second name for a skipped capture (hard link), including one
+		// recorded from another manuscript directory, would ship the same bytes.
+		return skipped.contains(path, info)
+	}); err != nil {
+		return err
+	}
+	if err := pruneEmptyDiscoveryDirs(dst, strings.EqualFold(filepath.Base(src), "discovery")); err != nil {
+		return err
+	}
+	return redactAbsoluteHostPathsInTree(dst)
+}
+
+func shouldSkipPublishableManuscriptFile(root, path string, info fs.FileInfo, opts PublishableManuscriptCopyOptions) bool {
 	// A `sources/` directory holds downloaded third-party reference repos — local
 	// research INPUT, not authored manuscript OUTPUT. Never publish copies of other
 	// projects' code: it is a licensing problem and a secret/PII vector (the only
@@ -693,21 +748,274 @@ func shouldSkipPublishableManuscriptFile(path string, info fs.FileInfo, opts Pub
 		return true
 	}
 	// Live transcripts and pipeline runstate carry response bodies and host
-	// paths. This check stays ahead of IncludeRawCaptures so that flag remains
-	// limited to browser-sniff evidence. Phase 5 marker filenames stay copyable.
-	if isManuscriptPipelineRunstate(path, info) || isRawLiveDogfoodTranscript(filepath.Base(path)) {
+	// paths. This check stays ahead of IncludeRawCaptures so that flag cannot
+	// opt them back in. Phase 5 marker filenames stay copyable even when their
+	// JSON resembles a report.
+	if isManuscriptPipelineRunstate(path, info) || isRawLiveDogfoodTranscript(filepath.Base(path)) || isLiveDogfoodReportFile(path, info) {
 		return true
 	}
 	if opts.IncludeRawCaptures {
 		return false
 	}
-	if isRawBrowserSniffCapture(path, info) {
+	if isRawBrowserSniffCapture(root, path, info) {
 		return true
 	}
 	if strings.EqualFold(filepath.Ext(path), ".har") {
 		return true
 	}
+	if !info.IsDir() && isInsideDiscoveryTree(root, path) && !isPressAuthoredDiscoveryArtifact(filepath.Base(path)) {
+		return true
+	}
 	return false
+}
+
+// Summaries the press writes into discovery/: markdown reports, traffic
+// analysis, provenance, BLE analysis, and the deduped URL list. Capture
+// inputs (HAR, enriched JSON, direct responses, sniff-urls.txt) are not in
+// this set — sniff-urls.txt still has query strings.
+func isPressAuthoredDiscoveryArtifact(name string) bool {
+	lower := strings.ToLower(name)
+	if strings.HasSuffix(lower, ".md") {
+		return true
+	}
+	switch lower {
+	case "traffic-analysis.json",
+		"traffic-analysis.schema.json",
+		"ble-analysis.json",
+		"ble-evidence-redacted.json",
+		"browser-sniff-unique-paths.txt":
+		return true
+	}
+	for _, pattern := range []string{
+		"*-traffic-analysis.json",
+		"*-ble-analysis.json",
+		"*-provenance.json",
+	} {
+		matched, err := filepath.Match(pattern, lower)
+		if err == nil && matched {
+			return true
+		}
+	}
+	return false
+}
+
+// Discovery membership is relative to the directory being copied. A parent
+// named discovery (an API slug, or a workspace checkout) must not pull
+// research/ and proofs/ into the allowlist. Copying the discovery directory
+// itself has no discovery component in the relative path, so that root is
+// the discovery tree.
+func isInsideDiscoveryTree(root, path string) bool {
+	root = filepath.Clean(root)
+	path = filepath.Clean(path)
+	rel, err := filepath.Rel(root, path)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return false
+	}
+	if strings.EqualFold(filepath.Base(root), "discovery") {
+		return true
+	}
+	return pathHasComponentFold(filepath.Dir(rel), "discovery")
+}
+
+func skippedPublishableContent(src string, opts PublishableManuscriptCopyOptions) (skippedFiles, error) {
+	src = filepath.Clean(src)
+	var skipped skippedFiles
+	err := filepath.WalkDir(src, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			if path == src {
+				return walkErr
+			}
+			return skipIfVanished(walkErr, d != nil && d.IsDir())
+		}
+		if path == src || d.IsDir() {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return skipIfVanished(err, false)
+		}
+		// Directory skips (sources/, bundles/, sample dirs) do not mark each
+		// child, so a hard link of that child under another name would ship.
+		// Followed symlink targets would mark an ordinary file as raw when a
+		// skipped name points at it. The copy walk checks the link path and
+		// the resolved path separately.
+		if info.Mode()&fs.ModeSymlink != 0 || !info.Mode().IsRegular() {
+			return nil
+		}
+		if !shouldSkipPublishableManuscriptFile(src, path, info, opts) && !publishableAncestorSkipped(src, path, opts) {
+			return nil
+		}
+		skipped.add(path, info)
+		return nil
+	})
+	if err != nil {
+		return skippedFiles{}, err
+	}
+	return skipped, nil
+}
+
+func publishableAncestorSkipped(src, path string, opts PublishableManuscriptCopyOptions) bool {
+	dir := filepath.Dir(path)
+	for dir != src && dir != "." && dir != string(filepath.Separator) {
+		info, err := os.Lstat(dir)
+		if err != nil {
+			return false
+		}
+		if shouldSkipPublishableManuscriptFile(src, dir, info, opts) {
+			return true
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return false
+		}
+		dir = parent
+	}
+	return false
+}
+
+// fileIdentity is the device and inode (volume serial and file index on
+// Windows). Hard links share it; distinct files do not.
+type fileIdentity struct {
+	dev uint64
+	ino uint64
+}
+
+// skippedFiles records captures that must not ship under another name.
+// ids is the lookup; unknown keeps files whose identity could not be read
+// so those few still compare with os.SameFile.
+type skippedFiles struct {
+	ids     map[fileIdentity]struct{}
+	unknown []fs.FileInfo
+}
+
+func (s *skippedFiles) add(path string, info fs.FileInfo) {
+	if info == nil || !info.Mode().IsRegular() {
+		return
+	}
+	if id, ok := fileIdentityOf(path, info); ok {
+		if s.ids == nil {
+			s.ids = make(map[fileIdentity]struct{})
+		}
+		s.ids[id] = struct{}{}
+		return
+	}
+	s.unknown = append(s.unknown, info)
+}
+
+func (s *skippedFiles) merge(other skippedFiles) {
+	for id := range other.ids {
+		if s.ids == nil {
+			s.ids = make(map[fileIdentity]struct{})
+		}
+		s.ids[id] = struct{}{}
+	}
+	s.unknown = append(s.unknown, other.unknown...)
+}
+
+func (s skippedFiles) contains(path string, info fs.FileInfo) bool {
+	if info == nil || info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return false
+	}
+	if id, ok := fileIdentityOf(path, info); ok {
+		if _, found := s.ids[id]; found {
+			return true
+		}
+	}
+	for _, other := range s.unknown {
+		if os.SameFile(info, other) {
+			return true
+		}
+	}
+	return false
+}
+
+func pruneEmptyDiscoveryDirs(root string, wholeTreeIsDiscovery bool) error {
+	root = filepath.Clean(root)
+	var dirs []string
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if path == root || !d.IsDir() {
+			return nil
+		}
+		if wholeTreeIsDiscovery {
+			dirs = append(dirs, path)
+			return nil
+		}
+		if !isInsideDiscoveryTree(root, path) && !strings.EqualFold(filepath.Base(path), "discovery") {
+			return nil
+		}
+		dirs = append(dirs, path)
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	for i := len(dirs) - 1; i >= 0; i-- {
+		entries, err := os.ReadDir(dirs[i])
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return err
+		}
+		if len(entries) != 0 {
+			continue
+		}
+		if err := os.Remove(dirs[i]); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	return nil
+}
+
+func isPublishablePhase5Marker(name string) bool {
+	return strings.EqualFold(name, Phase5AcceptanceFilename) || strings.EqualFold(name, Phase5SkipFilename)
+}
+
+// Filename globs miss reruns. The on-disk report is a top-level tests array
+// whose entries carry output_sample, or the dir/binary/verdict/tests key set.
+func isLiveDogfoodReportFile(path string, info fs.FileInfo) bool {
+	if info.IsDir() || isPublishablePhase5Marker(filepath.Base(path)) {
+		return false
+	}
+	if !strings.EqualFold(filepath.Ext(path), ".json") {
+		return false
+	}
+	data, err := os.ReadFile(path)
+	if err != nil || !bytes.Contains(data, []byte(`"tests"`)) {
+		return false
+	}
+	return jsonHasLiveDogfoodReportShape(data)
+}
+
+func jsonHasLiveDogfoodReportShape(data []byte) bool {
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(data, &top); err != nil {
+		return false
+	}
+	testsRaw, hasTests := top["tests"]
+	if !hasTests {
+		return false
+	}
+	var tests []json.RawMessage
+	if err := json.Unmarshal(testsRaw, &tests); err != nil {
+		return false
+	}
+	for _, raw := range tests {
+		var entry map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &entry); err != nil {
+			continue
+		}
+		if _, ok := entry["output_sample"]; ok {
+			return true
+		}
+	}
+	_, hasDir := top["dir"]
+	_, hasBinary := top["binary"]
+	_, hasVerdict := top["verdict"]
+	return hasDir && hasBinary && hasVerdict
 }
 
 func isManuscriptPipelineRunstate(path string, info fs.FileInfo) bool {
@@ -735,29 +1043,146 @@ func isRawLiveDogfoodTranscript(name string) bool {
 	return false
 }
 
-func isRawBrowserSniffCapture(path string, info fs.FileInfo) bool {
-	clean := filepath.Clean(path)
-	base := filepath.Base(clean)
-	parentPath := filepath.Dir(clean)
+func isRawBrowserSniffCapture(root, path string, info fs.FileInfo) bool {
+	base := filepath.Base(path)
+	parentPath := filepath.Dir(path)
 
-	if pathHasComponent(parentPath, "discovery") {
+	if isInsideDiscoveryTree(root, path) {
 		hyphenated, _ := filepath.Match("probe-*.json", base)
 		underscored, _ := filepath.Match("probe_*.json", base)
 		if hyphenated || underscored {
 			return true
 		}
 	}
-	if info.IsDir() && pathHasComponent(parentPath, "discovery") && base == "bundles" {
+	if info.IsDir() && isInsideDiscoveryTree(root, path) && base == "bundles" {
 		return true
 	}
-	if info.IsDir() && pathHasComponent(parentPath, "research") && strings.HasSuffix(base, "-browser-sniff-spec-samples") {
+	// New writes carry the marker for any --samples-output name. Older trees
+	// used *-browser-sniff-spec-samples, or <stem>-samples for any spec stem.
+	// Stem directories still hold raw_url credentials. Authored notes in a
+	// -samples directory do not.
+	if info.IsDir() && hasSniffSamplesMarker(path) {
+		return true
+	}
+	if info.IsDir() && pathHasComponent(parentPath, "research") && isHistoricalSniffSamplesDir(path, base) {
 		return true
 	}
 	return false
 }
 
+func isHistoricalSniffSamplesDir(dir, name string) bool {
+	lower := strings.ToLower(name)
+	if !strings.HasSuffix(lower, "-samples") {
+		return false
+	}
+	// The pre-marker writer default. Keep it even when the JSON was already
+	// scrubbed of raw_url, so those trees do not reappear on republish.
+	if strings.HasSuffix(lower, "-browser-sniff-spec-samples") {
+		return true
+	}
+	return dirContainsRawURLSample(dir)
+}
+
+func dirContainsRawURLSample(dir string) bool {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.EqualFold(filepath.Ext(entry.Name()), ".json") {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil || !info.Mode().IsRegular() {
+			continue
+		}
+		// Packaging already drops files at or above this cap, so reading
+		// them cannot change what ships.
+		if info.Size() >= publishableManuscriptMaxCaptureBytes {
+			continue
+		}
+		if fileHasSampleShape(filepath.Join(dir, entry.Name())) {
+			return true
+		}
+	}
+	return false
+}
+
+// Both keys are required, and response_body_known follows the bodies, so a
+// bounded head or tail read can miss it. A note that mentions raw_url without
+// that flag is authored research. A read error after raw_url is seen omits
+// the directory instead of shipping an unconfirmed sample.
+func fileHasSampleShape(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer func() { _ = f.Close() }()
+
+	rawKey := []byte(`"raw_url"`)
+	knownKey := []byte(`"response_body_known"`)
+	overlap := len(knownKey) - 1
+	buf := make([]byte, 32*1024)
+	var carry []byte
+	sawRaw := false
+	sawKnown := false
+	for {
+		n, err := f.Read(buf)
+		window := buf[:n]
+		if len(carry) > 0 {
+			joined := make([]byte, len(carry)+n)
+			copy(joined, carry)
+			copy(joined[len(carry):], buf[:n])
+			window = joined
+		}
+		if n > 0 || len(carry) > 0 {
+			if !sawRaw && bytes.Contains(window, rawKey) {
+				sawRaw = true
+			}
+			if !sawKnown && bytes.Contains(window, knownKey) {
+				sawKnown = true
+			}
+			if sawRaw && sawKnown {
+				return true
+			}
+		}
+		if err == io.EOF {
+			return false
+		}
+		if err != nil {
+			return sawRaw
+		}
+		if len(window) == 0 {
+			continue
+		}
+		if len(window) > overlap {
+			next := make([]byte, overlap)
+			copy(next, window[len(window)-overlap:])
+			carry = next
+			continue
+		}
+		next := make([]byte, len(window))
+		copy(next, window)
+		carry = next
+	}
+}
+
+func hasSniffSamplesMarker(dir string) bool {
+	info, err := os.Lstat(filepath.Join(dir, browsersniff.SamplesDirMarker))
+	return err == nil && info.Mode().IsRegular()
+}
+
 func pathHasComponent(path, component string) bool {
 	return slices.Contains(strings.Split(filepath.ToSlash(filepath.Clean(path)), "/"), component)
+}
+
+func pathHasComponentFold(path, component string) bool {
+	for part := range strings.SplitSeq(filepath.ToSlash(filepath.Clean(path)), "/") {
+		if strings.EqualFold(part, component) {
+			return true
+		}
+	}
+	return false
 }
 
 // A WalkDir child can disappear between enumeration and stat (Windows

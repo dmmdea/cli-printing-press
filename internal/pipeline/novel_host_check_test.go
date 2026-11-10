@@ -4,12 +4,108 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestNovelHostGeneratedEndpointAnnotationIgnored(t *testing.T) {
+	cliDir, researchDir := seedReimplementationFixture(t, map[string]string{
+		"root.go": `package cli
+func init() {
+	rootCmd.AddCommand(newVideosCmd())
+	rootCmd.AddCommand(newTranscriptsCmd())
+}
+`,
+		"videos.go": `package cli
+func newVideosCmd() *cobra.Command {
+	cmd := &cobra.Command{Use: "videos"}
+	cmd.AddCommand(newVideosSearchCmd())
+	return cmd
+}
+`,
+		"videos_search.go": `package cli
+func newVideosSearchCmd() *cobra.Command {
+	return &cobra.Command{
+		Use: "search",
+		Annotations: map[string]string{
+			"pp:endpoint": "videos.search",
+			"pp:method": "GET",
+			"pp:path": "/v1/videos/search",
+		},
+	}
+}
+`,
+		"transcripts.go": `package cli
+func newTranscriptsCmd() *cobra.Command {
+	cmd := &cobra.Command{Use: "transcripts"}
+	cmd.AddCommand(newTranscriptsSearchCmd())
+	return cmd
+}
+`,
+		"transcripts_search.go": `package cli
+func newTranscriptsSearchCmd() *cobra.Command {
+	return &cobra.Command{Use: "search"}
+}
+`,
+	}, []NovelFeature{{Name: "Search transcripts", Command: "transcripts search"}})
+
+	assert.Empty(t, checkReimplementation(cliDir, researchDir).UnverifiedHosts)
+}
+
+func TestNovelHostAnnotationCallsStillChecked(t *testing.T) {
+	for _, annotation := range []string{
+		`cmd.Annotations["custom"] = VALUE`,
+		`cmd.Annotations = map[string]string{"custom": VALUE}`,
+		`cmd = &cobra.Command{Annotations: map[string]string{"custom": VALUE}}`,
+	} {
+		for _, value := range []string{
+			`fetch("https://unknown.example.test")`,
+			`func() string { _, _ = http.Get("https://unknown.example.test"); return "metadata" }()`,
+			`fmt.Sprint(func() string { _, _ = http.Get("https://unknown.example.test"); return "metadata" }())`,
+			`"videos.search"`,
+			`("https://metadata.example.test" + "/path")`,
+		} {
+			t.Run(annotation+value, func(t *testing.T) {
+				src := "package cli\nfunc command() { " + strings.ReplaceAll(annotation, "VALUE", value) + " }"
+				got := hostsInGoSource("search.go", src, "search")
+				if strings.Contains(value, "unknown.example.test") {
+					require.Len(t, got, 1)
+					assert.Equal(t, "unknown.example.test", got[0].host)
+				} else {
+					assert.Empty(t, got)
+				}
+			})
+		}
+	}
+}
+
+func TestNovelHostIgnoresAnnotationValues(t *testing.T) {
+	src := `package cli
+func newSearchCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use: "search",
+		Annotations: map[string]string{
+			"pp:endpoint": "videos.search",
+			"pp:method": "GET",
+			"pp:path": "/v1/videos/search",
+			"custom": "https://metadata.example-unknown.com",
+			"https://key.example-unknown.com": "metadata",
+		},
+	}
+	cmd.Annotations["pp:endpoint"] = "transcripts.search"
+	cmd.Annotations = map[string]string{"custom": "https://other.example-unknown.com"}
+	_ = "https://api.example-unknown.com/v1"
+	return cmd
+}
+`
+	got := hostsInGoSource("search.go", src, "transcripts search")
+	require.Len(t, got, 1)
+	assert.Equal(t, "api.example-unknown.com", got[0].host)
+}
 
 func TestUnverifiedNovelHostAbsentFromResearchFails(t *testing.T) {
 	cliDir, researchDir := seedReimplementationFixture(t, map[string]string{
@@ -95,6 +191,222 @@ func TestNovelHostInDocumentedURLListPasses(t *testing.T) {
 
 	got := checkReimplementation(cliDir, researchDir)
 	assert.Empty(t, got.UnverifiedHosts)
+}
+
+func TestRFCReservedHostsInNovelHelpAndResearchPass(t *testing.T) {
+	cliDir, researchDir := seedReimplementationFixture(t, map[string]string{
+		"play.go": `package cli
+
+import "github.com/spf13/cobra"
+
+func newPlayCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "play --webhook https://hooks.example.com/events",
+		Short: "Send a test notification to hooks.example.net",
+		Long:  "Use https://preview.example.org/events or https://service.example/test.",
+		Example: ` + "`" + `  play --webhook https://hooks.example.com/events
+  play --email reader@example.com
+  play --webhook https://preview.test/events
+  play --webhook https://preview.invalid/events
+  play --webhook https://preview.localhost/events` + "`" + `,
+	}
+}
+`,
+	}, []NovelFeature{{
+		Name:         "Play",
+		Command:      "play",
+		Description:  "Try https://hooks.example.com/events before configuring a real webhook.",
+		Example:      "Send a receipt to reader@example.org through https://preview.test/events.",
+		WhyItMatters: "The invalid URL https://preview.invalid/events is safe documentation.",
+	}})
+
+	got := checkReimplementation(cliDir, researchDir)
+	assert.Empty(t, got.UnverifiedHosts)
+}
+
+func TestRFCReservedRuntimeHostStillFailsNovelHostGate(t *testing.T) {
+	cliDir, researchDir := seedReimplementationFixture(t, map[string]string{
+		"play.go": `package cli
+
+import "github.com/spf13/cobra"
+
+const webhookURL = "https://hooks.example.com/events"
+
+func newPlayCmd() *cobra.Command {
+	return &cobra.Command{Use: "play"}
+}
+`,
+	}, []NovelFeature{{
+		Name:    "Play",
+		Command: "play",
+	}})
+
+	got := checkReimplementation(cliDir, researchDir)
+	require.Len(t, got.UnverifiedHosts, 1)
+	assert.Equal(t, "hooks.example.com", got.UnverifiedHosts[0].Host)
+	assert.Equal(t, "play.go", got.UnverifiedHosts[0].File)
+}
+
+func TestRFCReservedHostInAssignedNovelHelpPasses(t *testing.T) {
+	cliDir, researchDir := seedReimplementationFixture(t, map[string]string{
+		"play.go": `package cli
+
+import "github.com/spf13/cobra"
+
+func newPlayCmd() *cobra.Command {
+	cmd := &cobra.Command{Use: "play"}
+	cmd.Example = "play --webhook https://hooks.example.com/events"
+	return cmd
+}
+`,
+	}, []NovelFeature{{
+		Name:    "Play",
+		Command: "play",
+	}})
+
+	got := checkReimplementation(cliDir, researchDir)
+	assert.Empty(t, got.UnverifiedHosts)
+}
+
+func TestRFCReservedHostInLiteralNovelHelpPasses(t *testing.T) {
+	cliDir, researchDir := seedReimplementationFixture(t, map[string]string{
+		"play.go": `package cli
+
+import "github.com/spf13/cobra"
+
+func newPlayCmd() *cobra.Command {
+	return &cobra.Command{
+		Use: "play",
+		Long: "Send events to https://hooks.example.com/events.",
+	}
+}
+`,
+	}, []NovelFeature{{
+		Name:    "Play",
+		Command: "play",
+	}})
+
+	got := checkReimplementation(cliDir, researchDir)
+	assert.Empty(t, got.UnverifiedHosts)
+}
+
+func TestRFCReservedHostInNovelHelpCallFails(t *testing.T) {
+	cliDir, researchDir := seedReimplementationFixture(t, map[string]string{
+		"play.go": `package cli
+
+import (
+	"net/http"
+
+	"github.com/spf13/cobra"
+)
+
+func newPlayCmd() *cobra.Command {
+	return &cobra.Command{
+		Use: "play",
+		Long: func() string {
+			_, _ = http.Get("https://hooks.example.com/events")
+			return "Send events."
+		}(),
+	}
+}
+`,
+	}, []NovelFeature{{
+		Name:    "Play",
+		Command: "play",
+	}})
+
+	got := checkReimplementation(cliDir, researchDir)
+	require.Len(t, got.UnverifiedHosts, 1)
+	assert.Equal(t, "hooks.example.com", got.UnverifiedHosts[0].Host)
+}
+
+func TestRFCReservedHostInNovelFlagUsagePasses(t *testing.T) {
+	cliDir, researchDir := seedReimplementationFixture(t, map[string]string{
+		"play.go": `package cli
+
+import "github.com/spf13/cobra"
+
+func newPlayCmd() *cobra.Command {
+	cmd := &cobra.Command{Use: "play"}
+	cmd.PersistentFlags().String("webhook", "", "URL, e.g. https://hooks.example.com/events")
+	return cmd
+}
+`,
+	}, []NovelFeature{{
+		Name:    "Play",
+		Command: "play",
+	}})
+
+	got := checkReimplementation(cliDir, researchDir)
+	assert.Empty(t, got.UnverifiedHosts)
+}
+
+func TestRFCReservedHostInNovelFlagDefaultStillFails(t *testing.T) {
+	cliDir, researchDir := seedReimplementationFixture(t, map[string]string{
+		"play.go": `package cli
+
+import "github.com/spf13/cobra"
+
+func newPlayCmd() *cobra.Command {
+	cmd := &cobra.Command{Use: "play"}
+	cmd.Flags().String("webhook", "https://hooks.example.com/events", "Webhook URL")
+	return cmd
+}
+`,
+	}, []NovelFeature{{
+		Name:    "Play",
+		Command: "play",
+	}})
+
+	got := checkReimplementation(cliDir, researchDir)
+	require.Len(t, got.UnverifiedHosts, 1)
+	assert.Equal(t, "hooks.example.com", got.UnverifiedHosts[0].Host)
+}
+
+func TestUnverifiedRealHostInAssignedNovelHelpFails(t *testing.T) {
+	cliDir, researchDir := seedReimplementationFixture(t, map[string]string{
+		"play.go": `package cli
+
+import "github.com/spf13/cobra"
+
+func newPlayCmd() *cobra.Command {
+	cmd := &cobra.Command{Use: "play"}
+	cmd.Example = "play --webhook https://hooks.unverified.example-api.com/events"
+	return cmd
+}
+`,
+	}, []NovelFeature{{
+		Name:    "Play",
+		Command: "play",
+	}})
+
+	got := checkReimplementation(cliDir, researchDir)
+	require.Len(t, got.UnverifiedHosts, 1)
+	assert.Equal(t, "hooks.unverified.example-api.com", got.UnverifiedHosts[0].Host)
+}
+
+func TestUnverifiedRealHostInNovelHelpFails(t *testing.T) {
+	cliDir, researchDir := seedReimplementationFixture(t, map[string]string{
+		"play.go": `package cli
+
+import "github.com/spf13/cobra"
+
+func newPlayCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:     "play",
+		Example: "play --webhook https://hooks.unverified.example-api.com/events",
+	}
+}
+`,
+	}, []NovelFeature{{
+		Name:    "Play",
+		Command: "play",
+	}})
+
+	got := checkReimplementation(cliDir, researchDir)
+	require.Len(t, got.UnverifiedHosts, 1)
+	assert.Equal(t, "hooks.unverified.example-api.com", got.UnverifiedHosts[0].Host)
+	assert.Equal(t, "play.go", got.UnverifiedHosts[0].File)
 }
 
 func TestNovelHostDNSNXDOMAINFailsWhenObserved(t *testing.T) {
@@ -833,12 +1145,44 @@ func TestDottedProseIdentifierIsNotAHost(t *testing.T) {
 	assert.Empty(t, findings)
 }
 
+func TestNovelHostLiteralClassification(t *testing.T) {
+	tests := []struct {
+		literal string
+		want    []string
+	}{
+		{literal: "events.jsonl"},
+		{literal: "exchange-snapshots.db"},
+		{literal: "audit.log"},
+		{literal: "notes.md"},
+		{literal: "8.0.1.0"},
+		{literal: "2.0"},
+		{literal: "tables.create"},
+		{literal: "VM.Audit"},
+		{literal: "articles.get"},
+		{literal: "api.vendor.example", want: []string{"api.vendor.example"}},
+		{literal: "evil.example.com", want: []string{"evil.example.com"}},
+		{literal: "www.googleapis.com", want: []string{"www.googleapis.com"}},
+		{literal: "cdn.example.test", want: []string{"cdn.example.test"}},
+		{literal: "https://evil.example.com/v1", want: []string{"evil.example.com"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.literal, func(t *testing.T) {
+			src := "package cli\n\nfunc newPlayCmd() {\n\t_ = " + strconv.Quote(tt.literal) + "\n}\n"
+			var got []string
+			for _, decl := range hostsInGoSource("play.go", src, "play") {
+				got = append(got, decl.host)
+			}
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
 func TestRepeatedUnverifiedHostUsesFeatureLine(t *testing.T) {
 	cliDir, researchDir := seedReimplementationFixture(t, map[string]string{
 		"root.go": "package cli\n",
 	}, []NovelFeature{
-		{Name: "One", Command: "one", Description: "Calls https://ghost.example.test/a"},
-		{Name: "Two", Command: "two", Description: "Calls https://ghost.example.test/b"},
+		{Name: "One", Command: "one", Description: "Calls https://ghost.unverified.example-api.com/a"},
+		{Name: "Two", Command: "two", Description: "Calls https://ghost.unverified.example-api.com/b"},
 	})
 	raw, err := os.ReadFile(filepath.Join(researchDir, "research.json"))
 	require.NoError(t, err)
@@ -853,8 +1197,8 @@ func TestRepeatedUnverifiedHostUsesFeatureLine(t *testing.T) {
 	two := byCommand["two"]
 	assert.NotEqual(t, one.Line, two.Line)
 	assert.Equal(t, "research.json", one.File)
-	assert.Contains(t, lineText(raw, one.Line), "ghost.example.test/a")
-	assert.Contains(t, lineText(raw, two.Line), "ghost.example.test/b")
+	assert.Contains(t, lineText(raw, one.Line), "ghost.unverified.example-api.com/a")
+	assert.Contains(t, lineText(raw, two.Line), "ghost.unverified.example-api.com/b")
 }
 
 func TestDogfoodHostGateUsesResolvedSpecOnce(t *testing.T) {
@@ -894,4 +1238,668 @@ func writeSpecRoot(t *testing.T, serverURL string) string {
 	dir := t.TempDir()
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "spec.yaml"), []byte("servers:\n  - url: "+serverURL+"\n"), 0o644))
 	return dir
+}
+
+func TestRFCReservedHostInFormattedNovelHelpPasses(t *testing.T) {
+	cliDir, researchDir := seedReimplementationFixture(t, map[string]string{
+		"play.go": `package cli
+
+import (
+	"fmt"
+
+	"github.com/spf13/cobra"
+)
+
+func newPlayCmd(path string) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:  "play",
+		Long: fmt.Sprintf("Send events to https://hooks.example.com/%s.", path),
+	}
+	cmd.Flags().String("target", "", fmt.Sprintf("Target URL, e.g. %s", "https://hooks.example.com/events"))
+	return cmd
+}
+`,
+	}, []NovelFeature{{
+		Name:    "Play",
+		Command: "play",
+	}})
+
+	got := checkReimplementation(cliDir, researchDir)
+	assert.Empty(t, got.UnverifiedHosts)
+}
+
+func TestNovelHostApexAndVocabularyNamespace(t *testing.T) {
+	cliDir, researchDir := seedReimplementationFixture(t, map[string]string{
+		"deals.go": `package cli
+
+import "strings"
+
+const schemaOrgPrefix = "https://schema.org/"
+
+func newDealsCmd() {
+	var host, itemCondition string
+	if host == "subito.it" || strings.HasSuffix(host, ".subito.it") {
+		_ = host
+	}
+	if host == "evilsubito.it" || host == "subito.it.evil.com" || host == "shop.subito.it" {
+		_ = host
+	}
+	_ = strings.TrimPrefix(itemCondition, schemaOrgPrefix)
+	_ = strings.TrimPrefix(itemCondition, "https://schema.org/")
+	_ = strings.TrimPrefix(itemCondition, "https://www.schema.org/")
+	_ = strings.TrimPrefix(itemCondition, "https://notschema.org/")
+	_ = strings.TrimPrefix(itemCondition, "https://evil.schema.org/")
+	_ = strings.TrimPrefix(itemCondition, "https://schema.org.evil.com/")
+	_ = "https://ghost.unverified.example-api.com/v1/items"
+	// Use: "deals"
+}
+`,
+	}, []NovelFeature{{
+		Name:    "Deals",
+		Command: "deals",
+	}})
+	require.NoError(t, os.WriteFile(filepath.Join(researchDir, "observed-urls.txt"), []byte("https://www.subito.it/annunci\nhttps://hades.subito.it/v1/search\n"), 0o644))
+
+	got := checkReimplementation(cliDir, researchDir)
+	hosts := map[string]bool{}
+	for _, finding := range got.UnverifiedHosts {
+		hosts[finding.Host] = true
+	}
+	assert.False(t, hosts["subito.it"], "apex of an observed subdomain must pass: %#v", got.UnverifiedHosts)
+	assert.False(t, hosts["schema.org"], "schema.org trim prefix must pass: %#v", got.UnverifiedHosts)
+	assert.False(t, hosts["www.schema.org"], "www.schema.org trim prefix must pass: %#v", got.UnverifiedHosts)
+	for _, host := range []string{
+		"evilsubito.it",
+		"subito.it.evil.com",
+		"shop.subito.it",
+		"notschema.org",
+		"evil.schema.org",
+		"schema.org.evil.com",
+		"ghost.unverified.example-api.com",
+	} {
+		assert.True(t, hosts[host], "host %s must still fail: %#v", host, got.UnverifiedHosts)
+	}
+}
+
+func TestNovelHostApexDoesNotMatchLookalikeObservedHosts(t *testing.T) {
+	cliDir, researchDir := seedReimplementationFixture(t, map[string]string{
+		"deals.go": `package cli
+
+func newDealsCmd() {
+	host := "subito.it"
+	_ = host
+	// Use: "deals"
+}
+`,
+	}, []NovelFeature{{
+		Name:    "Deals",
+		Command: "deals",
+	}})
+	require.NoError(t, os.WriteFile(filepath.Join(researchDir, "observed-urls.txt"), []byte("https://www.evilsubito.it/\nhttps://subito.it.evil.com/path\n"), 0o644))
+
+	got := checkReimplementation(cliDir, researchDir)
+	require.NotEmpty(t, got.UnverifiedHosts)
+	assert.Equal(t, "subito.it", got.UnverifiedHosts[0].Host)
+}
+
+func TestVocabularyNamespaceAffixExemptionScope(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name    string
+		files   map[string]string
+		present []string
+		absent  []string
+	}{
+		{
+			name: "local const trim",
+			files: map[string]string{
+				"deals.go": `package cli
+
+import "strings"
+
+func newDealsCmd() {
+	const prefix = "https://schema.org/"
+	var item string
+	_ = strings.TrimPrefix(item, prefix)
+	// Use: "deals"
+}
+`,
+			},
+			absent: []string{"schema.org"},
+		},
+		{
+			name: "local var trim",
+			files: map[string]string{
+				"deals.go": `package cli
+
+import "strings"
+
+func newDealsCmd() {
+	var prefix = "https://schema.org/"
+	var item string
+	_ = strings.TrimPrefix(item, prefix)
+	// Use: "deals"
+}
+`,
+			},
+			absent: []string{"schema.org"},
+		},
+		{
+			name: "local const fetch",
+			files: map[string]string{
+				"deals.go": `package cli
+
+import "net/http"
+
+func newDealsCmd() {
+	const prefix = "https://schema.org/"
+	_, _ = http.Get(prefix + "version/latest/schemaorg-current-https.jsonld")
+	// Use: "deals"
+}
+`,
+			},
+			present: []string{"schema.org"},
+		},
+		{
+			name: "local var fetch",
+			files: map[string]string{
+				"deals.go": `package cli
+
+import "net/http"
+
+func newDealsCmd() {
+	var prefix = "https://schema.org/"
+	_, _ = http.Get(prefix + "version/latest/schemaorg-current-https.jsonld")
+	// Use: "deals"
+}
+`,
+			},
+			present: []string{"schema.org"},
+		},
+		{
+			name: "cross file fetch",
+			files: map[string]string{
+				"deals.go": `package cli
+
+import "strings"
+
+const schemaOrgPrefix = "https://schema.org/"
+
+func newDealsCmd() {
+	var item string
+	_ = strings.TrimPrefix(item, schemaOrgPrefix)
+	fetchSchema()
+	// Use: "deals"
+}
+`,
+				"schema_fetch.go": `package cli
+
+import "net/http"
+
+func fetchSchema() {
+	_, _ = http.Get(schemaOrgPrefix + "version/latest/schemaorg-current-https.jsonld")
+}
+`,
+			},
+			present: []string{"schema.org"},
+		},
+		{
+			name: "const in other file fetched from command",
+			files: map[string]string{
+				"deals.go": `package cli
+
+import "net/http"
+
+func newDealsCmd() {
+	_, _ = http.Get(schemaOrgPrefix + "version/latest/schemaorg-current-https.jsonld")
+	// Use: "deals"
+}
+`,
+				"schema_const.go": `package cli
+
+import "strings"
+
+const schemaOrgPrefix = "https://schema.org/"
+
+func trimSchema(item string) string {
+	return strings.TrimPrefix(item, schemaOrgPrefix)
+}
+`,
+			},
+			present: []string{"schema.org"},
+		},
+		{
+			name: "cross file trim only",
+			files: map[string]string{
+				"deals.go": `package cli
+
+const schemaOrgPrefix = "https://schema.org/"
+
+func newDealsCmd() {
+	trimSchema("")
+	// Use: "deals"
+}
+`,
+				"schema_trim.go": `package cli
+
+import "strings"
+
+func trimSchema(item string) string {
+	return strings.TrimPrefix(item, schemaOrgPrefix)
+}
+`,
+			},
+			absent: []string{"schema.org"},
+		},
+		{
+			name: "alias const then fetch",
+			files: map[string]string{
+				"deals.go": `package cli
+
+const schemaOrgPrefix = "https://schema.org/"
+
+func newDealsCmd() {
+	trimSchema("")
+	// Use: "deals"
+}
+`,
+				"schema_alias.go": `package cli
+
+import "net/http"
+
+const alias = schemaOrgPrefix
+const alias2 = alias
+
+func trimSchema(item string) string { return item }
+
+func fetchSchema() {
+	_, _ = http.Get(alias2 + "version/latest/schemaorg-current-https.jsonld")
+}
+`,
+			},
+			present: []string{"schema.org"},
+		},
+		{
+			name: "alias const then trim",
+			files: map[string]string{
+				"deals.go": `package cli
+
+import "strings"
+
+const schemaOrgPrefix = "https://schema.org/"
+const alias = schemaOrgPrefix
+const alias2 = alias
+
+func newDealsCmd() {
+	var item string
+	_ = strings.TrimPrefix(item, alias2)
+	// Use: "deals"
+}
+`,
+			},
+			absent: []string{"schema.org"},
+		},
+		{
+			name: "grouped const copy fetch",
+			files: map[string]string{
+				"deals.go": `package cli
+
+import "net/http"
+
+const (
+	schemaOrgPrefix = "https://schema.org/"
+	alias
+)
+
+func newDealsCmd() {
+	_, _ = http.Get(alias + "version/latest/schemaorg-current-https.jsonld")
+	// Use: "deals"
+}
+`,
+			},
+			present: []string{"schema.org"},
+		},
+		{
+			name: "grouped const copy trim",
+			files: map[string]string{
+				"deals.go": `package cli
+
+import "strings"
+
+const (
+	schemaOrgPrefix = "https://schema.org/"
+	alias
+)
+
+func newDealsCmd() {
+	var item string
+	_ = strings.TrimPrefix(item, alias)
+	// Use: "deals"
+}
+`,
+			},
+			absent: []string{"schema.org"},
+		},
+		{
+			name: "grouped const original fetch and copy trim",
+			files: map[string]string{
+				"deals.go": `package cli
+
+import (
+	"net/http"
+	"strings"
+)
+
+const (
+	schemaOrgPrefix = "https://schema.org/"
+	alias
+)
+
+func newDealsCmd() {
+	var item string
+	_ = strings.TrimPrefix(item, alias)
+	_, _ = http.Get(schemaOrgPrefix + "version/latest/schemaorg-current-https.jsonld")
+	// Use: "deals"
+}
+`,
+			},
+			present: []string{"schema.org"},
+		},
+		{
+			name: "grouped const inherited alias then fetch",
+			files: map[string]string{
+				"deals.go": `package cli
+
+import (
+	"net/http"
+	"strings"
+)
+
+const (
+	base = "https://schema.org/"
+	trim = base
+	fetch
+)
+
+func newDealsCmd() {
+	var item string
+	_ = strings.TrimPrefix(item, trim)
+	_, _ = http.Get(fetch)
+	// Use: "deals"
+}
+`,
+			},
+			present: []string{"schema.org"},
+		},
+		{
+			name: "grouped const inherited alias trim only",
+			files: map[string]string{
+				"deals.go": `package cli
+
+import "strings"
+
+const (
+	base = "https://schema.org/"
+	trim = base
+	also
+)
+
+func newDealsCmd() {
+	var item string
+	_ = strings.TrimPrefix(item, trim)
+	_ = strings.TrimPrefix(item, also)
+	// Use: "deals"
+}
+`,
+			},
+			absent: []string{"schema.org"},
+		},
+		{
+			name: "local grouped const inherited alias then fetch",
+			files: map[string]string{
+				"deals.go": `package cli
+
+import (
+	"net/http"
+	"strings"
+)
+
+func newDealsCmd() {
+	const (
+		base = "https://schema.org/"
+		trim = base
+		fetch
+	)
+	var item string
+	_ = strings.TrimPrefix(item, trim)
+	_, _ = http.Get(fetch)
+	// Use: "deals"
+}
+`,
+			},
+			present: []string{"schema.org"},
+		},
+		{
+			name: "local grouped const inherited alias trim only",
+			files: map[string]string{
+				"deals.go": `package cli
+
+import "strings"
+
+func newDealsCmd() {
+	const (
+		base = "https://schema.org/"
+		trim = base
+		also
+	)
+	var item string
+	_ = strings.TrimPrefix(item, trim)
+	_ = strings.TrimPrefix(item, also)
+	// Use: "deals"
+}
+`,
+			},
+			absent: []string{"schema.org"},
+		},
+		{
+			name: "shadow fetch before local declaration",
+			files: map[string]string{
+				"deals.go": `package cli
+
+import (
+	"net/http"
+	"strings"
+)
+
+const schemaOrgPrefix = "https://schema.org/"
+
+func trimSchema(item string) string {
+	return strings.TrimPrefix(item, schemaOrgPrefix)
+}
+
+func newDealsCmd() {
+	_, _ = http.Get(schemaOrgPrefix + "version/latest/schemaorg-current-https.jsonld")
+	schemaOrgPrefix := "safe"
+	_ = strings.TrimPrefix("", schemaOrgPrefix)
+	// Use: "deals"
+}
+`,
+			},
+			present: []string{"schema.org"},
+		},
+		{
+			name: "param shadows package const",
+			files: map[string]string{
+				"deals.go": `package cli
+
+import (
+	"net/http"
+	"strings"
+)
+
+const schemaOrgPrefix = "https://schema.org/"
+
+func newDealsCmd() {
+	var item string
+	_ = strings.TrimPrefix(item, schemaOrgPrefix)
+	sneak("https://ghost.unverified.example-api.com/x")
+	// Use: "deals"
+}
+
+func sneak(schemaOrgPrefix string) {
+	_, _ = http.Get(schemaOrgPrefix)
+}
+`,
+			},
+			present: []string{"ghost.unverified.example-api.com"},
+			absent:  []string{"schema.org"},
+		},
+		{
+			name: "pass const into a fetch helper",
+			files: map[string]string{
+				"deals.go": `package cli
+
+import "strings"
+
+const schemaOrgPrefix = "https://schema.org/"
+
+func newDealsCmd() {
+	var item string
+	_ = strings.TrimPrefix(item, schemaOrgPrefix)
+	fetchSchema(schemaOrgPrefix + "version/latest/schemaorg-current-https.jsonld")
+	// Use: "deals"
+}
+`,
+				"schema_fetch.go": `package cli
+
+import "net/http"
+
+func fetchSchema(url string) {
+	_, _ = http.Get(url)
+}
+`,
+			},
+			present: []string{"schema.org"},
+		},
+		{
+			name: "local alias then fetch",
+			files: map[string]string{
+				"deals.go": `package cli
+
+import (
+	"net/http"
+	"strings"
+)
+
+const schemaOrgPrefix = "https://schema.org/"
+
+func newDealsCmd() {
+	var item string
+	_ = strings.TrimPrefix(item, schemaOrgPrefix)
+	u := schemaOrgPrefix + "version/latest/schemaorg-current-https.jsonld"
+	_, _ = http.Get(u)
+	// Use: "deals"
+}
+`,
+			},
+			present: []string{"schema.org"},
+		},
+		{
+			name: "local const copied to var then trimmed",
+			files: map[string]string{
+				"deals.go": `package cli
+
+import "strings"
+
+func newDealsCmd() {
+	const prefix = "https://schema.org/"
+	var alias = prefix
+	var item string
+	_ = strings.TrimPrefix(item, alias)
+	// Use: "deals"
+}
+`,
+			},
+			absent: []string{"schema.org"},
+		},
+		{
+			name: "local const copied to var then fetched",
+			files: map[string]string{
+				"deals.go": `package cli
+
+import "net/http"
+
+func newDealsCmd() {
+	const prefix = "https://schema.org/"
+	var alias = prefix
+	_, _ = http.Get(alias + "version/latest/schemaorg-current-https.jsonld")
+	// Use: "deals"
+}
+`,
+			},
+			present: []string{"schema.org"},
+		},
+		{
+			name: "local shadow fetch does not hide package literal",
+			files: map[string]string{
+				"deals.go": `package cli
+
+import "net/http"
+
+const schemaOrgPrefix = "https://schema.org/"
+
+func newDealsCmd() {
+	schemaOrgPrefix := "https://schema.org/version/"
+	_, _ = http.Get(schemaOrgPrefix + "latest.jsonld")
+	// Use: "deals"
+}
+`,
+			},
+			present: []string{"schema.org"},
+		},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			cliDir, researchDir := seedReimplementationFixture(t, tt.files, []NovelFeature{{
+				Name:    "Deals",
+				Command: "deals",
+			}})
+			got := checkReimplementation(cliDir, researchDir)
+			hosts := map[string]bool{}
+			for _, finding := range got.UnverifiedHosts {
+				hosts[finding.Host] = true
+			}
+			for _, host := range tt.present {
+				assert.True(t, hosts[host], "host %s must fail: %#v", host, got.UnverifiedHosts)
+			}
+			for _, host := range tt.absent {
+				assert.False(t, hosts[host], "host %s must pass: %#v", host, got.UnverifiedHosts)
+			}
+		})
+	}
+}
+
+func TestVocabularyNamespaceFetchStillFailsNovelHostGate(t *testing.T) {
+	cliDir, researchDir := seedReimplementationFixture(t, map[string]string{
+		"deals.go": `package cli
+
+import "net/http"
+
+const schemaOrgPrefix = "https://schema.org/"
+
+func newDealsCmd() {
+	_, _ = http.Get(schemaOrgPrefix + "version/latest/schemaorg-current-https.jsonld")
+	// Use: "deals"
+}
+`,
+	}, []NovelFeature{{
+		Name:    "Deals",
+		Command: "deals",
+	}})
+
+	got := checkReimplementation(cliDir, researchDir)
+	require.NotEmpty(t, got.UnverifiedHosts)
+	assert.Equal(t, "schema.org", got.UnverifiedHosts[0].Host)
 }

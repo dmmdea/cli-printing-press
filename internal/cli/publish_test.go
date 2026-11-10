@@ -7,9 +7,11 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"testing"
 
+	"github.com/mvanhorn/cli-printing-press/v4/internal/artifacts"
 	"github.com/mvanhorn/cli-printing-press/v4/internal/generator"
 	"github.com/mvanhorn/cli-printing-press/v4/internal/govulncheck"
 	"github.com/mvanhorn/cli-printing-press/v4/internal/naming"
@@ -746,7 +748,7 @@ func TestRunGoVulnCheckUsesPinnedDefaultCommandWithModuleToolchain(t *testing.T)
 		t.Skip("fake shell go binary is Unix-only")
 	}
 	dir := t.TempDir()
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module example.com/test\n\ngo 1.26.6\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module example.com/test\n\ngo 1.26.10\n"), 0o644))
 
 	fakeBin := t.TempDir()
 	callsPath := filepath.Join(t.TempDir(), "go-calls.txt")
@@ -768,7 +770,7 @@ exit 42
 
 	calls, err := os.ReadFile(callsPath)
 	require.NoError(t, err)
-	assert.Equal(t, "args=run "+govulncheck.ToolModule+" ./...\ntoolchain=go1.26.6\n", string(calls))
+	assert.Equal(t, "args=run "+govulncheck.ToolModule+" ./...\ntoolchain=go1.26.10\n", string(calls))
 	assert.NotContains(t, string(calls), "-show")
 	assert.NotContains(t, string(calls), "verbose")
 }
@@ -1100,6 +1102,51 @@ func TestPublishPackageStripsBuildDir(t *testing.T) {
 	assert.ErrorIs(t, stagedErr, os.ErrNotExist, "staged dir must not include build/")
 }
 
+func TestPublishPackageExcludesLiveCheckDirsAndStrayExecutables(t *testing.T) {
+	home := setLibraryTestEnv(t)
+	cliDir := filepath.Join(home, "library", "test-pp-cli")
+	writePublishableTestCLI(t, cliDir)
+	stubPublishPackageValidation(t)
+
+	plant := func(path string, data []byte, mode os.FileMode) {
+		t.Helper()
+		require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+		require.NoError(t, os.WriteFile(path, data, mode))
+	}
+	staleExe := filepath.Join(cliDir, ".printing-press-live-check-2895911864", "foo-pp-cli.exe")
+	nestedExe := filepath.Join(cliDir, "nested", "deep", ".printing-press-live-check-3501810456", "foo-pp-cli.exe")
+	strayExe := filepath.Join(cliDir, "nested", "stray.exe")
+	strayELF := filepath.Join(cliDir, "internal", "cli", "stray-bin")
+	helper := filepath.Join(cliDir, "scripts", "helper.sh")
+	plant(staleExe, []byte("MZ leftover"), 0o755)
+	plant(nestedExe, []byte("still here"), 0o644)
+	plant(strayExe, []byte("not a real image"), 0o644)
+	plant(strayELF, []byte{0x7f, 'E', 'L', 'F', 0x02}, 0o755)
+	plant(helper, []byte("#!/bin/sh\necho ok\n"), 0o755)
+
+	target := filepath.Join(t.TempDir(), "staging")
+	cmd := newPublishCmd()
+	cmd.SetArgs([]string{"package", "--dir", cliDir, "--category", "other", "--target", target, "--module-path", "github.com/mvanhorn/printing-press-library/library/other/test", "--json"})
+
+	output, err := runWithCapturedStdout(t, cmd.Execute)
+	require.NoError(t, err)
+
+	var result PackageResult
+	require.NoError(t, json.Unmarshal([]byte(output), &result))
+
+	for _, path := range []string{staleExe, nestedExe, strayExe, strayELF, helper} {
+		_, srcErr := os.Stat(path)
+		assert.NoError(t, srcErr, "package must not delete source-tree file %s", path)
+	}
+
+	assert.NoDirExists(t, filepath.Join(result.StagedDir, ".printing-press-live-check-2895911864"))
+	assert.NoDirExists(t, filepath.Join(result.StagedDir, "nested", "deep", ".printing-press-live-check-3501810456"))
+	assert.NoFileExists(t, filepath.Join(result.StagedDir, "nested", "stray.exe"))
+	assert.NoFileExists(t, filepath.Join(result.StagedDir, "internal", "cli", "stray-bin"))
+	require.FileExists(t, filepath.Join(result.StagedDir, "scripts", "helper.sh"))
+	require.FileExists(t, filepath.Join(result.StagedDir, "cmd", "test-pp-cli", "main.go"))
+}
+
 func TestPublishPackageStripsRootBinaries(t *testing.T) {
 	home := setLibraryTestEnv(t)
 	cliDir := filepath.Join(home, "library", "test-pp-cli")
@@ -1177,6 +1224,54 @@ func TestPublishPackageStampsRuntimeVersionFromBaseDir(t *testing.T) {
 	require.NoError(t, err)
 	assert.NotContains(t, string(version), "var version")
 	assert.Contains(t, string(version), "func newVersionCmd()")
+}
+
+func TestPublishPackageKeepsBaseDirHomepage(t *testing.T) {
+	tests := []struct {
+		name   string
+		base   string
+		source string
+		want   string
+	}{
+		{name: "base entry homepage wins", base: "https://test.com", source: "https://test.io", want: "https://test.com"},
+		{name: "base entry homepage fills an empty source", base: "https://test.com", want: "https://test.com"},
+		{name: "source homepage kept when base has none", source: "https://test.io", want: "https://test.io"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			home := setLibraryTestEnv(t)
+			cliDir := filepath.Join(home, "library", "test-pp-cli")
+			writePublishableTestCLI(t, cliDir)
+			stubPublishPackageValidation(t)
+			if tt.source != "" {
+				manifest, err := pipeline.ReadCLIManifest(cliDir)
+				require.NoError(t, err)
+				manifest.Homepage = tt.source
+				writeTestManifest(t, cliDir, manifest)
+			}
+
+			base := t.TempDir()
+			writeTestManifest(t, base, pipeline.CLIManifest{
+				SchemaVersion: pipeline.CurrentCLIManifestSchemaVersion,
+				APIName:       "test",
+				CLIName:       "test-pp-cli",
+				Homepage:      tt.base,
+			})
+
+			target := filepath.Join(t.TempDir(), "staging")
+			cmd := newPublishCmd()
+			cmd.SetArgs([]string{"package", "--dir", cliDir, "--category", "other", "--target", target, "--base-dir", base, "--module-path", "github.com/mvanhorn/printing-press-library/library/other/test", "--json"})
+
+			output, err := runWithCapturedStdout(t, cmd.Execute)
+			require.NoError(t, err)
+			var result PackageResult
+			require.NoError(t, json.Unmarshal([]byte(output), &result))
+
+			staged, err := pipeline.ReadCLIManifest(result.StagedDir)
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, staged.Homepage)
+		})
+	}
 }
 
 func TestPublishPackageStampsRuntimeVersionFromDestStash(t *testing.T) {
@@ -1437,9 +1532,12 @@ func TestPublishPackageOmitsLiveDogfoodTranscripts(t *testing.T) {
 		SkipReason:    "auth_required_no_credential",
 		AuthContext:   pipeline.Phase5AuthContext{Type: "none"},
 	})
+	shaped := []byte(`{"dir":"` + leak + `","binary":"` + leak + `/example-pp-cli","verdict":"PASS","tests":[{"command":"items list","output_sample":"account balance"}]}` + "\n")
 	require.NoError(t, os.WriteFile(filepath.Join(proofsDir, "publish-live-gate.json"), transcript, 0o644))
 	require.NoError(t, os.WriteFile(filepath.Join(proofsDir, "test-20260329-100000-publish-live-gate.json"), transcript, 0o644))
 	require.NoError(t, os.WriteFile(filepath.Join(proofsDir, "20260829T160251Z-dogfood-results.json"), transcript, 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(proofsDir, "dogfood-live.json"), shaped, 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(runDir, "research", "run-notes.md"), []byte("cli "+leak+"\nstate /Users/operator/printing-press/.runstate/scope/out.json\n"), 0o644))
 	require.NoError(t, os.WriteFile(filepath.Join(runDir, "pipeline", "state.json"), []byte(`{"binary":"`+leak+`/bin"}`+"\n"), 0o644))
 
 	target := filepath.Join(t.TempDir(), "staging")
@@ -1459,7 +1557,13 @@ func TestPublishPackageOmitsLiveDogfoodTranscripts(t *testing.T) {
 	assert.NoFileExists(t, filepath.Join(staged, "proofs", "publish-live-gate.json"))
 	assert.NoFileExists(t, filepath.Join(staged, "proofs", "test-20260329-100000-publish-live-gate.json"))
 	assert.NoFileExists(t, filepath.Join(staged, "proofs", "20260829T160251Z-dogfood-results.json"))
+	assert.NoFileExists(t, filepath.Join(staged, "proofs", "dogfood-live.json"))
 	assert.NoDirExists(t, filepath.Join(staged, "pipeline"))
+	gotNotes, err := os.ReadFile(filepath.Join(staged, "research", "run-notes.md"))
+	require.NoError(t, err)
+	assert.Contains(t, string(gotNotes), artifacts.CLIDirPlaceholder+"/printing-press/library/example")
+	assert.Contains(t, string(gotNotes), artifacts.RunStatePlaceholder+"/scope/out.json")
+	assert.NotContains(t, string(gotNotes), leak)
 
 	var leaked []string
 	walkErr := filepath.WalkDir(result.StagedDir, func(path string, d fs.DirEntry, err error) error {
@@ -1751,6 +1855,111 @@ func TestPublishPackageCanIncludeRawCaptures(t *testing.T) {
 	assert.FileExists(t, filepath.Join(result.StagedDir, ".manuscripts", runID, "discovery", "browser-sniff-capture.har"))
 	assert.FileExists(t, filepath.Join(result.StagedDir, ".manuscripts", runID, "discovery", "bundles", "app.js"))
 	assert.FileExists(t, filepath.Join(result.StagedDir, ".manuscripts", runID, "research", "test-browser-sniff-spec-samples", "sample.json"))
+}
+
+func TestPublishPackageDiscoveryAllowlist(t *testing.T) {
+	home := setLibraryTestEnv(t)
+	cliDir := filepath.Join(home, "library", "test-pp-cli")
+	writePublishableTestCLI(t, cliDir)
+	stubPublishPackageValidation(t)
+
+	runID := "20260329-100000"
+	setPublishableTestRunID(t, cliDir, runID)
+	runDir := filepath.Join(home, "manuscripts", "test", runID)
+	allowed := []string{
+		"discovery/browser-sniff-report.md",
+		"discovery/traffic-analysis.json",
+		"discovery/crowd-sniff-provenance.json",
+		"discovery/browser-sniff-unique-paths.txt",
+	}
+	raw := []string{
+		"discovery/resp-entitydetail.json",
+		"discovery/requests-search.json",
+		"discovery/direct-response-search.json",
+		"discovery/direct-probe-search.json",
+		"discovery/browser-sniff-capture.json",
+		"discovery/browser-sniff-capture.har",
+		"discovery/probe-001.json",
+		"discovery/page.html",
+		"discovery/app.js",
+		"discovery/bundles/app.js",
+		"discovery/raw/home.html",
+		"discovery/contract/out-01/sample.body",
+		"discovery/oracle-check/r1_body",
+		"discovery/terms/General-Terms-of-Use.txt",
+		"discovery/pdf/share-pct.pdf",
+		"discovery/sniff-urls.txt",
+	}
+	untouched := []string{
+		"research/brief.md",
+		"research/captured.json",
+		"research/page.html",
+		"proofs/shipcheck.md",
+		"proofs/notes.txt",
+	}
+	for _, rel := range append(append([]string{}, allowed...), append(raw, untouched...)...) {
+		path := filepath.Join(runDir, filepath.FromSlash(rel))
+		require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+		require.NoError(t, os.WriteFile(path, []byte(rel+"\n"), 0o644))
+	}
+
+	packageAt := func(t *testing.T, target string, includeRaw bool) string {
+		t.Helper()
+		args := []string{"package", "--dir", cliDir, "--category", "other", "--target", target, "--module-path", "github.com/mvanhorn/printing-press-library/library/other/test", "--json"}
+		if includeRaw {
+			args = append(args, "--include-raw-captures")
+		}
+		cmd := newPublishCmd()
+		cmd.SetArgs(args)
+		output, err := runWithCapturedStdout(t, cmd.Execute)
+		require.NoError(t, err)
+		var result PackageResult
+		require.NoError(t, json.Unmarshal([]byte(output), &result))
+		assert.True(t, result.ManuscriptsIncluded)
+		return filepath.Join(result.StagedDir, ".manuscripts", runID)
+	}
+
+	staged := packageAt(t, filepath.Join(t.TempDir(), "staging"), false)
+	var want []string
+	want = append(want, allowed...)
+	want = append(want, untouched...)
+	sort.Strings(want)
+	assert.Equal(t, want, relFilesUnder(t, staged))
+	for _, rel := range untouched {
+		body, err := os.ReadFile(filepath.Join(staged, filepath.FromSlash(rel)))
+		require.NoError(t, err)
+		assert.Equal(t, rel+"\n", string(body))
+	}
+
+	included := packageAt(t, filepath.Join(t.TempDir(), "staging-raw"), true)
+	for _, rel := range append(append([]string{}, allowed...), append(raw, untouched...)...) {
+		assert.FileExists(t, filepath.Join(included, filepath.FromSlash(rel)), rel)
+	}
+	body, err := os.ReadFile(filepath.Join(included, "research", "page.html"))
+	require.NoError(t, err)
+	assert.Equal(t, "research/page.html\n", string(body))
+	body, err = os.ReadFile(filepath.Join(included, "proofs", "notes.txt"))
+	require.NoError(t, err)
+	assert.Equal(t, "proofs/notes.txt\n", string(body))
+}
+
+func relFilesUnder(t *testing.T, root string) []string {
+	t.Helper()
+	var got []string
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil || path == root || d.IsDir() {
+			return walkErr
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		got = append(got, filepath.ToSlash(rel))
+		return nil
+	})
+	require.NoError(t, err)
+	sort.Strings(got)
+	return got
 }
 
 func TestPublishPackageFiltersEmbeddedManuscriptsFallback(t *testing.T) {
@@ -2767,7 +2976,7 @@ func TestCheckModulePath(t *testing.T) {
 
 	t.Run("canonical prefix passes", func(t *testing.T) {
 		require.NoError(t, os.WriteFile(filepath.Join(dir, "go.mod"),
-			[]byte("module github.com/mvanhorn/printing-press-library/library/ai/exa\n\ngo 1.26.6\n"), 0o644))
+			[]byte("module github.com/mvanhorn/printing-press-library/library/ai/exa\n\ngo 1.26.10\n"), 0o644))
 		res := checkModulePath(dir, "")
 		assert.True(t, res.Passed, res.Error)
 		assert.Equal(t, "module path", res.Name)
@@ -2776,7 +2985,7 @@ func TestCheckModulePath(t *testing.T) {
 	t.Run("canonical prefix passes when requested explicitly", func(t *testing.T) {
 		const canonical = "github.com/mvanhorn/printing-press-library/library/ai/exa"
 		require.NoError(t, os.WriteFile(filepath.Join(dir, "go.mod"),
-			[]byte("module "+canonical+"\n\ngo 1.26.6\n"), 0o644))
+			[]byte("module "+canonical+"\n\ngo 1.26.10\n"), 0o644))
 		res := checkModulePath(dir, canonical)
 		assert.True(t, res.Passed, res.Error)
 	})
@@ -2784,14 +2993,14 @@ func TestCheckModulePath(t *testing.T) {
 	t.Run("custom requested path passes when go.mod matches", func(t *testing.T) {
 		const custom = "github.com/acme/my-library/library/ai/exa"
 		require.NoError(t, os.WriteFile(filepath.Join(dir, "go.mod"),
-			[]byte("module "+custom+"\n\ngo 1.26.6\n"), 0o644))
+			[]byte("module "+custom+"\n\ngo 1.26.10\n"), 0o644))
 		res := checkModulePath(dir, custom)
 		assert.True(t, res.Passed, res.Error)
 	})
 
 	t.Run("declared path that differs from the requested path fails", func(t *testing.T) {
 		require.NoError(t, os.WriteFile(filepath.Join(dir, "go.mod"),
-			[]byte("module github.com/acme/my-library/library/ai/exa\n\ngo 1.26.6\n"), 0o644))
+			[]byte("module github.com/acme/my-library/library/ai/exa\n\ngo 1.26.10\n"), 0o644))
 		res := checkModulePath(dir, "github.com/acme/my-library/library/ai/other")
 		assert.False(t, res.Passed)
 		assert.Contains(t, res.Error, "does not match the requested --module-path")
@@ -2799,7 +3008,7 @@ func TestCheckModulePath(t *testing.T) {
 
 	t.Run("bare CLI name fails", func(t *testing.T) {
 		require.NoError(t, os.WriteFile(filepath.Join(dir, "go.mod"),
-			[]byte("module exa-pp-cli\n\ngo 1.26.6\n"), 0o644))
+			[]byte("module exa-pp-cli\n\ngo 1.26.10\n"), 0o644))
 		res := checkModulePath(dir, "")
 		assert.False(t, res.Passed)
 		assert.Contains(t, res.Error, "does not start with the canonical library prefix")
@@ -2807,7 +3016,7 @@ func TestCheckModulePath(t *testing.T) {
 
 	t.Run("bare CLI name fails even when requested explicitly", func(t *testing.T) {
 		require.NoError(t, os.WriteFile(filepath.Join(dir, "go.mod"),
-			[]byte("module exa-pp-cli\n\ngo 1.26.6\n"), 0o644))
+			[]byte("module exa-pp-cli\n\ngo 1.26.10\n"), 0o644))
 		res := checkModulePath(dir, "exa-pp-cli")
 		assert.False(t, res.Passed)
 		assert.Contains(t, res.Error, "is a bare CLI name")
@@ -2821,7 +3030,7 @@ func TestCheckModulePath(t *testing.T) {
 
 	t.Run("no module line fails", func(t *testing.T) {
 		emptyDir := t.TempDir()
-		require.NoError(t, os.WriteFile(filepath.Join(emptyDir, "go.mod"), []byte("go 1.26.6\n"), 0o644))
+		require.NoError(t, os.WriteFile(filepath.Join(emptyDir, "go.mod"), []byte("go 1.26.10\n"), 0o644))
 		res := checkModulePath(emptyDir, "")
 		assert.False(t, res.Passed)
 		assert.Contains(t, res.Error, "declares no module line")
@@ -2834,7 +3043,7 @@ func TestPublishValidateModulePathCheckWired(t *testing.T) {
 	writePublishableTestCLI(t, cliDir)
 	// Force a bare module path to exercise the new check end-to-end.
 	require.NoError(t, os.WriteFile(filepath.Join(cliDir, "go.mod"),
-		[]byte("module test-pp-cli\n\ngo 1.26.6\n"), 0o644))
+		[]byte("module test-pp-cli\n\ngo 1.26.10\n"), 0o644))
 
 	cmd := newPublishCmd()
 	cmd.SetArgs([]string{"validate", "--dir", cliDir, "--json"})

@@ -1,12 +1,14 @@
 package pipeline
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mvanhorn/cli-printing-press/v4/internal/generator"
 	"github.com/mvanhorn/cli-printing-press/v4/internal/naming"
@@ -104,9 +106,9 @@ func TestSkillSetupBlocksMatchWorkspaceContract(t *testing.T) {
 func TestPrintingPressSetupContractRebuildsStaleRepoLocalBinary(t *testing.T) {
 	t.Parallel()
 
-	output, goLog := runPrintingPressSetupContract(t, "4.12.0", "4.23.0")
+	output, goLog := runPrintingPressSetupContract(t, "4.35.3", "4.35.4")
 
-	assert.Contains(t, output, "[local-binary-stale] local build v4.12.0 is older than source v4.23.0")
+	assert.Contains(t, output, "[local-binary-stale] local build v4.35.3 is older than source v4.35.4")
 	assert.Contains(t, output, "[local-binary-rebuilt] rebuilt")
 	assert.Contains(t, output, "PRINTING_PRESS_BIN=")
 	assert.Contains(t, goLog, "build -o ./cli-printing-press ./cmd/cli-printing-press")
@@ -115,7 +117,7 @@ func TestPrintingPressSetupContractRebuildsStaleRepoLocalBinary(t *testing.T) {
 func TestPrintingPressSetupContractLeavesFreshRepoLocalBinaryAlone(t *testing.T) {
 	t.Parallel()
 
-	output, goLog := runPrintingPressSetupContract(t, "4.23.0", "4.23.0")
+	output, goLog := runPrintingPressSetupContract(t, "4.35.4", "4.35.4")
 
 	assert.NotContains(t, output, "[local-binary-stale]")
 	assert.NotContains(t, output, "[local-binary-rebuilt]")
@@ -126,7 +128,7 @@ func TestPrintingPressSetupContractLeavesFreshRepoLocalBinaryAlone(t *testing.T)
 func TestPrintingPressSetupContractEmitsSkillStaleWhenSkillBelowBinaryFloor(t *testing.T) {
 	t.Parallel()
 
-	output, _, err := runPrintingPressSetupContractWithSkillFloor(t, "4.32.0", "4.32.0", "9.0.0")
+	output, _, err := runPrintingPressSetupContractWithSkillFloor(t, "4.35.4", "4.35.4", "9.0.0")
 	require.Error(t, err, "skill-stale must fail the setup contract; err=%v output=%q", err, output)
 
 	assert.Contains(t, output, "[skill-stale] printing-press skill v")
@@ -139,11 +141,71 @@ func TestPrintingPressSetupContractEmitsSkillStaleWhenSkillBelowBinaryFloor(t *t
 func TestPrintingPressSetupContractOmitsSkillStaleWhenSkillMeetsBinaryFloor(t *testing.T) {
 	t.Parallel()
 
-	output, _, err := runPrintingPressSetupContractWithSkillFloor(t, "4.32.0", "4.32.0", "3.0.0")
+	output, _, err := runPrintingPressSetupContractWithSkillFloor(t, "4.35.4", "4.35.4", "3.0.0")
 	require.NoError(t, err, output)
 
 	assert.NotContains(t, output, "[skill-stale]")
+	assert.NotContains(t, output, "[binary-below-min]")
 	assert.Contains(t, output, "PRINTING_PRESS_BIN=")
+}
+
+func TestPrintingPressSetupContractStopsBelowMinBinaryDespiteFreshCache(t *testing.T) {
+	t.Parallel()
+
+	output, netLog, err := runPrintingPressStandaloneContract(t, "4.35.1")
+	require.Error(t, err, output)
+
+	assert.Contains(t, output, "[binary-below-min] cli-printing-press binary v4.35.1 is older than the minimum required v4.35.4")
+	assert.Contains(t, output, "PRESS_BINARY_INSTALLED=4.35.1")
+	assert.Contains(t, output, "PRESS_BINARY_REQUIRED=4.35.4")
+	assert.NotContains(t, output, "[upgrade-available]")
+	assert.NotContains(t, output, "[upgrade-required]")
+	assert.NotContains(t, output, "[browser-tools-missing]")
+	assert.NotContains(t, netLog, "go list")
+	assert.NotContains(t, netLog, "curl")
+}
+
+func TestPrintingPressSetupContractAllowsCurrentBinaryWithoutNetwork(t *testing.T) {
+	t.Parallel()
+
+	output, netLog, err := runPrintingPressStandaloneContract(t, "4.35.4")
+	require.NoError(t, err, output)
+
+	assert.NotContains(t, output, "[binary-below-min]")
+	assert.NotContains(t, output, "[upgrade-available]")
+	assert.NotContains(t, output, "[upgrade-required]")
+	assert.Contains(t, output, "PRINTING_PRESS_BIN=")
+	assert.NotContains(t, netLog, "go list")
+	assert.NotContains(t, netLog, "curl")
+}
+
+func TestPrintingPressLiveHappyPathFloorRunsBeforeVersionCheckTTL(t *testing.T) {
+	skill := readContractFile(t, filepath.Join("..", "..", "skills", "printing-press", "SKILL.md"))
+	require.Contains(t, skill, "pp:live-happy-path")
+
+	block := extractContractBlock(t, skill)
+	below := strings.Index(block, "[binary-below-min]")
+	ttl := strings.Index(block, "_should_check=true")
+	require.GreaterOrEqual(t, below, 0)
+	require.Greater(t, ttl, below, "min-binary enforcement must run before the version-check TTL gate")
+
+	branch := block[below:]
+	if end := strings.Index(branch, "\n  fi"); end > 0 {
+		branch = branch[:end]
+	}
+	assert.Contains(t, branch, `return 1 2>/dev/null || exit 1`)
+	assert.Contains(t, branch, `git -C \"$_scope_dir\" pull --ff-only origin main`)
+	assert.NotContains(t, branch, "curl")
+	assert.NotContains(t, branch, "go list")
+	assert.Contains(t, block, "PRESS_VERCHECK_TTL=86400")
+
+	checks := readContractFile(t, filepath.Join("..", "..", "skills", "printing-press", "references", "setup-checks.md"))
+	repoAdvice := substringBetween(t, checks, "When `PRESS_REPO_MODE=true`, tell the user to update the printing-press checkout", "When `PRESS_REPO_MODE=false`")
+	assert.Contains(t, repoAdvice, "_scope_dir")
+	assert.Contains(t, repoAdvice, `git -C "<repo>" pull --ff-only origin main`)
+	assert.Contains(t, repoAdvice, `go build -o ./cli-printing-press ./cmd/cli-printing-press`)
+	assert.NotContains(t, repoAdvice, "directory containing the captured `PRINTING_PRESS_BIN`")
+	assert.Contains(t, checks, "go install github.com/mvanhorn/cli-printing-press/v4/cmd/cli-printing-press@latest")
 }
 
 func TestSkillsEnforceCurrencyFloor(t *testing.T) {
@@ -379,8 +441,8 @@ func TestSetupContractsStayQuietInHealthyEnvironment(t *testing.T) {
 
 			output, err := runSkillSetupContract(t, skill, setupContractOptions{
 				includeGo:       true,
-				goInstalled:     "1.26.6",
-				goBinary:        "1.26.6",
+				goInstalled:     "1.26.10",
+				goBinary:        "1.26.10",
 				diskAvailableKB: "4194304",
 			})
 
@@ -402,14 +464,14 @@ func TestSetupContractsWarnOnOldGoToolchain(t *testing.T) {
 			output, err := runSkillSetupContract(t, skill, setupContractOptions{
 				includeGo:       true,
 				goInstalled:     "1.25.0",
-				goBinary:        "1.26.6",
+				goBinary:        "1.26.10",
 				diskAvailableKB: "4194304",
 			})
 
 			require.NoError(t, err, output)
 			assert.Contains(t, output, "[go-toolchain-old]")
 			assert.Contains(t, output, "PRESS_GO_INSTALLED=1.25.0")
-			assert.Contains(t, output, "PRESS_GO_REQUIRED=1.26.6")
+			assert.Contains(t, output, "PRESS_GO_REQUIRED=1.26.10")
 		})
 	}
 }
@@ -424,13 +486,13 @@ func TestSetupContractsBlockOldGoWhenToolchainLocal(t *testing.T) {
 			output, err := runSkillSetupContract(t, skill, setupContractOptions{
 				includeGo:       true,
 				goInstalled:     "1.25.0",
-				goBinary:        "1.26.6",
+				goBinary:        "1.26.10",
 				goToolchain:     "local",
 				diskAvailableKB: "4194304",
 			})
 
 			require.Error(t, err, output)
-			assert.Contains(t, output, "[setup-error] Go 1.26.6 or newer is required")
+			assert.Contains(t, output, "[setup-error] Go 1.26.10 or newer is required")
 			assert.NotContains(t, output, "[go-toolchain-old]")
 		})
 	}
@@ -445,8 +507,8 @@ func TestSetupContractsWarnOnLowDisk(t *testing.T) {
 
 			output, err := runSkillSetupContract(t, skill, setupContractOptions{
 				includeGo:       true,
-				goInstalled:     "1.26.6",
-				goBinary:        "1.26.6",
+				goInstalled:     "1.26.10",
+				goBinary:        "1.26.10",
 				diskAvailableKB: "1048576",
 			})
 
@@ -467,8 +529,8 @@ func TestSetupContractsBlockCriticallyLowDisk(t *testing.T) {
 
 			output, err := runSkillSetupContract(t, skill, setupContractOptions{
 				includeGo:       true,
-				goInstalled:     "1.26.6",
-				goBinary:        "1.26.6",
+				goInstalled:     "1.26.10",
+				goBinary:        "1.26.10",
 				diskAvailableKB: "1024",
 			})
 
@@ -887,6 +949,18 @@ func TestPrintingPressSkillSetsPublicLibraryCategoryBeforeGenerate(t *testing.T)
 	assert.GreaterOrEqual(t, strings.Count(generateBlocks, "--category <public-library-category>"), 7)
 }
 
+func TestPrintingPressSkillRecordsResearchedHomepage(t *testing.T) {
+	skill := readContractFile(t, filepath.Join("..", "..", "skills", "printing-press", "SKILL.md"))
+	block := substringBetween(t, skill, "**Homepage rule**", "**Narrative rules**")
+
+	assert.Contains(t, skill, "- Homepage:")
+	assert.Contains(t, skill, `"homepage": "<https URL of the product's public website, omit when unconfirmed>"`)
+	assert.Contains(t, block, "Omit `homepage`")
+	assert.Contains(t, block, "API host")
+	assert.Contains(t, block, "not the docs site")
+	assert.Contains(t, block, "never overwrites")
+}
+
 func TestPrintingPressSkillExamplesUseCurrentCLINaming(t *testing.T) {
 	skill := readContractFile(t, filepath.Join("..", "..", "skills", "printing-press", "SKILL.md"))
 
@@ -933,6 +1007,8 @@ func TestPublishSkillSkipsCliSkillsMirrorRegen(t *testing.T) {
 	assert.Contains(t, skill, "git clean -fdq library/")
 	assert.Contains(t, skill, "git add -A library/")
 	assert.Contains(t, skill, `git add -f "library/<category>/<api-slug>/"`)
+	assert.Contains(t, skill, "publish package removes `.printing-press-live-check-*` directories and")
+	assert.Contains(t, skill, "compiled executables at any depth")
 	assert.Contains(t, skill, "UNEXPECTED_STAGED")
 	assert.Contains(t, skill, `git commit -m "feat(<api-slug>): add <api-slug>"`)
 	assert.NotContains(t, skill, `git add -f "library/<category>/<api-slug>/cmd/<api-slug>-pp-mcp/"`)
@@ -1019,7 +1095,7 @@ func TestImportRewriteHandlesCRLFGoMod(t *testing.T) {
 	t.Parallel()
 
 	staging := t.TempDir()
-	require.NoError(t, os.WriteFile(filepath.Join(staging, "go.mod"), []byte("module github.com/mvanhorn/printing-press-library/library/productivity/sample\r\n\r\ngo 1.26.6\r\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(staging, "go.mod"), []byte("module github.com/mvanhorn/printing-press-library/library/productivity/sample\r\n\r\ngo 1.26.10\r\n"), 0o644))
 	require.NoError(t, os.MkdirAll(filepath.Join(staging, "internal", "cli"), 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(staging, "internal", "cli", "root.go"), []byte("package cli\r\n\r\nimport \"github.com/mvanhorn/printing-press-library/library/productivity/sample/internal/client\"\r\n\r\nvar _ = client.New\r\n"), 0o644))
 
@@ -1230,14 +1306,165 @@ func TestReprintSkillSurfacesManifestDiffBeforeHandoff(t *testing.T) {
 	assert.Contains(t, reprintSkill, "Do not continue silently when tracked manifest fields")
 }
 
-func TestPolishSkillPinsGo126CompatibleGosecFallback(t *testing.T) {
+func TestPolishSkillBuildsGosecThatLoadsCurrentGo(t *testing.T) {
 	skill := readContractFile(t, filepath.Join("..", "..", "skills", "printing-press-polish", "SKILL.md"))
-	fallback := "go run github.com/securego/gosec/v2/cmd/gosec@v2.26.1"
 
-	assert.Equal(t, 3, strings.Count(skill, fallback))
-	assert.Contains(t, skill, fallback+" -fmt=json -out=/tmp/polish-gosec-before.json ./...")
-	assert.Contains(t, skill, fallback+" -fmt=json -out=/tmp/polish-gosec-after.json ./...")
-	assert.NotContains(t, skill, "github.com/securego/gosec/v2/cmd/gosec@v2.21.4")
+	// Released gosec bundles an x/tools that cannot read newer Go export data;
+	// the fallback must build gosec against a pinned current x/tools.
+	assert.Contains(t, skill, "go get github.com/securego/gosec/v2/cmd/gosec@v2.29.0 golang.org/x/tools@v0.52.0")
+	assert.Contains(t, skill, "polish_gosec /tmp/polish-gosec-before.json")
+	assert.Contains(t, skill, "polish_gosec /tmp/polish-gosec-after.json")
+	// Each skill block runs in its own shell, so both scans carry the same
+	// definition; nothing is sourced from a shared, pre-creatable path.
+	helpers := polishGosecHelpers(skill)
+	require.Len(t, helpers, 2)
+	assert.Equal(t, helpers[0], helpers[1], "baseline and after-fix gosec helpers must match")
+	assert.Contains(t, helpers[0], "export GOWORK=off")
+	assert.Equal(t, 2, strings.Count(helpers[0], `rm -rf "$built"`))
+	assert.NotContains(t, skill, "/tmp/polish-gosec.sh")
+	assert.Contains(t, skill, `non-empty `+"`"+`"Golang errors"`+"`"+` map`)
+	assert.NotContains(t, skill, "go run github.com/securego/gosec/v2/cmd/gosec@")
+}
+
+func polishGosecHelpers(skill string) []string {
+	var out []string
+	for rest := skill; ; {
+		start := strings.Index(rest, "polish_gosec() {\n")
+		if start < 0 {
+			return out
+		}
+		end := strings.Index(rest[start:], "\n}\n")
+		if end < 0 {
+			return out
+		}
+		out = append(out, rest[start:start+end+3])
+		rest = rest[start+end+3:]
+	}
+}
+
+func TestPolishSkillGosecHelperFallsBackAndReportsBuildFailures(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("bash not available")
+	}
+	jq, err := exec.LookPath("jq")
+	if err != nil {
+		t.Skip("jq not available")
+	}
+	skill := readContractFile(t, filepath.Join("..", "..", "skills", "printing-press-polish", "SKILL.md"))
+	helpers := polishGosecHelpers(skill)
+	require.NotEmpty(t, helpers)
+
+	const fullReport = `{"Issues":[],"Golang errors":{}}`
+	const partialReport = `{"Issues":[],"Golang errors":{"pkg":[{"error":"export data version 5"}]}}`
+	writeReporter := func(path, report string) {
+		script := "#!/bin/sh\nfor a in \"$@\"; do case $a in -out=*) printf '%s' '" + report + "' > \"${a#-out=}\";; esac; done\n"
+		require.NoError(t, os.WriteFile(path, []byte(script), 0o755))
+	}
+	// Fake go: "go build -o <path>" installs a reporter that writes a full report;
+	// FAKE_GO_FAIL makes "go get" fail like a proxy or network outage. A
+	// GOWORK value other than off fails the way a scratch module outside the
+	// caller's workspace would.
+	fakeGo := func(dir string) {
+		writeReporter(filepath.Join(dir, "full-reporter"), fullReport)
+		script := "#!/bin/sh\n" +
+			"echo \"GOWORK=${GOWORK-} $*\" >> \"$FAKE_GO_LOG\"\n" +
+			"if [ -n \"$GOWORK\" ] && [ \"$GOWORK\" != off ]; then echo 'directory is not in the workspace' >&2; exit 1; fi\n" +
+			"case $1 in\n" +
+			"get) if [ -n \"$FAKE_GO_FAIL\" ]; then echo 'proxy unreachable' >&2; exit 1; fi;;\n" +
+			"build)\n" +
+			"printf '%s\\n' '#!/bin/sh' 'echo \"SCAN_GOWORK=${GOWORK-}\" >> \"$FAKE_GO_LOG\"' > \"$3\"\n" +
+			"cat \"$FAKE_FULL_REPORTER\" >> \"$3\"\n" +
+			"chmod +x \"$3\"\n" +
+			";;\n" +
+			"esac\n"
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "go"), []byte(script), 0o755))
+	}
+
+	run := func(t *testing.T, installed string, failBuild bool, extraEnv ...string) (string, string, error) {
+		t.Helper()
+		bin := t.TempDir()
+		fakeGo(bin)
+		// jq lives in the fake bin so PATH does not include its real directory,
+		// where a package manager may also install gosec.
+		require.NoError(t, os.Symlink(jq, filepath.Join(bin, "jq")))
+		if installed != "" {
+			writeReporter(filepath.Join(bin, "gosec"), installed)
+		}
+		work := t.TempDir()
+		out := filepath.Join(work, "report.json")
+		goLog := filepath.Join(work, "go.log")
+		scratch := t.TempDir()
+		cmd := exec.Command("bash", "-c", helpers[0]+"polish_gosec \""+out+"\"")
+		cmd.Dir = work
+		cmd.Env = []string{
+			"PATH=" + bin + string(os.PathListSeparator) + "/usr/bin:/bin",
+			"TMPDIR=" + scratch,
+			"FAKE_GO_LOG=" + goLog,
+			"FAKE_FULL_REPORTER=" + filepath.Join(bin, "full-reporter"),
+		}
+		if failBuild {
+			cmd.Env = append(cmd.Env, "FAKE_GO_FAIL=1")
+		}
+		cmd.Env = append(cmd.Env, extraEnv...)
+		var stderr strings.Builder
+		cmd.Stderr = &stderr
+		err := cmd.Run()
+		entries, readErr := os.ReadDir(scratch)
+		require.NoError(t, readErr)
+		require.Empty(t, entries, "scratch gosec build dir must be removed")
+		report, _ := os.ReadFile(out)
+		logged, _ := os.ReadFile(goLog)
+		return string(report) + "|" + string(logged), stderr.String(), err
+	}
+
+	t.Run("complete installed scan is used as-is", func(t *testing.T) {
+		got, _, err := run(t, fullReport, false)
+		require.NoError(t, err)
+		assert.Contains(t, got, fullReport)
+		assert.NotContains(t, got, "build -o", "a complete installed scan must not build the fallback")
+	})
+	t.Run("partial installed scan rebuilds and rescans", func(t *testing.T) {
+		got, stderr, err := run(t, partialReport, false)
+		require.NoError(t, err)
+		assert.Contains(t, got, fullReport, "the fallback scan must replace the partial report")
+		assert.Contains(t, got, "build -o gosec")
+		assert.Contains(t, stderr, "could not load every package")
+	})
+	t.Run("missing gosec builds the fallback", func(t *testing.T) {
+		got, _, err := run(t, "", false)
+		require.NoError(t, err)
+		assert.Contains(t, got, fullReport)
+	})
+	t.Run("fallback build failure is reported", func(t *testing.T) {
+		got, stderr, err := run(t, "", true)
+		require.Error(t, err, "a failed fallback build must return non-zero")
+		assert.Contains(t, stderr, "could not build the gosec fallback")
+		assert.Contains(t, stderr, "proxy unreachable")
+		assert.True(t, strings.HasPrefix(got, "|"), "no report may be written when the build fails: %q", got)
+	})
+	t.Run("inherited workspace does not reject the scratch module", func(t *testing.T) {
+		workspaceDir := t.TempDir()
+		workspace := filepath.Join(workspaceDir, "go.work")
+		require.NoError(t, os.WriteFile(workspace, []byte("go 1.22\n\nuse .\n"), 0o644))
+		got, stderr, err := run(t, "", false, "GOWORK="+workspace)
+		require.NoError(t, err, stderr)
+		assert.Contains(t, got, fullReport)
+		assert.NotContains(t, stderr, "not in the workspace")
+		log := strings.SplitN(got, "|", 2)[1]
+		var sawScan bool
+		for line := range strings.SplitSeq(strings.TrimSpace(log), "\n") {
+			if rest, ok := strings.CutPrefix(line, "SCAN_GOWORK="); ok {
+				assert.Equal(t, workspace, rest, "the CLI scan must keep the caller workspace")
+				sawScan = true
+				continue
+			}
+			assert.Truef(t, strings.HasPrefix(line, "GOWORK=off "), "scratch go saw %q", line)
+			assert.NotContains(t, line, workspace)
+		}
+		assert.True(t, sawScan, "fallback scan should record the workspace it inherited")
+		assert.Contains(t, log, "mod init polish-gosec")
+		assert.Contains(t, log, "build -o gosec")
+	})
 }
 
 func TestPublishSkillRerunsLiveGateBeforeManagedClone(t *testing.T) {
@@ -1270,11 +1497,27 @@ func TestPublishSkillRerunsLiveGateBeforeManagedClone(t *testing.T) {
 	assert.Contains(t, liveGateBlock, "phase5-skip.json")
 	assert.Contains(t, liveGateBlock, `"$PRINTING_PRESS_BIN" publish validate --dir "$CLI_DIR" --json`)
 	assert.Contains(t, liveGateBlock, `--skip-live-test=<reason>`)
-	assert.Contains(t, liveGateBlock, `auth_type=none during a known upstream outage or LAN-unreachable hardware case`)
-	assert.Contains(t, liveGateBlock, `local_network_only = true`)
-	assert.Contains(t, liveGateBlock, `API_KEY_AVAILABLE=true`)
-	assert.Contains(t, liveGateBlock, `api_key_available: $api_key_available`)
+	assert.Contains(t, liveGateBlock, `--write-skip "$PROOFS_DIR/phase5-skip.json"`)
+	assert.Contains(t, liveGateBlock, `--reason "$SKIP_LIVE_TEST_REASON"`)
+	assert.Contains(t, liveGateBlock, `--auth-env "$AUTH_ENV"`)
+	assert.Contains(t, liveGateBlock, `lan-unreachable-from-generation-host`)
+	assert.Contains(t, liveGateBlock, `oauth2_refresh`)
+	assert.NotContains(t, liveGateBlock, `shasum -a 256`)
+	assert.NotContains(t, liveGateBlock, `API_KEY_AVAILABLE=true`)
+	assert.NotContains(t, liveGateBlock, `api_key_available: $api_key_available`)
+	assert.NotContains(t, liveGateBlock, `local_network_only = true`)
 	assert.Contains(t, skill, "### Publish Live Gate")
+}
+
+func TestDogfoodPhaseRecordsSkipWithPressCommand(t *testing.T) {
+	phase := readContractFile(t, filepath.Join("..", "..", "skills", "printing-press", "phases", "18-dogfood-testing.md"))
+	assert.Contains(t, phase, `--write-skip "$PROOFS_DIR/phase5-skip.json"`)
+	assert.Contains(t, phase, `--reason auth_required_no_credential`)
+	assert.Contains(t, phase, `--auth-env "<AUTH_ENV>"`)
+	assert.Contains(t, phase, `--reason lan-unreachable-from-generation-host`)
+	assert.Contains(t, phase, "do not pass `cookie-auth-no-harness-session` to `--write-skip`")
+	assert.NotContains(t, phase, `"skip_reason": "auth_required_no_credential"`)
+	assert.NotContains(t, phase, "shasum")
 }
 
 func TestPolishPublishOfferRequiresFreshUserTurn(t *testing.T) {
@@ -1618,6 +1861,68 @@ exit 0
 	return string(out), string(logBytes), err
 }
 
+func runPrintingPressStandaloneContract(t *testing.T, binaryVersion string) (output string, netLog string, err error) {
+	t.Helper()
+
+	root := t.TempDir()
+	work := filepath.Join(root, "work")
+	fakeBin := filepath.Join(root, "bin")
+	home := filepath.Join(root, "home")
+	pressHome := filepath.Join(home, "printing-press")
+	netLogPath := filepath.Join(root, "net.log")
+	require.NoError(t, os.MkdirAll(work, 0o755))
+	require.NoError(t, os.MkdirAll(fakeBin, 0o755))
+	require.NoError(t, os.MkdirAll(pressHome, 0o755))
+	require.NoError(t, os.WriteFile(netLogPath, nil, 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(pressHome, ".version-check"), fmt.Appendf(nil,
+		"last_check=%d\nlatest=4.32.6\nmode=standalone\nmin_supported=4.28.0\nreason=test\n",
+		time.Now().Unix(),
+	), 0o644))
+
+	writeExecutable(t, filepath.Join(fakeBin, "cli-printing-press"), versionJSONScript(binaryVersion, "3.0.0"))
+	writeExecutable(t, filepath.Join(fakeBin, "go"), `#!/bin/sh
+if [ "$1" = "list" ]; then
+  echo "go list $*" >> "$NET_LOG"
+  exit 1
+fi
+exit 0
+`)
+	writeExecutable(t, filepath.Join(fakeBin, "curl"), `#!/bin/sh
+echo "curl $*" >> "$NET_LOG"
+exit 1
+`)
+	writeExecutable(t, filepath.Join(fakeBin, "df"), `#!/bin/sh
+echo "Filesystem 1024-blocks Used Available Capacity Mounted on"
+echo "fake 9999999 0 4194304 0% /"
+`)
+
+	gitInit := exec.Command("git", "init")
+	gitInit.Dir = work
+	gitInitOutput, err := gitInit.CombinedOutput()
+	require.NoError(t, err, string(gitInitOutput))
+
+	skill := readContractFile(t, filepath.Join("..", "..", "skills", "printing-press", "SKILL.md"))
+	contract := extractContractBlock(t, skill)
+	contract = strings.ReplaceAll(contract, "```bash\n", "")
+	contract = strings.ReplaceAll(contract, "\n```", "")
+	scriptPath := filepath.Join(root, "setup-contract.sh")
+	writeExecutable(t, scriptPath, "#!/bin/sh\n"+contract)
+
+	cmd := exec.Command("/bin/sh", scriptPath)
+	cmd.Dir = work
+	cmd.Env = append(os.Environ(),
+		"ARGUMENTS=",
+		"HOME="+home,
+		"NET_LOG="+netLogPath,
+		"PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"PRINTING_PRESS_HOME="+pressHome,
+	)
+	out, runErr := cmd.CombinedOutput()
+	logBytes, logErr := os.ReadFile(netLogPath)
+	require.NoError(t, logErr)
+	return string(out), string(logBytes), runErr
+}
+
 func versionScript(version string) string {
 	return versionJSONScript(version, "")
 }
@@ -1701,7 +2006,7 @@ func runSkillSetupContract(t *testing.T, skill setupSkill, opts setupContractOpt
 	t.Helper()
 
 	if opts.goInstalled == "" {
-		opts.goInstalled = "1.26.6"
+		opts.goInstalled = "1.26.10"
 	}
 	if opts.goBinary == "" {
 		opts.goBinary = opts.goInstalled
@@ -1722,10 +2027,10 @@ func runSkillSetupContract(t *testing.T, skill setupSkill, opts setupContractOpt
 	require.NoError(t, os.WriteFile(filepath.Join(repo, "go.mod"), []byte("module example.com/press\n\ngo 1.20\n"), 0o644))
 	require.NoError(t, os.WriteFile(filepath.Join(repo, "internal", "version", "version.go"), []byte(`package version
 
-var Version = "4.23.0" // x-release-please-version
+var Version = "4.35.4" // x-release-please-version
 `), 0o644))
-	writeExecutable(t, filepath.Join(repo, "cli-printing-press"), versionScript("4.23.0"))
-	writeExecutable(t, filepath.Join(fakeBin, "cli-printing-press"), versionScript("4.23.0"))
+	writeExecutable(t, filepath.Join(repo, "cli-printing-press"), versionScript("4.35.4"))
+	writeExecutable(t, filepath.Join(fakeBin, "cli-printing-press"), versionScript("4.35.4"))
 	writeExecutable(t, filepath.Join(fakeBin, "curl"), "#!/bin/sh\nexit 1\n")
 	writeExecutable(t, filepath.Join(fakeBin, "shasum"), "#!/bin/sh\ncat >/dev/null\necho \"0123456789abcdef  -\"\n")
 	writeExecutable(t, filepath.Join(fakeBin, "df"), `#!/bin/sh
@@ -1737,16 +2042,16 @@ echo "fake 9999999 0 ${PP_FAKE_DF_AVAIL_KB:-4194304} 0% /"
 case "$1" in
   env)
     if [ "$2" = "GOVERSION" ]; then
-      echo "go${PP_FAKE_GO_INSTALLED:-1.26.6}"
+      echo "go${PP_FAKE_GO_INSTALLED:-1.26.10}"
       exit 0
     fi
     exit 0
     ;;
   version)
     if [ "$#" -ge 2 ]; then
-      echo "$2: go${PP_FAKE_GO_BINARY:-1.26.6}"
+      echo "$2: go${PP_FAKE_GO_BINARY:-1.26.10}"
     else
-      echo "go version go${PP_FAKE_GO_INSTALLED:-1.26.6} test/amd64"
+      echo "go version go${PP_FAKE_GO_INSTALLED:-1.26.10} test/amd64"
     fi
     exit 0
     ;;

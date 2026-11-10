@@ -88,7 +88,10 @@ func TestGeneratedCommandsHonorNonJSONRequestAndResponseMediaTypes(t *testing.T)
 	uploadSource := readGeneratedFile(t, outputDir, "internal", "cli", "uploads_create.go")
 	assert.Contains(t, uploadSource, `cmd.Flags().StringVar(&rawBodyFile, "file"`)
 	assert.Contains(t, uploadSource, `cmd.Flags().BoolVar(&stdinBody, "stdin"`)
-	assert.Contains(t, uploadSource, `c.SendRaw(cmd.Context(), "POST", path, params, rawBody, rawContentType, nil)`)
+	// POST /uploads with a raw file body is a free upload: it carries the
+	// replay-safe marker through headerOverrides.
+	assert.Contains(t, uploadSource, `c.SendRaw(cmd.Context(), "POST", path, params, rawBody, rawContentType, headerOverrides)`)
+	assert.Contains(t, uploadSource, `"X-Printing-Press-Replay-Safe": "true"`)
 	assert.NotContains(t, uploadSource, "parsing stdin JSON")
 
 	purgeSource := readGeneratedFile(t, outputDir, "internal", "cli", "uploads_purge.go")
@@ -107,7 +110,7 @@ func TestGeneratedCommandsHonorNonJSONRequestAndResponseMediaTypes(t *testing.T)
 	codeOrchSource := readGeneratedFile(t, codeOrchOutputDir, "internal", "mcp", "code_orch.go")
 	assert.Contains(t, codeOrchSource, `RequestContentType: "application/octet-stream"`)
 	assert.Contains(t, codeOrchSource, `rawBody, err = base64.StdEncoding.DecodeString(encoded)`)
-	assert.Contains(t, codeOrchSource, `data, _, err = c.SendRaw(ctx, ep.Method, path, query, rawBody, rawContentType, hdrs)`)
+	assert.Contains(t, codeOrchSource, `data, _, err = c.SendRaw(ctx, method, path, query, rawBody, rawContentType, hdrs)`)
 	assert.Contains(t, codeOrchSource, `"request_body"] = map[string]any`)
 	assert.Contains(t, codeOrchSource, `"default_content_type":   ep.RequestContentType`)
 	assert.Contains(t, codeOrchSource, `"X-Printing-Press-Text-Response": "true"`)
@@ -192,6 +195,7 @@ func TestCodeOrchestrationRawRequestRuntime(t *testing.T) {
 	for _, endpointID := range []string{"uploads.create", "uploads.purge"} {
 		result, err := handleCodeOrchExecute(context.Background(), codeOrchRequest(map[string]any{
 			"endpoint_id": endpointID,
+			"confirm":     true,
 			"params": map[string]any{
 				"body_base64": encoded,
 				"content_type": "audio/wav",

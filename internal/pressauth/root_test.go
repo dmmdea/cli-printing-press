@@ -43,11 +43,82 @@ func TestLoginHelpListsExpectedFlags(t *testing.T) {
 		t.Fatalf("login --help should exit cleanly, got: %v", err)
 	}
 
-	wantFlags := []string{"--login-url", "--complete-selector", "--refresh-endpoint", "--jwt-carrier-cookie", "--force"}
+	wantFlags := []string{"--login-url", "--complete-selector", "--complete-cookie", "--include-subdomains", "--refresh-endpoint", "--jwt-carrier-cookie", "--force"}
 	for _, flag := range wantFlags {
 		if !strings.Contains(stdout, flag) {
 			t.Errorf("login --help output missing flag %q; got:\n%s", flag, stdout)
 		}
+	}
+	if !strings.Contains(stdout, "every page tab") {
+		t.Errorf("login --help output missing %q; got:\n%s", "every page tab", stdout)
+	}
+	if !strings.Contains(stdout, "neither of those flags is set") {
+		t.Errorf("login --help should limit the sign-out heuristic to the case with no completion flag; got:\n%s", stdout)
+	}
+	if strings.Count(stdout, "replaces the sign-out heuristic") < 2 {
+		t.Errorf("login --help should say both completion flags replace the sign-out heuristic; got:\n%s", stdout)
+	}
+	for _, phrase := range []string{"host-only", "RFC 6265", "Leave the flag off"} {
+		if !strings.Contains(stdout, phrase) {
+			t.Errorf("login --help output missing %q; got:\n%s", phrase, stdout)
+		}
+	}
+}
+
+func TestIncludeSubdomainsFlagDefaultsOff(t *testing.T) {
+	cmd := newLoginCmd(nil)
+	flag := cmd.Flags().Lookup("include-subdomains")
+	if flag == nil {
+		t.Fatal("missing --include-subdomains")
+	}
+	if flag.DefValue != "false" {
+		t.Fatalf("default = %q, want false", flag.DefValue)
+	}
+	if err := cmd.ParseFlags([]string{"--include-subdomains=false"}); err != nil {
+		t.Fatalf("parse explicit false: %v", err)
+	}
+	off, err := cmd.Flags().GetBool("include-subdomains")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if off {
+		t.Fatal("explicit --include-subdomains=false parsed as true")
+	}
+
+	onCmd := newLoginCmd(nil)
+	if err := onCmd.ParseFlags([]string{"--include-subdomains"}); err != nil {
+		t.Fatalf("parse flag: %v", err)
+	}
+	on, err := onCmd.Flags().GetBool("include-subdomains")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !on {
+		t.Fatal("bare --include-subdomains parsed as false")
+	}
+}
+
+func TestNoMatchedCookiesErrorMentionsSubdomains(t *testing.T) {
+	err := noMatchedCookiesError("example.com", false)
+	var exitErr *ExitError
+	if !errors.As(err, &exitErr) {
+		t.Fatalf("expected *ExitError, got %T", err)
+	}
+	if exitErr.Code != ExitNoNewCookies {
+		t.Errorf("Code = %d, want ExitNoNewCookies", exitErr.Code)
+	}
+	if !strings.Contains(err.Error(), "--include-subdomains") {
+		t.Errorf("default miss should mention --include-subdomains, got: %v", err)
+	}
+	if strings.Contains(noMatchedCookiesError("example.com", true).Error(), "--include-subdomains") {
+		t.Error("error should not repeat --include-subdomains when the flag was already set")
+	}
+	wide := noMatchedCookiesError("example.com", true)
+	if !errors.As(wide, &exitErr) {
+		t.Fatalf("expected *ExitError, got %T", wide)
+	}
+	if exitErr.Code != ExitNoNewCookies {
+		t.Errorf("wide Code = %d, want ExitNoNewCookies", exitErr.Code)
 	}
 }
 

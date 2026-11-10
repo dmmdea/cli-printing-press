@@ -120,20 +120,26 @@ type ManifestTier struct {
 
 // ManifestTool describes a single MCP tool derived from an API endpoint.
 type ManifestTool struct {
-	Name              string           `json:"name"`
-	Description       string           `json:"description"`
-	DescriptionSource string           `json:"description_source,omitempty"`
-	Method            string           `json:"method"`
-	Path              string           `json:"path"`
-	Tier              string           `json:"tier,omitempty"`
-	NoAuth            bool             `json:"no_auth,omitempty"`
-	Params            []ManifestParam  `json:"params"`
-	HeaderOverrides   []ManifestHeader `json:"header_overrides,omitempty"`
+	Name              string `json:"name"`
+	Description       string `json:"description"`
+	DescriptionSource string `json:"description_source,omitempty"`
+	Method            string `json:"method"`
+	Path              string `json:"path"`
+	// BaseURL is the override origin when a resource, sub-resource, or
+	// endpoint base (including an OpenAPI operation server) changes the
+	// request target. Empty means Path is already that target. Catalog
+	// consumers keep Path as the spec path; join BaseURL in front of Path
+	// for the URL the CLI calls.
+	BaseURL         string           `json:"base_url,omitempty"`
+	Tier            string           `json:"tier,omitempty"`
+	NoAuth          bool             `json:"no_auth,omitempty"`
+	Params          []ManifestParam  `json:"params"`
+	HeaderOverrides []ManifestHeader `json:"header_overrides,omitempty"`
 }
 
 // ManifestParam describes a tool parameter with an explicit location
-// (path, query, or body). Name is the public CLI/MCP input name; WireName is
-// set only when the upstream API key differs from that public name.
+// (path, query, header, or body). Name is the public CLI/MCP input name;
+// WireName is set only when the upstream API key differs from that public name.
 type ManifestParam struct {
 	Name        string   `json:"name"`
 	WireName    string   `json:"wire_name,omitempty"`
@@ -237,6 +243,7 @@ func WriteToolsManifestWithDescription(dir string, parsed *spec.APISpec, manifes
 		tool := buildManifestTool(endpoint.ToolName, desc.Description, desc.Source, endpoint.Endpoint, paramDescriptions.Description)
 		tool.Tier = endpoint.Tier
 		tool.NoAuth = endpoint.NoAuth
+		tool.BaseURL = endpoint.RequestBaseURL
 		manifest.Tools = append(manifest.Tools, tool)
 	}
 
@@ -329,6 +336,8 @@ type manifestEndpointRecord struct {
 	Tier     string
 	NoAuth   bool
 	AuthType string
+	// RequestBaseURL is empty when joining a base would leave the spec path unchanged.
+	RequestBaseURL string
 }
 
 func manifestEndpointRecords(parsed *spec.APISpec) []manifestEndpointRecord {
@@ -347,11 +356,12 @@ func manifestEndpointRecords(parsed *spec.APISpec) []manifestEndpointRecord {
 				continue
 			}
 			records = append(records, manifestEndpointRecord{
-				ToolName: mcpoverrides.ToolName(rName, "", eName),
-				Endpoint: endpoint,
-				Tier:     parsed.EffectiveTier(resource, endpoint),
-				NoAuth:   noAuth,
-				AuthType: authType,
+				ToolName:       mcpoverrides.ToolName(rName, "", eName),
+				Endpoint:       endpoint,
+				Tier:           parsed.EffectiveTier(resource, endpoint),
+				NoAuth:         noAuth,
+				AuthType:       authType,
+				RequestBaseURL: manifestRequestBaseURL(spec.Resource{}, resource, endpoint, false),
 			})
 		}
 		subNames := sortedResourceKeys(resource.SubResources)
@@ -369,11 +379,12 @@ func manifestEndpointRecords(parsed *spec.APISpec) []manifestEndpointRecord {
 					continue
 				}
 				records = append(records, manifestEndpointRecord{
-					ToolName: mcpoverrides.ToolName(rName, subName, eName),
-					Endpoint: endpoint,
-					Tier:     parsed.EffectiveTier(effectiveSub, endpoint),
-					NoAuth:   noAuth,
-					AuthType: authType,
+					ToolName:       mcpoverrides.ToolName(rName, subName, eName),
+					Endpoint:       endpoint,
+					Tier:           parsed.EffectiveTier(effectiveSub, endpoint),
+					NoAuth:         noAuth,
+					AuthType:       authType,
+					RequestBaseURL: manifestRequestBaseURL(resource, subResource, endpoint, true),
 				})
 			}
 		}
@@ -389,6 +400,20 @@ func manifestToolCounts(records []manifestEndpointRecord) (total, public int) {
 		}
 	}
 	return total, public
+}
+
+// manifestRequestBaseURL returns the base the generated client bakes into
+// an absolute request path. It is empty when that join leaves the spec path
+// unchanged, so a CLI without overrides keeps a byte-identical manifest.
+func manifestRequestBaseURL(parent, resource spec.Resource, endpoint spec.Endpoint, isSub bool) string {
+	base := spec.EffectiveEndpointBaseURL(resource, endpoint)
+	if isSub {
+		base = spec.EffectiveSubEndpointBaseURL(parent, resource, endpoint)
+	}
+	if spec.EndpointPathWithBase(base, endpoint.Path) == endpoint.Path {
+		return ""
+	}
+	return base
 }
 
 func effectiveManifestEndpointAuth(parsed *spec.APISpec, resource spec.Resource, endpoint spec.Endpoint) (noAuth bool, authType string, include bool) {
@@ -428,15 +453,9 @@ func buildManifestTool(name, description, descriptionSource string, ep spec.Endp
 	// description-override agents reading the manifest to understand
 	// the API contract.
 	for _, p := range ep.Params {
-		loc := "query"
-		if p.Positional || p.PathParam {
-			loc = "path"
-		}
+		loc := manifestParamLocation(p)
 		name := uniqueManifestParamName(p.PublicInputName(), publicNames)
-		wireName := p.WireName()
-		if loc == "path" {
-			wireName = p.Name
-		}
+		wireName := manifestEndpointParamWireName(p, loc)
 		tool.Params = append(tool.Params, ManifestParam{
 			Name:        name,
 			WireName:    manifestWireName(name, wireName),
@@ -476,6 +495,30 @@ func buildManifestTool(name, description, descriptionSource string, ep spec.Endp
 	}
 
 	return tool
+}
+
+// manifestParamLocation reports where the generated CLI puts this parameter
+// on the wire. Path substitution wins over a declared In so reclassified
+// path flags stay "path". Header matches headerOverrides. Anything else,
+// including in:cookie, is a query flag: OpenAPI drops cookie parameters,
+// and command templates only special-case headers.
+func manifestParamLocation(p spec.Param) string {
+	if p.Positional || p.PathParam {
+		return "path"
+	}
+	if strings.EqualFold(strings.TrimSpace(p.In), "header") {
+		return "header"
+	}
+	return "query"
+}
+
+// manifestEndpointParamWireName is the key the generated CLI sends.
+// Path placeholders and header names are Param.Name. Query keys honor URLName.
+func manifestEndpointParamWireName(p spec.Param, loc string) string {
+	if loc == "path" || loc == "header" {
+		return p.Name
+	}
+	return p.WireName()
 }
 
 type manifestBodyParam struct {

@@ -29,10 +29,12 @@ func isAllowedDeadHelper(name string) bool {
 		"extractGraphQLConnection",
 		"extractGraphQLObject",
 		"formatCLIParamValue",
+		"hasMoreFieldIsNextLink",
 		"isFollowableNextURL",
 		"isJSONArray",
 		"nextClientSidePaginationCursor",
 		"nextCursorFromLinks",
+		"nextCursorFromPaging",
 		"nextCursorFromTopLevelURL",
 		"nextFullPageOffsetCursor",
 		"paginatedGet",
@@ -41,6 +43,8 @@ func isAllowedDeadHelper(name string) bool {
 		"paginationCursorToken",
 		"paginationLinkURL",
 		"pathParamSegmentValue",
+		"rawJSONNull",
+		"readHasMoreField",
 		"replaceDependentPathParam",
 		"replacePathParam",
 		"replaceURLIDPathParam",
@@ -49,8 +53,7 @@ func isAllowedDeadHelper(name string) bool {
 		"resolvePaginatedNextCursor",
 		"resourceURLIDPathParam",
 		"responsePayloadParentAtPath",
-		"urlIDFieldName",
-		"writeNoop":
+		"urlIDFieldName":
 		return true
 	default:
 		return false
